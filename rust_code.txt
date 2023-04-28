@@ -1,0 +1,4409 @@
+mod benchmark;
+mod cgen;
+mod eval;
+mod grift;
+mod ins_and_outs;
+mod insert_coercions;
+mod parser;
+mod precision;
+mod pretty;
+mod syntax;
+mod type_check;
+mod z3_state;
+
+use clap::Clap;
+use std::io::*;
+use std::path::Path;
+
+#[derive(Clap)]
+enum Parser {
+    Empty,
+    Grift,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Annot {
+    Ignore,
+    Hard,
+}
+
+impl std::str::FromStr for Annot {
+    type Err = &'static str;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "ignore" => Ok(Annot::Ignore),
+            "hard" => Ok(Annot::Hard),
+            _ => Err("invalid annotation behavior"),
+        }
+    }
+}
+
+impl std::str::FromStr for Parser {
+    type Err = &'static str;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "grift" => Ok(Parser::Grift),
+            "empty" => Ok(Parser::Empty),
+            _ => Err("invalid parser"),
+        }
+    }
+}
+
+#[derive(Clap)]
+#[clap(name = env!("CARGO_PKG_NAME"), version = env!("CARGO_PKG_VERSION"))]
+struct TopLevel {
+    #[clap(subcommand)]
+    sub_command: SubCommand,
+}
+
+#[derive(Clap)]
+enum SubCommand {
+    Migrate(Opts),
+    Eval(EvalOpts),
+    Benchmark(BenchmarkOpts),
+    LatexBenchmarks(BenchmarkOpts),
+    LatexBenchmarkSummary(BenchmarkOpts),
+    LatexConciseSummary(BenchmarkOpts),
+}
+
+#[derive(Clap)]
+struct EvalOpts {
+    input: String,
+    #[clap(short = 'c', long)]
+    show_inserted_coercions: bool,
+}
+
+#[derive(Clap)]
+struct BenchmarkOpts {
+    input: String,
+    // Tools to ignore from the benchmark set
+    #[clap(long)]
+    ignore: Vec<String>,
+}
+
+#[derive(Clap)]
+pub struct Opts {
+    /// Input file (defaults to '-', meaning STDIN)
+    #[clap(index = 1, default_value = "-")]
+    input: String,
+    /// Print debugging output
+    #[clap(short, long)]
+    debug: bool,
+    /// Disable the optimizer, which uses 'assert_soft' to reduce the number of
+    /// coercions.
+    #[clap(long = "no-optimize")]
+    disable_optimizer: bool,
+    /// Produce an exact type that may not be safe in all contexts
+    #[clap(long = "precise")]
+    unsafe_mode: bool,
+    /// All uses of a variable have the same type (by default, variables can be weakened)
+    #[clap(long = "rigid-vars")]
+    rigid_variables: bool,
+    /// Do not type-check the final result of migration
+    #[clap(long)]
+    skip_type_check: bool,
+    // Select the parser
+    #[clap(short, long, default_value = "empty")]
+    parser: Parser,
+    /// Use a predefined environment; when '-p grift' is set, will default to
+    /// 'grift', otherwise it will be 'empty'
+    #[clap(
+        short,
+        long,
+        default_value_if("parser", Some("grift"), "grift"),
+        default_value("empty")
+    )]
+    env: Parser,
+    /// Specifies behavior on type annotations; when '-p grift' is set, will
+    /// default to 'ignore'.
+    #[clap(
+        short,
+        long,
+        default_value_if("parser", Some("grift"), "ignore"),
+        default_value("ignore")
+    )]
+    annot: Annot,
+    /// Use ins and outs. Lots of features unsupported in this mode.
+    #[clap(long)]
+    ins_and_outs: bool,
+    /// When a file is provided, inferred types are corresponded to the
+    /// provided file's type annotations and whether they match (ignoring
+    /// annotations, coercions, and unannotated identifiers) is printed
+    #[clap(long)]
+    compare: Option<String>,
+}
+
+#[derive(Clone, Copy)]
+pub struct Options {
+    optimizer: bool,
+    context: bool,
+    debug: bool,
+    rigid_vars: bool,
+    annot: Annot,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Options {
+            optimizer: true,
+            context: true,
+            debug: false,
+            rigid_vars: false,
+            annot: Annot::Hard,
+        }
+    }
+}
+
+fn main() -> Result<()> {
+    let top_level = TopLevel::parse();
+    match top_level.sub_command {
+        SubCommand::Migrate(opts) => migrate_main(opts),
+        SubCommand::Eval(opts) => eval_main(opts),
+        SubCommand::Benchmark(opts) => {
+            benchmark::benchmark_main(&opts.input, opts.ignore.as_slice())
+        }
+        SubCommand::LatexBenchmarks(opts) => benchmark::details_latex(&opts.input),
+        SubCommand::LatexBenchmarkSummary(opts) => benchmark::summarize_latex(&opts.input),
+        SubCommand::LatexConciseSummary(opts) => benchmark::summarize_latex_concise(&opts.input),
+    }
+}
+
+fn eval_main(opts: EvalOpts) -> Result<()> {
+    let src_txt = std::fs::read_to_string(opts.input)?;
+    let mut src_ast = parser::parse(&src_txt).expect("parse error");
+    insert_coercions::insert_coercions(&mut src_ast).unwrap();
+    if opts.show_inserted_coercions {
+        println!("With coercions:\n{}", &src_ast);
+    }
+    match eval::eval(src_ast) {
+        Ok(_) => println!("OK"),
+        Err(s) => println!("{}", s),
+    };
+    Ok(())
+}
+
+fn language_or_override<'a>(language: &'a Parser, an_override: &'a Parser) -> &'a Parser {
+    match an_override {
+        Parser::Grift => an_override,
+        Parser::Empty => language,
+    }
+}
+
+fn migrate_main(config: Opts) -> Result<()> {
+    let options = Options {
+        optimizer: !config.disable_optimizer,
+        context: !config.unsafe_mode,
+        debug: config.debug,
+        rigid_vars: config.rigid_variables,
+        annot: config.annot,
+    };
+
+    let language = match config.parser {
+        Parser::Grift => Parser::Grift,
+        Parser::Empty => match &config.input[..] {
+            "-" => Parser::Empty,
+            _ => match Path::new(&config.input).extension() {
+                Some(ext) => match ext.to_str().expect("non utf-8") {
+                    "grift" => Parser::Grift,
+                    _ => Parser::Empty,
+                },
+                None => Parser::Empty,
+            },
+        },
+    };
+
+    let env = match language_or_override(&language, &config.env) {
+        Parser::Grift => grift::env(),
+        _ => Default::default(),
+    };
+    let source = match config.input.as_str() {
+        "-" => {
+            let mut out = String::new();
+            stdin().read_to_string(&mut out)?;
+            out
+        }
+        file => std::fs::read_to_string(file)?,
+    };
+
+    let mut parsed = match language {
+        Parser::Empty => parser::parse(&source).unwrap(),
+        Parser::Grift => grift::parse(&source),
+    };
+
+    if options.annot == Annot::Ignore {
+        parsed.fresh_types();
+    }
+
+    if options.debug {
+        eprintln!("Parsed program:");
+        eprintln!("{}", parsed);
+    }
+    let inferred = if config.ins_and_outs {
+        parsed.fresh_types();
+        ins_and_outs::typeinf_portable(parsed)
+    } else {
+        cgen::typeinf_options(parsed, &env, options).unwrap()
+    };
+
+    if !config.skip_type_check {
+        let typ = type_check::tcheck(&env, &inferred)
+            .map_err(|e| Error::new(ErrorKind::Other, format!("{}", e)))?;
+        if options.debug {
+            eprintln!("Inferred type:");
+            eprintln!("{}", typ);
+        }
+    }
+
+    match config.compare {
+        None => {
+            match language {
+                Parser::Empty => println!("{}", &inferred),
+                Parser::Grift => inferred.print_id_types(),
+            }
+            Ok(())
+        }
+        Some(f) => {
+            let compare_to_str = std::fs::read_to_string(f)?;
+            let compare_to = grift::parse(&compare_to_str);
+            match inferred.matches_roughly(&compare_to) {
+                Ok(()) => {
+                    println!("MATCHES");
+                    Ok(())
+                }
+                Err(e) => {
+                    println!("{}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests_631 {
+    use super::cgen::typeinf_options;
+    use super::parser::parse;
+    use super::syntax::{Coerce, Exp, Typ};
+    use super::type_check::type_check;
+    use super::Options;
+    trait PairOr {
+        fn or(&self, other: Self) -> Self;
+    }
+    impl PairOr for (bool, bool) {
+        fn or(&self, other: Self) -> Self {
+            (self.0 || other.0, self.1 || other.1)
+        }
+    }
+    fn coerce_contains_coercions(c: Coerce) -> (bool, bool) {
+        match c {
+            Coerce::Doomed => (false, true),
+            Coerce::Id => (false, false),
+            Coerce::Seq(a, b) => coerce_contains_coercions(*a).or(coerce_contains_coercions(*b)),
+            Coerce::Tag(_) => (true, false),
+            Coerce::Untag(_) => (false, true),
+            Coerce::Wrap(..) => panic!("wrap shouldn't happen in TypeWhich"),
+        }
+    }
+    // (to_any, from_any)
+    pub fn contains_coercions(e: Exp) -> (bool, bool) {
+        match e {
+            Exp::PrimCoerce(c, e) => contains_coercions(*e).or(coerce_contains_coercions(c)),
+            Exp::Coerce(t1, t2, e) => {
+                let cts = contains_coercions(*e);
+                if t1 == t2 {
+                    // this probably shouldn't happen after proper annotation
+                    cts
+                } else {
+                    // a coercion between two non-anys counts as a from_any
+                    // because it is possibly unsafe (which is what we really
+                    // mean by from_any)
+                    (t2 == Typ::Any, t2 != Typ::Any)
+                }
+            }
+            Exp::Lit(..) | Exp::Var(..) | Exp::Empty(..) => (false, false),
+            Exp::Fun(_, _, e)
+            | Exp::Fix(_, _, e)
+            | Exp::Ann(e, _)
+            | Exp::Fst(e)
+            | Exp::Snd(e)
+            | Exp::Head(e)
+            | Exp::Tail(e)
+            | Exp::UnaryOp(_, e)
+            | Exp::Box(e)
+            | Exp::Unbox(e)
+            | Exp::IsEmpty(e)
+            | Exp::IsBool(e)
+            | Exp::IsInt(e)
+            | Exp::IsString(e)
+            | Exp::IsList(e)
+            | Exp::IsFun(e)
+            | Exp::VectorLen(e) => contains_coercions(*e),
+            Exp::App(e1, e2)
+            | Exp::BinaryOp(_, e1, e2)
+            | Exp::AddOverload(e1, e2)
+            | Exp::Cons(e1, e2)
+            | Exp::Pair(e1, e2)
+            | Exp::BoxSet(e1, e2)
+            | Exp::Let(.., e1, e2)
+            | Exp::Vector(e1, e2)
+            | Exp::VectorRef(e1, e2) => contains_coercions(*e1).or(contains_coercions(*e2)),
+            Exp::If(e1, e2, e3) | Exp::VectorSet(e1, e2, e3) => contains_coercions(*e1)
+                .or(contains_coercions(*e2))
+                .or(contains_coercions(*e3)),
+            Exp::LetRec(bindings, e) => bindings
+                .into_iter()
+                .fold(contains_coercions(*e), |cc, (_, _, ei)| {
+                    cc.or(contains_coercions(ei))
+                }),
+        }
+    }
+    pub fn succeeds(program: &str) -> Typ {
+        exp_succeeds(parse(program).unwrap())
+    }
+    pub fn no_from_any(program: &str) {
+        let orig = parse(program).unwrap();
+        let (_, e) = compile_verbose(orig);
+        let coercions = contains_coercions(e);
+        assert!(!coercions.1);
+    }
+    pub fn coerces(program: &str) -> Typ {
+        exp_coerces(parse(program).unwrap())
+    }
+    fn compile_verbose(mut orig: Exp) -> (Typ, Exp) {
+        orig.fresh_types();
+        println!("\nOriginal program:\n{}", &orig);
+        let mut options = Options::default();
+        options.debug = true;
+        let e = typeinf_options(orig, &Default::default(), options).unwrap();
+        println!("\nAfter type inference:\n{}", e);
+        let t = type_check(&e).expect("failed to typecheck");
+        println!("\nProgram type:\n{}", t);
+        (t, e)
+    }
+    pub fn exp_succeeds(orig: Exp) -> Typ {
+        let (t, e) = compile_verbose(orig);
+        let coercions = contains_coercions(e);
+        assert!(!coercions.0 && !coercions.1);
+        t
+    }
+    pub fn exp_coerces(orig: Exp) -> Typ {
+        let (t, e) = compile_verbose(orig);
+        let coercions = contains_coercions(e);
+        assert!(coercions.0 || coercions.1);
+        t
+    }
+    #[test]
+    fn addition() {
+        succeeds("200 + 9101");
+    }
+    #[test]
+    fn num_plus_bool() {
+        coerces("1 + true");
+    }
+    /// this isn't really what the 631 test was saying, but it's added here to
+    /// make sure the above isn't a bug
+    #[test]
+    fn num_plus_bool_janky() {
+        coerces("1 +? true");
+    }
+    #[test]
+    fn indir_int_equal_bool() {
+        coerces(
+            "fun p .
+                (fun foo . foo 10 p true)
+                    (fun x . fun y . fun z .
+                        if true then z
+                        else
+                            (fun w . w) (if true then y else (fun w0 . w0) x))",
+        );
+    }
+    #[test]
+    fn key_is_bool_and_int() {
+        // previously ended in else key > 10 which would yield bool and
+        // constrain key to int, so we make something similar type-wise without
+        // adding comparisons
+        coerces(
+            "fun key . if true then if true then key else true else
+                (fun i . true) (key + 10)",
+        );
+    }
+    #[test]
+    fn lots_of_conditionals() {
+        coerces(
+            "fun x . fun y . fun z .
+               (if true then x else y) :: (if true then y else z) ::
+                  (if true then z else (fun w . w) 5) :: (if x then empty else empty)",
+        );
+    }
+    #[test]
+    fn bool_const() {
+        succeeds("true");
+    }
+    #[test]
+    fn list_of_booleans() {
+        succeeds("true :: empty");
+    }
+    #[test]
+    fn list_of_numbers() {
+        succeeds("100 :: empty");
+    }
+    #[test]
+    fn factorial() {
+        // should be if n == 0 instead of if false but it's probably not a
+        // particularly important operation to have
+        succeeds(
+            "let fac = fix fac . fun n . if false then 1 else n * fac (n + -1) in
+             fac 50 + fac 100",
+        );
+    }
+    #[test]
+    fn extract_list() {
+        succeeds("head (2 :: empty) + 5");
+    }
+    #[test]
+    fn identity_polymorphic() {
+        coerces(
+            "let id = fun x . x in
+            let f = fun anid .
+                let n = id 10 in
+                let b = id true in
+                5 in
+            f id",
+        );
+    }
+    #[test]
+    fn simple_arith() {
+        succeeds("(fun x . x + 1) 10");
+    }
+    #[test]
+    fn numeric_const() {
+        succeeds("908");
+    }
+    #[test]
+    fn is_empty_number() {
+        coerces("is_empty 500");
+    }
+    #[test]
+    fn is_empty_list() {
+        succeeds("is_empty (1 :: empty)");
+    }
+    #[test]
+    fn real_map() {
+        succeeds(
+            "let map = fix map . fun f . fun lst .
+               if is_empty(lst) then
+                 empty
+               else
+                 f(head(lst)) :: (map f (tail(lst))) in
+               map (fun n . n + 1) (1 :: 2 :: 3 :: empty)",
+        );
+    }
+    #[test]
+    fn bogus_map() {
+        succeeds(
+            "let map = fun f . fun lst .
+               f(head(lst)) :: f(head(tail(lst))) :: empty in
+                   map (fun n . n + 1) (1 :: 2 :: 3 :: empty)",
+        );
+    }
+    // = not yet supported: extract a value from a record =
+    // = not yet supported: extract a value from a non-record =
+    #[test]
+    fn double() {
+        succeeds(
+            "let square = fun n . if false then 0 else n + n in
+            square 10 + square 5",
+        );
+    }
+    #[test]
+    fn tail_wag() {
+        succeeds("12 :: (tail (12 :: empty))");
+    }
+    #[test]
+    fn tail_toggle() {
+        succeeds("tail (1 :: empty)");
+    }
+    // = not yet supported: arrays are homogenous =
+    #[test]
+    fn dyn_list_single_level() {
+        coerces("1 :: (false :: empty)");
+    }
+    #[test]
+    fn dyn_list_nested() {
+        coerces("1 :: (false :: ((2 :: (true :: empty)) :: empty))");
+    }
+    #[test]
+    fn flatten_body() {
+        coerces(
+            "let flatten = fun append . fun f . fun x .
+               if is_list x then append (f (head x)) (f (tail x)) else x :: empty in
+               let l = 1 :: (false :: ((2 :: (true :: empty)) :: empty)) in
+               flatten (fun x . fun y. x) (fun x. x) l",
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests_migeed_and_parsberg {
+    use super::cgen::typeinf;
+    use super::parser::parse;
+    use super::tests_631::coerces;
+    use super::type_check::type_check;
+
+    // TODO(arjun): _maximal in the name is not accurate. Alternative name:
+    // assert_ti_ok
+    fn assert_maximal(program: &str, annotated: &str) {
+        let mut orig = parse(program).unwrap();
+        orig.fresh_types();
+        println!("\nOriginal program:\n{}", &orig);
+        let e = typeinf(orig).expect("type inference failed on the original program");
+        println!("\nAfter type inference:\n{}", e);
+        let correct = typeinf(parse(annotated).unwrap())
+            .expect("type inference failed on the expected program");
+        println!(
+            "\nProgram type:\n{}",
+            type_check(&e).expect("failed to typecheck")
+        );
+        println!("\nCorrect:\n{}", correct);
+        assert_eq!(e, correct);
+    }
+    #[test]
+    #[ignore]
+    fn apply_add() {
+        assert_maximal("fun x . x (x + 1)", "fun x: any . x (x + 1)");
+    }
+
+    #[test]
+    #[ignore]
+    fn add_applied() {
+        // TODO(arjun): We get a different result. Worth discussing.
+        assert_maximal(
+            "fun x             . x ((x true) + 1)",
+            "fun x: any -> int . x ((x true) + 1)",
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn add_two_applies() {
+        // TODO(arjun): We get a different result. Worth discussing.
+        assert_maximal(
+            "fun x             . x 4 + x true",
+            "fun x: any -> int . x 4 + x true",
+        );
+    }
+    #[test]
+    fn identity_four() {
+        assert_maximal("(fun x . x) 4", "(fun x: int . x) 4");
+    }
+
+    #[test]
+    #[ignore]
+    fn succ_id_id() {
+        // TODO(luna): We get a different result, in part because we don't
+        // allow from_any coercions on arguments
+        assert_maximal(
+            "1 + ((fun y    .y) ((fun x    .x) true))",
+            "1 + ((fun y:int.y) (from_any ((fun x:any.x) true)))",
+        );
+    }
+    #[test]
+    fn identity() {
+        assert_maximal("fun x.x", "fun x: any . x");
+    }
+
+    #[test]
+    #[ignore]
+    fn apply2() {
+        // TODO(arjun): We get any -> any -> any as the type on the arrow, which
+        // results in just as few coercions.
+        assert_maximal(
+            "fun x    .fun y                    .y x x",
+            "fun x:int.fun y:(int -> int -> int).y x x",
+        );
+    }
+    #[test]
+    #[ignore]
+    fn indirect_apply_self() {
+        // TODO(luna): We get a different result, in part because we don't
+        // allow from_any coercions on arguments
+        assert_maximal(
+            "fun x    .(fun y    .x)           x  x",
+            "fun x:any.(fun y:int.x) (from_any x) x",
+        );
+    }
+    #[test]
+    #[ignore]
+    fn the_long_one() {
+        // TODO(luna): We get a different result, in part because we don't
+        // allow from_any coercions on arguments
+        assert_maximal(
+            "fun x    .(fun f    .(fun x    .fun y    .x)          f (from_any (f x)))(fun z    .1)",
+            "fun x:int.(fun f:any.(fun x:int.fun y:int.x)(from_any f)(from_any (f x)))(fun z:int.1)",
+        );
+    }
+    /// this benchmark has no maximal migration, which means that x could be
+    /// given an infinity recursive arrow type (t -> t -> t -> ...). we will
+    /// give it... something
+    #[test]
+    fn apply_self() {
+        coerces("fun x.x x");
+    }
+    /// this benchmark has an unknown maximal migration. because Migeed's
+    /// algorithm is incomplete, it sometimes does not report whether a maximal
+    /// solution exists. in practice, this probably means that there is no maximal
+    /// migration. we still give it some migration
+    #[test]
+    fn untypable_in_sys_f() {
+        coerces("(fun x.fun y.y(x(fun x.x))(x(fun b.fun c.b)))(fun d.d d)");
+    }
+    /// unknown to Migeed and Parsberg. self interpreter for the lambda calculus
+    #[test]
+    fn self_interpreter() {
+        coerces(
+            "(fun h.(fun x.h(x x))(fun x.h x x))
+             (fun e.fun m.m(fun x.x)(fun m.fun n.(e m)(e n))(fun m.fun v.e (m v)))",
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests_misc {
+    use super::tests_631::coerces;
+
+    #[test]
+    fn fact_church() {
+        coerces(
+            "
+            let add1  =
+                  fun x. 1 + x in
+            let one  =
+                  fun f. fun x. f x in
+            let five  =
+                  fun f. fun x. f (f (f (f (f x)))) in
+            let pred  =
+                  fun n.
+                    (fun f.
+                      (fun x.
+                        (((n (fun g. fun h. h (g f)))
+                          (fun u. x))
+                         (fun u. u)))) in
+            let mult  =
+                  fun m.
+                    (fun n.
+                      (fun f. m (n f))) in
+            let _true   =
+                   fun a. fun b. a in
+            let _false  =
+                   fun a. fun b. b in
+            let is0   =
+                  fun n. n (fun x. _false) _true in
+            let fact  =
+                  fix fact. fun n.
+                    ((     (is0 n) // if
+                           (fun x. one))
+                           (fun x. (mult n) (fact (pred n)))) in
+            let realize = fun n . n add1 0 in // : (int -> int) -> (int -> int)
+            let n = fact five in
+            realize n",
+        );
+    }
+    #[test]
+    fn fact_dyn() {
+        coerces(
+            "
+            let f = fun f.fun n.
+                if n = 0
+                    then 1
+                    else n * (f f (n + -1)) in
+            f f 6",
+        );
+    }
+}
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::io::Read;
+use std::process::{Command, Stdio};
+use std::time::Duration;
+use wait_timeout::ChildExt;
+
+/// Several outcomes involve running the program before and after migration.
+/// Those outcomes have a steps field. The program is expected to terminate
+/// in at most the given number of steps, or we have an unexpected outcome.
+#[derive(Debug, Serialize, Deserialize)]
+struct Outcome {
+    #[serde(default, skip_serializing_if = "is_false")]
+    assert_unusable: bool,
+    result: Option<Expect>,
+    #[serde(default, skip_serializing_if = "is_none")]
+    migration: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+enum Expect {
+    Rejection(Rejection),
+    NewRuntimeError { num_stars: usize },
+    Unusable { num_stars: usize },
+    FullyCompatible {
+        num_stars: usize,
+        #[serde(skip_serializing_if = "is_false", default)]
+        manually_verify: bool,
+    },
+    Disaster,
+    Restricted {
+        num_stars: usize,
+    },
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+struct Rejection {
+    stdout: String,
+    stderr: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct RuntimeError {
+    /// Output from the tool
+    message: Option<String>,
+    program: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Benchmark {
+    file: String,
+    #[serde(skip_serializing_if = "is_none")]
+    context: Option<String>,
+    #[serde(default)]
+    results: std::collections::HashMap<String, Outcome>,
+    #[serde(default)] // default is zero
+    num_stars: usize,
+    #[serde(skip_serializing_if = "is_none")]
+    assert_compatible: Option<String>
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct MigrationTool {
+    title: String,
+    command: Vec<String>,
+}
+#[derive(Debug, Serialize, Deserialize)]
+struct Benchmarks {
+    tools: Vec<MigrationTool>,
+    benchmarks: Vec<Benchmark>,
+}
+
+fn is_false(b: &bool) -> bool {
+    return !b;
+}
+
+fn is_none<T>(v: &Option<T>) -> bool {
+    return v.is_none();
+}
+
+fn count_stars(e: &super::syntax::Exp) -> usize {
+    use super::syntax::{Exp, Typ};
+    match e {
+        Exp::Lit(..) | Exp::Var(..) => 0,
+        Exp::App(e1, e2) | Exp::BinaryOp(_, e1, e2) => count_stars(e1) + count_stars(e2),
+        // If we introduce an annotation, we get an extra star! This can produce surprising results
+        // For example, the original program `1 + true` has zero stars, but after migration, we get
+        // `1 + true as any`, which has 1 star.
+        Exp::Ann(e, t) | Exp::Fun(_, t, e) => {
+            (match t {
+                Typ::Any => 1,
+                _ => 0,
+            }) + count_stars(e)
+        }
+        Exp::If(e1, e2, e3) => count_stars(e1) + count_stars(e2) + count_stars(e3),
+        _ => panic!("count_stars on {:?}", e),
+    }
+}
+
+fn get_outcome<'a>(
+    tool_name: &str,
+    results: &'a mut std::collections::HashMap<String, Outcome>,
+) -> &'a mut Outcome {
+    if results.contains_key(tool_name) == false {
+        results.insert(
+            tool_name.to_string(),
+            Outcome {
+                assert_unusable: false,
+                result: None,
+                migration: None,
+            },
+        );
+    }
+    return results.get_mut(tool_name).unwrap();
+}
+
+// Run the program after coercion insertion. True means it ran successfully.
+// False means a coercion error occurred. Anything else causes a panic.
+// Store the number of stores in num_stars, if provided.
+fn eval(code: String, num_stars: Option<&mut usize>) -> Option<bool> {
+    match super::parser::parse(code) {
+        Ok(mut ast) => {
+            if let Some(num_stars) = num_stars {
+                *num_stars = count_stars(&ast);
+            }
+            super::insert_coercions::insert_coercions(&mut ast).expect("coercion insertion failed");
+            Some(super::eval::eval(ast).is_ok())
+        }
+        Err(_messages) => None,
+    }
+}
+
+
+fn check_if_compatible(migrated: &str, expected: &Option<String>) -> bool {
+    match expected {
+        None => false,
+        Some(expected) => {
+            let expected_ast = super::parser::parse(expected).expect("could not parse expected compatible");
+            let migrated_ast = super::parser::parse(migrated).expect("coud not parse migrated compatible");
+            super::precision::exp_lt(&expected_ast, &migrated_ast)
+        }
+    }
+}
+
+// Run one benchmark program using one migration tool.
+fn benchmark_one(tool: &MigrationTool, benchmark: &mut Benchmark) {
+    // Run the program with a 30 second timeout.
+    let mut child = Command::new(&tool.command[0])
+        .args(&tool.command[1..])
+        .arg(&benchmark.file)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn");
+    let migrate_ok = match child.wait_timeout(Duration::from_secs(30)).unwrap() {
+        None => {
+            child.kill().unwrap();
+            eprintln!("Killed");
+            false
+        }
+        Some(code) => code.success(),
+    };
+    // Save standard out.
+    let mut tool_stdout = String::new();
+    child
+        .stdout
+        .unwrap()
+        .read_to_string(&mut tool_stdout)
+        .unwrap();
+    // Save standard err.
+    let mut tool_stderr = String::new();
+    child
+        .stderr
+        .unwrap()
+        .read_to_string(&mut tool_stderr)
+        .unwrap();
+
+    // Get a pointer to the outcome where we will store the result.
+    let mut outcome = get_outcome(&tool.title, &mut benchmark.results);
+
+    // Timeout or error from the migration tool.
+    if migrate_ok == false {
+        outcome.result = Some(Expect::Rejection(Rejection {
+            stdout: tool_stdout,
+            stderr: tool_stderr,
+        }));
+        return;
+    }
+
+    // For us to manually check the result of migration
+    outcome.migration = Some(tool_stdout.clone());
+    let original_program = std::fs::read_to_string(&benchmark.file).expect("reading benchmark");
+
+    // If benchmark.assert_compatible is present, it a program that is more type-precise
+    // than the original program. Verify that this is true and blow up if it is not the case.
+    if check_if_compatible(&original_program, &benchmark.assert_compatible) == false &&
+       benchmark.assert_compatible.is_some() {
+           outcome.result = Some(Expect::Disaster);
+           println!("assert_compatible is not more precise than the original program");
+           return;
+    }
+
+    // Flag that determines if the original program runs without error. Also, store the number of
+    // stars in the original program in benchmark.num_stars.
+    let original_runs_ok = eval(original_program.clone(), Some(&mut benchmark.num_stars));
+    // Flag that determines if the result of migration runs without error. Also, store the number of
+    // stars in the result of migration in outcome.stars_after_migration.
+    let mut stars_after_migration = 0;
+    let migrated_runs_ok = eval(tool_stdout.clone(), Some(&mut stars_after_migration));
+
+    // Check if the result of migration is less precise than what is known to be a maximally precise
+    // version of the original program.
+    let result_is_known_compatible = check_if_compatible(&tool_stdout, &benchmark.assert_compatible);
+
+    match &benchmark.context {
+        None => match (original_runs_ok, migrated_runs_ok) {
+            (None, _) => outcome.result = Some(Expect::Disaster),
+            (_, None) => outcome.result = Some(Expect::Disaster),
+            (Some(true), Some(false)) => {
+                outcome.result = Some(Expect::NewRuntimeError { num_stars: stars_after_migration });
+            }
+            (Some(true), Some(true)) => {
+                // No context, so we assume it is fully compatible. *But*, we set manually_verify
+                // if the result is not less precise than the known most precise version.
+                outcome.result = Some(Expect::FullyCompatible {
+                    num_stars: stars_after_migration,
+                    manually_verify: benchmark.num_stars != stars_after_migration
+                        && !result_is_known_compatible,
+                });
+            }
+            (Some(false), Some(false)) => {
+                // Program crashes before and after migration in the empty context. All crashes
+                // are compatible.
+                outcome.result = Some(Expect::FullyCompatible {
+                    num_stars: stars_after_migration,
+                    manually_verify: false,
+                });
+            }
+            (Some(false), Some(true)) => {
+                panic!("Migration eliminated an error!");
+            }
+        },
+        Some(context) => {
+            let original_in_context = context.replace("HOLE", &original_program);
+            let migrated_in_context = context.replace("HOLE", &tool_stdout);
+            let original_runs_ok_in_context = eval(original_in_context, None);
+            let migrated_runs_ok_in_context = eval(migrated_in_context, None);
+            match (
+                original_runs_ok,
+                migrated_runs_ok,
+                original_runs_ok_in_context,
+                migrated_runs_ok_in_context,
+            ) {
+                (Some(true), Some(true), Some(true), Some(false)) => {
+                    if outcome.assert_unusable {
+                        // Requires manual inspection
+                        outcome.result = Some(Expect::Unusable { num_stars: stars_after_migration });
+                    } else {
+                        outcome.result = Some(Expect::Restricted {
+                            num_stars: stars_after_migration,
+                        });
+                    }
+                }
+                (Some(true), Some(true), Some(true), Some(true)) => {
+                    outcome.result = Some(Expect::FullyCompatible {
+                        num_stars: stars_after_migration,
+                        manually_verify: benchmark.num_stars != stars_after_migration
+                            && !result_is_known_compatible,
+                    });
+                }
+                _ => {
+                    outcome.result = Some(Expect::Disaster);
+                }
+            }
+        }
+    }
+}
+
+pub fn summarize_latex(src_file: impl AsRef<str>) -> Result<(), std::io::Error> {
+    let src_text = std::fs::read_to_string(src_file.as_ref())?;
+    let benchmarks: Benchmarks = serde_yaml::from_str(&src_text).expect("syntax error");
+
+    let mut rejected = HashMap::<String, i32>::new();
+    let mut new_runtime_err = HashMap::<String, i32>::new();
+    let mut unusable = HashMap::<String, i32>::new();
+    let mut restricted = HashMap::<String, i32>::new();
+    let mut compatible = HashMap::<String, i32>::new();
+    let mut num_stars_left = HashMap::<String, i32>::new();
+    let mut num_original_stars = HashMap::<String, i32>::new();
+    for tool in &benchmarks.tools {
+        rejected.insert(tool.title.clone(), 0);
+        new_runtime_err.insert(tool.title.clone(), 0);
+        unusable.insert(tool.title.clone(), 0);
+        restricted.insert(tool.title.clone(), 0);
+        compatible.insert(tool.title.clone(), 0);
+        num_stars_left.insert(tool.title.clone(), 0);
+        num_original_stars.insert(tool.title.clone(), 0);
+    }
+
+    for b in &benchmarks.benchmarks {
+        for (tool_title, outcome) in &b.results {
+            match outcome.result {
+                Some(Expect::Rejection(..)) => {
+                    *rejected.get_mut(tool_title).unwrap() += 1;
+                }
+                Some(Expect::NewRuntimeError { .. }) => {
+                    *new_runtime_err.get_mut(tool_title).unwrap() += 1;
+                }
+                Some(Expect::Unusable { .. }) => {
+                    *unusable.get_mut(tool_title).unwrap() += 1;
+                }
+                Some(Expect::FullyCompatible { num_stars, .. }) => {
+                    *num_stars_left.get_mut(tool_title).unwrap() += num_stars as i32;
+                    *num_original_stars.get_mut(tool_title).unwrap() += b.num_stars as i32;
+                    *compatible.get_mut(tool_title).unwrap() += 1;
+                }
+                Some(Expect::Restricted { num_stars }) => {
+                    *num_stars_left.get_mut(tool_title).unwrap() += num_stars as i32;
+                    *num_original_stars.get_mut(tool_title).unwrap() += b.num_stars as i32;
+                    *restricted.get_mut(tool_title).unwrap() += 1;
+                }
+                Some(Expect::Disaster) => {}
+                None => {
+                    panic!("missing outcome");
+                }
+            }
+        }
+    }
+
+    let num_benchmarks = benchmarks.benchmarks.len();
+
+    for tool in &benchmarks.tools {
+        let title = &tool.title;
+        let rejected = rejected.get(title).unwrap();
+        let rejected_denom = num_benchmarks as i32;
+        let new_runtime_err = new_runtime_err.get(title).unwrap();
+        let new_runtime_err_denom = rejected_denom - rejected;
+        let unusable = unusable.get(title).unwrap();
+        let unusable_denom = new_runtime_err_denom - new_runtime_err;
+        let restricted = restricted.get(title).unwrap();
+        let restricted_denom = unusable_denom - unusable;
+        let stars = num_stars_left.get(title).unwrap();
+        let stars_denom = num_original_stars.get(title).unwrap();
+        println!(
+            "{} & {} / {} & {} / {} & {} / {} &  {} / {} & {} / {} \\\\ ",
+            title,
+            rejected,
+            rejected_denom,
+            new_runtime_err,
+            new_runtime_err_denom,
+            unusable,
+            unusable_denom,
+            restricted,
+            restricted_denom,
+            stars,
+            stars_denom
+        );
+    }
+
+    Ok(())
+}
+
+/// Produces the concise summmary table that makes it easier to determine the "winner" in
+/// three categories:
+///
+/// 1. What percentage of migrations are safe?
+/// 2. What percentage of migrations are compatible with all contexts?
+/// 3. What percentage of type annotations are improved?
+///
+/// A migration that is safe may still be unusable. A program with improved type annotations
+/// may not be safe.
+pub fn summarize_latex_concise(src_file: impl AsRef<str>) -> Result<(), std::io::Error> {
+    let src_text = std::fs::read_to_string(src_file.as_ref())?;
+    let benchmarks: Benchmarks = serde_yaml::from_str(&src_text).expect("syntax error");
+
+    let mut restricted = HashMap::<String, i32>::new();
+    let mut compatible = HashMap::<String, i32>::new();
+    let mut migrated = HashMap::<String, i32>::new();
+    let mut num_stars_left = HashMap::<String, i32>::new();
+    let mut num_original_stars = HashMap::<String, i32>::new();
+    for tool in &benchmarks.tools {
+        restricted.insert(tool.title.clone(), 0);
+        compatible.insert(tool.title.clone(), 0);
+        migrated.insert(tool.title.clone(), 0);
+        num_stars_left.insert(tool.title.clone(), 0);
+        num_original_stars.insert(tool.title.clone(), 0);
+    }
+
+    for b in &benchmarks.benchmarks {
+        for (tool_title, outcome) in &b.results {
+            match outcome.result {
+                Some(Expect::Rejection(..)) => { }
+                Some(Expect::NewRuntimeError { num_stars }) => {
+                    *migrated.get_mut(tool_title).unwrap() += 1;
+                    *num_stars_left.get_mut(tool_title).unwrap() += num_stars as i32;
+                    *num_original_stars.get_mut(tool_title).unwrap() += b.num_stars as i32;
+                }
+                Some(Expect::Unusable { num_stars }) => {
+                    *migrated.get_mut(tool_title).unwrap() += 1;
+                    *num_stars_left.get_mut(tool_title).unwrap() += num_stars as i32;
+                    *num_original_stars.get_mut(tool_title).unwrap() += b.num_stars as i32;
+                    *restricted.get_mut(tool_title).unwrap() += 1;
+                }
+                Some(Expect::FullyCompatible { num_stars, .. }) => {
+                    *migrated.get_mut(tool_title).unwrap() += 1;
+                    *num_stars_left.get_mut(tool_title).unwrap() += num_stars as i32;
+                    *num_original_stars.get_mut(tool_title).unwrap() += b.num_stars as i32;
+                    *compatible.get_mut(tool_title).unwrap() += 1;
+                }
+                Some(Expect::Restricted { num_stars }) => {
+                    *migrated.get_mut(tool_title).unwrap() += 1;
+                    *num_stars_left.get_mut(tool_title).unwrap() += num_stars as i32;
+                    *num_original_stars.get_mut(tool_title).unwrap() += b.num_stars as i32;
+                    *restricted.get_mut(tool_title).unwrap() += 1;
+                }
+                Some(Expect::Disaster) => {}
+                None => {
+                    panic!("missing outcome");
+                }
+            }
+        }
+    }
+
+    let num_benchmarks = benchmarks.benchmarks.len();
+
+    for tool in &benchmarks.tools {
+        let title = &tool.title;
+        let migrated = *migrated.get(title).unwrap();
+        let restricted = *restricted.get(title).unwrap();
+        let compatible = *compatible.get(title).unwrap();
+        let stars = *num_stars_left.get(title).unwrap();
+        let stars_denom = *num_original_stars.get(title).unwrap();
+        println!(
+            "{} & {:.2} & {:.2} & {:.2} & {:.2} \\\\ ",
+            title,
+            (migrated as f64) / num_benchmarks as f64,
+            ((restricted + compatible) as f64) / (num_benchmarks as f64),
+            (compatible as f64) / (num_benchmarks as f64),
+            1.0 - (stars as f64) / (stars_denom as f64),
+        );
+    }
+
+    Ok(())
+}
+
+pub fn benchmark_main(src_file: impl AsRef<str>, ignore: &[String]) -> Result<(), std::io::Error> {
+    let src_text = std::fs::read_to_string(src_file.as_ref())?;
+    let mut benchmarks: Benchmarks = serde_yaml::from_str(&src_text).expect("syntax error");
+    // Filter out tools that are in the ignore list.
+    benchmarks.tools.retain(|tool| false == ignore.contains(&tool.title));
+    for mut b in benchmarks.benchmarks.iter_mut() {
+        // Remove the expected outcomes for ignored tools, or we panic later.
+        b.results.retain(|tool_title, _| false == ignore.contains(tool_title));
+        for t in &benchmarks.tools {
+            eprintln!("Running {} on {} ...", t.title, b.file);
+            benchmark_one(&t, &mut b);
+        }
+    }
+
+    println!("{}", serde_yaml::to_string(&benchmarks).unwrap());
+    return Ok(());
+}
+
+pub fn details_latex(src_file: impl AsRef<str>) -> Result<(), std::io::Error> {
+    let src_text = std::fs::read_to_string(src_file.as_ref())?;
+    let benchmarks: Benchmarks = serde_yaml::from_str(&src_text).expect("syntax error");
+    for b in benchmarks.benchmarks {
+        println!("\\subsection*{{{}}}\n", &b.file.replace("_", "-"));
+        for t in &benchmarks.tools {
+            let result = b.results.get(&t.title).unwrap();
+            let migration = result
+                .migration
+                .as_ref()
+                .map(|s| s.replace("⦉", "t").replace("⦊", "").clone())
+                .unwrap_or("".to_string());
+            let outcome_str = match result.result.as_ref().unwrap() {
+                Expect::Disaster => "\\textbf{DISASTER}",
+                Expect::FullyCompatible { .. } => "Compatible",
+                Expect::NewRuntimeError { .. } => "Runtime Error",
+                Expect::Rejection { .. } => "Rejected",
+                Expect::Unusable{ .. } => "Unusable",
+                Expect::Restricted { .. } => "Restricted",
+            };
+            println!("\\paragraph{{{}}}: {}", &t.title, outcome_str);
+            println!("\\begin{{lstlisting}}");
+            println!("{}", migration);
+            println!("\\end{{lstlisting}}\n");
+        }
+    }
+    return Ok(());
+}
+//! Binary predicates to check if a type or expression is less precise (or identical) than
+//! another.
+//!
+//! In addition to the usual precision check, these predicates:
+//!
+//! 1. Account for alpha-renaming, e.g., it considers `fun x . x` and `fun y . y` to be 
+//!    identical; and
+//!
+//! 2. Treat type metavariables as `any`, e.g., it treats `fun x : 'a . x` and `fun x : any . x` as
+//!    identical expressions.
+
+use super::syntax::{Exp, Typ, Id};
+
+type Env = im_rc::HashMap<Id, Id>;
+
+pub fn typ_lt(t1: &Typ, t2: &Typ) -> bool {
+    use Typ::*;
+    match (t1, t2) {
+        (_, Any) => true,
+        (_, Metavar(_)) => true, // see module-level note
+        (Unit, Unit) => true,
+        (Int, Int) => true,
+        (Float, Float) => true,
+        (Bool, Bool) => true,
+        (Str, Str) => true,
+        (Char, Char) => true,
+        (Arr(t11, t12), Arr(t21, t22)) => typ_lt(t11, t21) && typ_lt(t12, t22),
+        (Pair(t11, t12), Pair(t21, t22)) => typ_lt(t11, t21) && typ_lt(t12, t22),
+        (Vect(t11), Vect(t21)) => typ_lt(t11, t21),
+        _ => false,
+    }
+}
+
+
+fn exp_lt_rec(env: &Env, e1: &Exp, e2: &Exp) -> bool {
+    use Exp::*;
+    match (e1, e2) {
+        (Lit(l1), Lit(l2)) => l1 == l2,
+        (Var(x), Var(y1)) => match env.get(x) {
+            None => false,
+            Some(y2) => y1 == y2
+        },
+        (Fun(x, t1, e1), Fun(y, t2, e2)) => {
+            if typ_lt(t1, t2) == false {
+                false
+            }
+            else {
+                let mut env = env.clone();
+                env.insert(x.clone(), y.clone());
+                exp_lt_rec(&env, e1, e2)
+            }
+        }
+        (App(e11, e12), App(e21, e22)) => exp_lt_rec(env, e11, e21) && exp_lt_rec(env, e12, e22),
+        (BinaryOp(op1, e11, e12), BinaryOp(op2, e21, e22)) => op1 == op2 && exp_lt_rec(env, e11, e21) && exp_lt_rec(env, e12, e22),
+        (If(e11, e12, e13), If(e21, e22, e23)) =>exp_lt_rec(env, e11, e21) && exp_lt_rec(env, e12, e22) && exp_lt_rec(env, e13, e23),
+        _ => false
+    }
+}
+
+pub fn exp_lt(e1: &Exp, e2: &Exp) -> bool {
+  let env = Env::default();
+  exp_lt_rec(&env, e1, e2)
+}use crate::syntax::Typ;
+use ast::{Bool, Dynamic};
+use z3::*;
+
+pub struct Z3State<'a> {
+    pub cxt: &'a Context,
+    pub typ: &'a DatatypeSort<'a>,
+    pub typ_sort: &'a Sort<'a>,
+    pub int_z3: Dynamic<'a>,
+    pub bool_z3: Dynamic<'a>,
+    pub str_z3: Dynamic<'a>,
+    pub arr_ctor: &'a FuncDecl<'a>,
+    pub list_ctor: &'a FuncDecl<'a>,
+    pub pair_ctor: &'a FuncDecl<'a>,
+    pub box_ctor: &'a FuncDecl<'a>,
+    pub any_z3: Dynamic<'a>,
+    pub unit_z3: Dynamic<'a>,
+    pub vect_ctor: &'a FuncDecl<'a>,
+    pub float_z3: Dynamic<'a>,
+    pub char_z3: Dynamic<'a>,
+}
+
+impl<'a> Z3State<'a> {
+    pub fn new(cxt: &'a Context, typ: &'a DatatypeSort<'a>) -> Self {
+        Z3State {
+            cxt,
+            int_z3: typ.variants[0].constructor.apply(&[]),
+            bool_z3: typ.variants[1].constructor.apply(&[]),
+            str_z3: typ.variants[2].constructor.apply(&[]),
+            arr_ctor: &typ.variants[3].constructor,
+            list_ctor: &typ.variants[4].constructor,
+            pair_ctor: &typ.variants[5].constructor,
+            box_ctor: &typ.variants[6].constructor,
+            any_z3: typ.variants[7].constructor.apply(&[]),
+            unit_z3: typ.variants[8].constructor.apply(&[]),
+            vect_ctor: &typ.variants[9].constructor,
+            float_z3: typ.variants[10].constructor.apply(&[]),
+            char_z3: typ.variants[11].constructor.apply(&[]),
+            typ_sort: &typ.sort,
+            typ,
+        }
+    }
+    pub fn typ(cxt: &'a Context) -> DatatypeSort<'a> {
+        DatatypeBuilder::new(&cxt, "Typ")
+            .variant("Int", vec![])
+            .variant("Bool", vec![])
+            .variant("Str", vec![])
+            .variant(
+                "Arr",
+                vec![
+                    ("arg", DatatypeAccessor::Datatype("Typ".into())),
+                    ("ret", DatatypeAccessor::Datatype("Typ".into())),
+                ],
+            )
+            .variant(
+                "List",
+                vec![("lt", DatatypeAccessor::Datatype("Typ".into()))],
+            )
+            .variant(
+                "Pair",
+                vec![
+                    ("t1", DatatypeAccessor::Datatype("Typ".into())),
+                    ("t2", DatatypeAccessor::Datatype("Typ".into())),
+                ],
+            )
+            .variant(
+                "Box",
+                vec![("bt", DatatypeAccessor::Datatype("Typ".into()))],
+            )
+            .variant("Any", vec![])
+            .variant("Unit", vec![])
+            .variant(
+                "Vect",
+                vec![("vt", DatatypeAccessor::Datatype("Typ".into()))],
+            )
+            .variant("Float", vec![])
+            .variant("Char", vec![])
+            .finish()
+    }
+    pub fn true_z3(&self) -> Bool<'a> {
+        Bool::from_bool(self.cxt, true)
+    }
+    pub fn z3_to_typ(&self, model: &'a Model, e: Dynamic) -> Typ {
+        if self.is_int(model, &e) {
+            Typ::Int
+        } else if self.is_bool(model, &e) {
+            Typ::Bool
+        } else if self.is_str(model, &e) {
+            Typ::Str
+        } else if self.is_arr(model, &e) {
+            let arg = self.arr_arg(&e);
+            let ret = self.arr_ret(&e);
+            let t1 = self.z3_to_typ(model, arg);
+            let t2 = self.z3_to_typ(model, ret);
+            Typ::Arr(Box::new(t1), Box::new(t2))
+        } else if self.is_list(model, &e) {
+            let t = self.list_typ(&e);
+            let t = self.z3_to_typ(model, t);
+            Typ::List(Box::new(t))
+        } else if self.is_pair(model, &e) {
+            let t1 = self.pair1(&e);
+            let t2 = self.pair2(&e);
+            let t1 = self.z3_to_typ(model, t1);
+            let t2 = self.z3_to_typ(model, t2);
+            Typ::Pair(Box::new(t1), Box::new(t2))
+        } else if self.is_box(model, &e) {
+            let t = self.box_typ(&e);
+            let t = self.z3_to_typ(model, t);
+            Typ::Box(Box::new(t))
+        } else if self.is_any(model, &e) {
+            Typ::Any
+        } else if self.is_unit(model, &e) {
+            Typ::Unit
+        } else if self.is_vect(model, &e) {
+            let t = self.vect_typ(&e);
+            let t = self.z3_to_typ(model, t);
+            Typ::Vect(Box::new(t))
+        } else if self.is_float(model, &e) {
+            Typ::Float
+        } else if self.is_char(model, &e) {
+            Typ::Char
+        } else {
+            panic!("missing case in z3_to_typ");
+        }
+    }
+
+    fn is_variant(&self, i: usize, model: &Model, e: &Dynamic) -> bool {
+        model
+            .eval(&self.typ.variants[i].tester.apply(&[&e]).as_bool().unwrap())
+            .unwrap()
+            .as_bool()
+            .unwrap()
+    }
+    pub fn z3_is_arr(&self, e: Dynamic<'a>) -> Bool<'a> {
+        self.typ.variants[3].tester.apply(&[&e]).as_bool().unwrap()
+    }
+    pub fn z3_is_list(&self, e: Dynamic<'a>) -> Bool<'a> {
+        self.typ.variants[4].tester.apply(&[&e]).as_bool().unwrap()
+    }
+    pub fn z3_is_pair(&self, e: Dynamic<'a>) -> Bool<'a> {
+        self.typ.variants[5].tester.apply(&[&e]).as_bool().unwrap()
+    }
+    pub fn z3_is_box(&self, e: Dynamic<'a>) -> Bool<'a> {
+        self.typ.variants[6].tester.apply(&[&e]).as_bool().unwrap()
+    }
+    pub fn z3_is_vect(&self, e: Dynamic<'a>) -> Bool<'a> {
+        self.typ.variants[9].tester.apply(&[&e]).as_bool().unwrap()
+    }
+    pub fn is_int(&self, model: &Model, e: &Dynamic) -> bool {
+        self.is_variant(0, model, e)
+    }
+    pub fn is_bool(&self, model: &Model, e: &Dynamic) -> bool {
+        self.is_variant(1, model, e)
+    }
+    pub fn is_str(&self, model: &Model, e: &Dynamic) -> bool {
+        self.is_variant(2, model, e)
+    }
+    pub fn is_arr(&self, model: &Model, e: &Dynamic) -> bool {
+        self.is_variant(3, model, e)
+    }
+    pub fn is_list(&self, model: &Model, e: &Dynamic) -> bool {
+        self.is_variant(4, model, e)
+    }
+    pub fn is_pair(&self, model: &Model, e: &Dynamic) -> bool {
+        self.is_variant(5, model, e)
+    }
+    pub fn is_box(&self, model: &Model, e: &Dynamic) -> bool {
+        self.is_variant(6, model, e)
+    }
+    pub fn is_any(&self, model: &Model, e: &Dynamic) -> bool {
+        self.is_variant(7, model, e)
+    }
+    pub fn is_unit(&self, model: &Model, e: &Dynamic) -> bool {
+        self.is_variant(8, model, e)
+    }
+    pub fn is_vect(&self, model: &Model, e: &Dynamic) -> bool {
+        self.is_variant(9, model, e)
+    }
+    pub fn is_float(&self, model: &Model, e: &Dynamic) -> bool {
+        self.is_variant(10, model, e)
+    }
+    pub fn is_char(&self, model: &Model, e: &Dynamic) -> bool {
+        self.is_variant(11, model, e)
+    }
+    pub fn arr_arg(&self, e: &Dynamic<'a>) -> Dynamic<'a> {
+        self.typ.variants[3].accessors[0].apply(&[e])
+    }
+    pub fn arr_ret(&self, e: &Dynamic<'a>) -> Dynamic<'a> {
+        self.typ.variants[3].accessors[1].apply(&[e])
+    }
+    pub fn list_typ(&self, e: &Dynamic<'a>) -> Dynamic<'a> {
+        self.typ.variants[4].accessors[0].apply(&[e])
+    }
+    pub fn pair1(&self, e: &Dynamic<'a>) -> Dynamic<'a> {
+        self.typ.variants[5].accessors[0].apply(&[e])
+    }
+    pub fn pair2(&self, e: &Dynamic<'a>) -> Dynamic<'a> {
+        self.typ.variants[5].accessors[1].apply(&[e])
+    }
+    pub fn box_typ(&self, e: &Dynamic<'a>) -> Dynamic<'a> {
+        self.typ.variants[6].accessors[0].apply(&[e])
+    }
+    pub fn vect_typ(&self, e: &Dynamic<'a>) -> Dynamic<'a> {
+        self.typ.variants[9].accessors[0].apply(&[e])
+    }
+}
+use super::syntax::*;
+
+// it does end up sometimes being useful to print metavariables in programs,
+// though usually it's just noise
+const PRINT_METAVARS: bool = false;
+const PRINT_COERCIONS: bool = false;
+
+// Copied from jankscripten
+pub trait Pretty {
+    fn pretty<'b, D, A>(&'b self, pp: &'b D) -> pretty::DocBuilder<'b, D, A>
+    where
+        D: pretty::DocAllocator<'b, A>,
+        D::Doc: Clone,
+        A: Clone;
+}
+
+pub const DEFAULT_WIDTH: usize = 72;
+
+// Copied from jankscripten
+#[macro_export]
+macro_rules! impl_Display_Pretty {
+    ($T:ty) => {
+        impl std::fmt::Display for $T {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                let pp = pretty::BoxAllocator;
+                let doc = self.pretty::<_, ()>(&pp);
+                doc.1.render_fmt($crate::pretty::DEFAULT_WIDTH, f)
+            }
+        }
+    };
+}
+
+////////////////////////////////////////////////////////////////////////////////
+
+fn skip_coercion(e: &Exp) -> &Exp {
+    match e {
+        Exp::Coerce(_, _, e) => e,
+        _ => e,
+    }
+}
+
+fn parens_if<'b, D, A, T>(pp: &'b D, d: &'b T, b: bool) -> pretty::DocBuilder<'b, D, A>
+where
+    T: Pretty,
+    D: pretty::DocAllocator<'b, A>,
+    A: std::clone::Clone,
+    <D as pretty::DocAllocator<'b, A>>::Doc: std::clone::Clone,
+{
+    if b {
+        pp.concat(vec![pp.text("("), d.pretty(pp), pp.text(")")])
+    } else {
+        d.pretty(pp)
+    }
+}
+
+impl Pretty for Typ {
+    fn pretty<'b, D, A>(&'b self, pp: &'b D) -> pretty::DocBuilder<'b, D, A>
+    where
+        D: pretty::DocAllocator<'b, A>,
+        A: std::clone::Clone,
+        <D as pretty::DocAllocator<'b, A>>::Doc: std::clone::Clone,
+    {
+        match self {
+            Typ::Unit => pp.text("unit"),
+            Typ::Int => pp.text("int"),
+            Typ::Float => pp.text("float"),
+            Typ::Bool => pp.text("bool"),
+            Typ::Str => pp.text("str"),
+            Typ::Char => pp.text("char"),
+            Typ::Arr(t1, t2) => pp.concat(vec![
+                parens_if(pp, &**t1, t1.is_arr()),
+                pp.space(),
+                pp.text("->"),
+                pp.space(),
+                t2.pretty(pp),
+            ]),
+            Typ::List(t) => pp.concat(vec![
+                pp.text("list"),
+                pp.space(),
+                parens_if(pp, &**t, t.is_atom()),
+            ]),
+            Typ::Pair(t1, t2) => pp
+                .concat(vec![
+                    parens_if(pp, &**t1, t1.is_atom()),
+                    pp.text(","),
+                    pp.space(),
+                    parens_if(pp, &**t2, t2.is_atom()),
+                ])
+                .parens(),
+            Typ::Box(t) => pp.concat(vec![
+                pp.text("box"),
+                pp.space(),
+                parens_if(pp, &**t, t.is_atom()),
+            ]),
+            Typ::Vect(t) => pp.concat(vec![
+                pp.text("vect"),
+                pp.space(),
+                parens_if(pp, &**t, t.is_atom()),
+            ]),
+            Typ::Any => pp.text("any"),
+            Typ::Metavar(i) => pp.text(alphabet(*i)),
+        }
+    }
+}
+
+/// produces lowercase latin letters in alphabetic order, then produces ⦉i⦊
+/// where i begins at 1 after the latin characters
+fn alphabet(i: u32) -> String {
+    let num_latin_chars = 26;
+    if i <= num_latin_chars {
+        std::char::from_u32('a' as u32 + i).unwrap().to_string()
+    } else {
+        format!("⦉{}⦊", i - num_latin_chars)
+    }
+}
+
+impl Pretty for Lit {
+    fn pretty<'b, D, A>(&'b self, pp: &'b D) -> pretty::DocBuilder<'b, D, A>
+    where
+        D: pretty::DocAllocator<'b, A>,
+        A: std::clone::Clone,
+        <D as pretty::DocAllocator<'b, A>>::Doc: std::clone::Clone,
+    {
+        match self {
+            Lit::Int(n) => pp.as_string(n),
+            Lit::Float(f) => pp.as_string(f),
+            Lit::Bool(true) => pp.text("true"),
+            Lit::Bool(false) => pp.text("false"),
+            Lit::Str(s) => pp.text("\"").append(pp.text(s)).append(pp.text("\"")),
+            Lit::Char(c) => pp.as_string(c).single_quotes(),
+            Lit::Unit => pp.text("()"),
+        }
+    }
+}
+
+impl Pretty for Toplevel {
+    fn pretty<'b, D, A>(&'b self, pp: &'b D) -> pretty::DocBuilder<'b, D, A>
+    where
+        D: pretty::DocAllocator<'b, A>,
+        A: std::clone::Clone,
+        <D as pretty::DocAllocator<'b, A>>::Doc: std::clone::Clone,
+    {
+        match self {
+            Toplevel::Define(x, t, e) => pp
+                .concat(vec![
+                    pp.text("define"),
+                    pp.space(),
+                    pp.text(x),
+                    pp.space(),
+                    pp.text(":"),
+                    pp.space(),
+                    t.pretty(pp),
+                    pp.softline(),
+                    e.pretty(pp),
+                ])
+                .parens(),
+            Toplevel::Exp(e) => e.pretty(pp),
+        }
+    }
+}
+
+impl Pretty for Exp {
+    fn pretty<'b, D, A>(&'b self, pp: &'b D) -> pretty::DocBuilder<'b, D, A>
+    where
+        D: pretty::DocAllocator<'b, A>,
+        A: std::clone::Clone,
+        <D as pretty::DocAllocator<'b, A>>::Doc: std::clone::Clone,
+    {
+        match self {
+            Exp::Lit(l) => l.pretty(pp),
+            Exp::Var(x) => pp.text(x),
+            Exp::Let(x, e1, e2) => pp.concat(vec![
+                pp.text("let"),
+                pp.space(),
+                pp.text(x),
+                pp.space(),
+                pp.text("="),
+                pp.space(),
+                e1.pretty(pp).nest(2),
+                pp.space(),
+                pp.text("in"),
+                pp.line(),
+                e2.pretty(pp),
+            ]),
+            Exp::LetRec(bindings, e) => pp.concat(vec![
+                pp.text("let rec"),
+                pp.space(),
+                pp.intersperse(
+                    bindings.iter().map(|(xi, ti, ei)| {
+                        pp.intersperse(
+                            vec![
+                                pp.text(xi),
+                                pp.text(":"),
+                                ti.pretty(pp),
+                                pp.text("="),
+                                ei.pretty(pp).nest(2),
+                            ],
+                            pp.space(),
+                        )
+                    }),
+                    pp.concat(vec![pp.line(), pp.text("and"), pp.space()]),
+                ),
+                pp.space(),
+                pp.text("in"),
+                pp.line(),
+                e.pretty(pp),
+            ]),
+            Exp::Ann(e, typ) => pp.intersperse(
+                vec![
+                    e.pretty(pp),
+                    pp.space(),
+                    pp.text(":"),
+                    pp.space(),
+                    typ.pretty(pp),
+                ],
+                pp.space(),
+            ),
+            Exp::Fun(x, Typ::Metavar(_), e) if !PRINT_METAVARS => pp
+                .concat(vec![
+                    pp.text("fun"),
+                    pp.space(),
+                    pp.text(x),
+                    pp.space(),
+                    pp.text("."),
+                    pp.softline(),
+                    e.pretty(pp).nest(2),
+                ])
+                .group(),
+            Exp::Fun(x, t, e) => pp.concat(vec![
+                pp.text("fun"),
+                pp.space(),
+                pp.text(x),
+                pp.text(":"),
+                t.pretty(pp),
+                pp.text("."),
+                pp.softline(),
+                e.pretty(pp).nest(2),
+            ]),
+            Exp::Fix(x, t, e) => pp.concat(vec![
+                pp.text("fix"),
+                pp.space(),
+                pp.text(x),
+                pp.text(":"),
+                t.pretty(pp),
+                pp.text("."),
+                pp.line(),
+                e.pretty(pp),
+            ]),
+            Exp::App(e1, e2) => {
+                let e2 = skip_coercion(&**e2);
+                pp.concat(vec![
+                    parens_if(pp, &**e1, e1.is_fun_exp()),
+                    pp.softline(),
+                    parens_if(pp, e2, !(e2.is_atom() || e2.is_coercion())),
+                ])
+            }
+            Exp::BinaryOp(op, e1, e2) => pp.concat(vec![
+                // should be pair or looser
+                parens_if(pp, &**e1, e1.is_fun_exp()),
+                pp.space(),
+                match op {
+                    BinOp::IntAdd => pp.text("+"),
+                    BinOp::IntMul => pp.text("*"),
+                    BinOp::IntEq => pp.text("="),
+                    _ => pp.text("[op]"),
+                },
+                pp.space(),
+                parens_if(pp, &**e2, e2.is_add_or_looser()),
+            ]),
+            Exp::AddOverload(e1, e2) => pp.concat(vec![
+                // should be pair or looser
+                parens_if(pp, &**e1, e1.is_fun_exp()),
+                pp.text(" +? "),
+                parens_if(pp, &**e2, e2.is_add_or_looser()),
+            ]),
+            Exp::UnaryOp(op, e1) => pp.concat(vec![
+                match op {
+                    UnOp::Not => pp.text("not "),
+                    _ => pp.text("[op] "),
+                },
+                parens_if(pp, &**e1, e1.is_mul_or_looser()),
+            ]),
+            Exp::If(e1, e2, e3) => pp
+                .concat(vec![
+                    pp.text("if"),
+                    pp.space(),
+                    e1.pretty(pp).nest(2),
+                    pp.line(),
+                    pp.concat(vec![pp.text("then"), pp.softline(), e2.pretty(pp)])
+                        .nest(2),
+                    pp.line(),
+                    pp.concat(vec![pp.text("else"), pp.softline(), e3.pretty(pp)])
+                        .nest(2),
+                ])
+                .group(),
+            Exp::Pair(e1, e2) => pp.concat(vec![
+                // should be is pair or looser (because pair is right associative)
+                parens_if(pp, &**e1, e1.is_fun_exp()),
+                pp.text(","),
+                pp.space(),
+                parens_if(pp, &**e2, e2.is_fun_exp()),
+            ]),
+            Exp::Fst(e) => pp.concat(vec![pp.text("fst"), pp.space(), e.pretty(pp).nest(2)]),
+            Exp::Snd(e) => pp.concat(vec![pp.text("snd"), pp.space(), e.pretty(pp).nest(2)]),
+            Exp::Cons(e1, e2) => pp.concat(vec![
+                parens_if(pp, &**e1, e1.is_app_like()),
+                pp.space(),
+                pp.text("::"),
+                pp.space(),
+                e2.pretty(pp).nest(2),
+            ]),
+            Exp::Empty(Typ::Metavar(_)) if !PRINT_METAVARS => pp.text("empty"),
+            Exp::Empty(t) => pp.concat(vec![pp.text("empty:"), pp.space(), t.pretty(pp)]),
+            Exp::IsEmpty(e) => {
+                pp.concat(vec![pp.text("is_empty"), pp.space(), e.pretty(pp).nest(2)])
+            }
+            Exp::Head(e) => pp.concat(vec![pp.text("head"), pp.space(), e.pretty(pp).nest(2)]),
+            Exp::Tail(e) => pp.concat(vec![
+                pp.text("tail"),
+                pp.space(),
+                parens_if(pp, &**e, e.is_app_like()).nest(2),
+            ]),
+            Exp::Box(e) => pp.concat(vec![
+                pp.text("box "),
+                parens_if(pp, &**e, e.is_app_like()).nest(2),
+            ]),
+            Exp::Unbox(e) => pp.concat(vec![
+                pp.text("unbox "),
+                parens_if(pp, &**e, e.is_app_like()).nest(2),
+            ]),
+            Exp::BoxSet(e1, e2) => pp.concat(vec![
+                pp.text("boxset! "),
+                parens_if(pp, &**e1, e1.is_app_like()).nest(2),
+                pp.space(),
+                parens_if(pp, &**e2, e2.is_app_like()).nest(2),
+            ]),
+            Exp::Vector(e1, e2) => pp.concat(vec![
+                pp.text("vector "),
+                parens_if(pp, &**e1, e1.is_app_like()).nest(2),
+                pp.space(),
+                parens_if(pp, &**e2, e2.is_app_like()).nest(2),
+            ]),
+            Exp::VectorRef(e1, e2) => pp.concat(vec![
+                pp.text("vector-ref "),
+                parens_if(pp, &**e1, e1.is_app_like()).nest(2),
+                pp.space(),
+                parens_if(pp, &**e2, e2.is_app_like()).nest(2),
+            ]),
+            Exp::VectorSet(e1, e2, e3) => pp.concat(vec![
+                pp.text("vector-set! "),
+                parens_if(pp, &**e1, e1.is_app_like()).nest(2),
+                pp.space(),
+                parens_if(pp, &**e2, e2.is_app_like()).nest(2),
+                pp.space(),
+                parens_if(pp, &**e3, e3.is_app_like()).nest(2),
+            ]),
+            Exp::VectorLen(e) => pp.concat(vec![
+                pp.text("vector-length "),
+                parens_if(pp, &**e, e.is_app_like()).nest(2),
+            ]),
+            Exp::IsBool(e) => pp.concat(vec![pp.text("is_bool"), pp.space(), e.pretty(pp).nest(2)]),
+            Exp::IsInt(e) => pp.concat(vec![pp.text("is_int"), pp.space(), e.pretty(pp).nest(2)]),
+            Exp::IsString(e) => {
+                pp.concat(vec![pp.text("is_string"), pp.space(), e.pretty(pp).nest(2)])
+            }
+            Exp::IsList(e) => pp.concat(vec![pp.text("is_list"), pp.space(), e.pretty(pp).nest(2)]),
+            Exp::IsFun(e) => pp.concat(vec![pp.text("is_fun"), pp.space(), e.pretty(pp).nest(2)]),
+            Exp::Coerce(_, Typ::Any, e) if e.is_atom() => {
+                pp.concat(vec![pp.text("("), e.pretty(pp), pp.text(" : any)")])
+            }
+            Exp::Coerce(from, to, e) if PRINT_COERCIONS => pp.concat(vec![
+                pp.text("coerce("),
+                from.pretty(pp),
+                pp.text(", "),
+                to.pretty(pp),
+                pp.text(")"),
+                pp.space(),
+                e.pretty(pp).nest(2),
+            ]),
+            Exp::Coerce(_, _, e) => e.pretty(pp),
+            Exp::PrimCoerce(k, e) => {
+                pp.concat(vec![pp.text(format!("[{:?}]", k)), e.pretty(pp).nest(2)])
+            }
+        }
+    }
+}
+
+impl_Display_Pretty!(Typ);
+impl_Display_Pretty!(Lit);
+impl_Display_Pretty!(Exp);
+impl_Display_Pretty!(Toplevel);
+use crate::parser::next_metavar;
+
+/// Several ground types are presently missing. But, these are all we need
+/// for the non-Grift benchmarks.
+#[derive(Debug, PartialEq, Clone)]
+pub enum GroundTyp {
+    Int,
+    Bool,
+    Fun,
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub enum Coerce {
+    Id,
+    Tag(GroundTyp),
+    Untag(GroundTyp),
+    Wrap(Box<Coerce>, Box<Coerce>),
+    Seq(Box<Coerce>, Box<Coerce>),
+    Doomed,
+}
+
+impl Coerce {
+    pub fn seq(&self, other: &Coerce) -> Coerce {
+        match (self, other) {
+            (Coerce::Id, _) => other.clone(),
+            (_, Coerce::Id) => self.clone(),
+            _ => Coerce::Seq(Box::new(self.clone()), Box::new(other.clone())),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub enum Typ {
+    Unit,
+    Int,
+    Float,
+    Bool,
+    Str,
+    Char,
+    Arr(Box<Typ>, Box<Typ>),
+    List(Box<Typ>),
+    Pair(Box<Typ>, Box<Typ>),
+    Box(Box<Typ>),
+    Vect(Box<Typ>),
+    Any,
+    Metavar(u32),
+}
+
+impl Typ {
+    pub fn take(&mut self) -> Typ {
+        std::mem::replace(self, Typ::Unit)
+    }
+
+    /// Generates a right-associated function type
+    ///
+    /// `typs` must not be empty
+    pub fn arrs(typs: Vec<Typ>) -> Self {
+        assert!(!typs.is_empty());
+
+        if typs.len() == 1 {
+            Typ::Arr(
+                Box::new(Typ::Unit),
+                Box::new(typs.into_iter().next().unwrap()),
+            )
+        } else {
+            let mut typs = typs.into_iter().rev();
+            let mut arr = typs.next().unwrap();
+            for typ in typs {
+                arr = Typ::Arr(Box::new(typ), Box::new(arr));
+            }
+            arr
+        }
+    }
+
+    /// Generates a right-associated, unit-terminated tuple type
+    pub fn tuples(typs: Vec<Typ>) -> Self {
+        if typs.len() == 0 {
+            Typ::Unit
+        } else if typs.len() == 1 {
+            Typ::Pair(
+                Box::new(typs.into_iter().next().unwrap()),
+                Box::new(Typ::Unit),
+            )
+        } else {
+            let mut tup = Typ::Unit;
+            for fst in typs.into_iter().rev() {
+                tup = Typ::Pair(Box::new(fst), Box::new(tup));
+            }
+            tup
+        }
+    }
+
+    pub fn is_arr(&self) -> bool {
+        matches!(self, Typ::Arr(..))
+    }
+    pub fn is_metavar(&self) -> bool {
+        matches!(self, Typ::Metavar(..))
+    }
+
+    pub fn join(&self, other: &Typ) -> Typ {
+        if self.is_metavar() || other.is_metavar() {
+            panic!(".join on metavars")
+        } else if self != other {
+            Typ::Any
+        } else {
+            self.clone()
+        }
+    }
+
+    pub fn is_atom(&self) -> bool {
+        match self {
+            Typ::Unit
+            | Typ::Int
+            | Typ::Float
+            | Typ::Bool
+            | Typ::Str
+            | Typ::Char
+            | Typ::Any
+            | Typ::Metavar(..) => false,
+            Typ::Arr(..) | Typ::List(..) | Typ::Pair(..) | Typ::Box(..) | Typ::Vect(..) => true,
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub enum Lit {
+    Int(i32),
+    Bool(bool),
+    Str(String),
+    Float(f64),
+    Char(char),
+    Unit,
+}
+
+impl Lit {
+    pub fn typ(&self) -> Typ {
+        match self {
+            Lit::Int(_) => Typ::Int,
+            Lit::Bool(_) => Typ::Bool,
+            Lit::Str(_) => Typ::Str,
+            Lit::Float(_) => Typ::Float,
+            Lit::Char(_) => Typ::Char,
+            Lit::Unit => Typ::Unit,
+        }
+    }
+}
+
+pub type Id = String;
+
+#[derive(Debug, PartialEq, Clone)]
+pub enum Toplevel {
+    Define(Id, Typ, Exp),
+    Exp(Exp),
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub enum Exp {
+    Lit(Lit),
+    Var(Id),
+    Fun(Id, Typ, Box<Exp>),
+    Fix(Id, Typ, Box<Exp>),
+    App(Box<Exp>, Box<Exp>),
+    UnaryOp(UnOp, Box<Exp>),
+    BinaryOp(BinOp, Box<Exp>, Box<Exp>),
+    Let(Id, Box<Exp>, Box<Exp>),
+    LetRec(Vec<(Id, Typ, Exp)>, Box<Exp>),
+    Ann(Box<Exp>, Typ),
+    AddOverload(Box<Exp>, Box<Exp>),
+    If(Box<Exp>, Box<Exp>, Box<Exp>),
+    // pairs
+    Pair(Box<Exp>, Box<Exp>),
+    Fst(Box<Exp>),
+    Snd(Box<Exp>),
+    // lists
+    Cons(Box<Exp>, Box<Exp>),
+    // Γ ⊢ empty: T : List(T)
+    Empty(Typ),
+    IsEmpty(Box<Exp>),
+    Head(Box<Exp>),
+    Tail(Box<Exp>),
+    // boxes
+    Box(Box<Exp>),
+    Unbox(Box<Exp>),
+    BoxSet(Box<Exp>, Box<Exp>),
+    // vectors
+    /// size, initial value
+    Vector(Box<Exp>, Box<Exp>),
+    /// vector, index
+    VectorRef(Box<Exp>, Box<Exp>),
+    /// vector, index, value
+    VectorSet(Box<Exp>, Box<Exp>, Box<Exp>),
+    /// vector
+    VectorLen(Box<Exp>), // built-in because we need the polymorphic type
+    /// Type tests
+    IsBool(Box<Exp>),
+    IsInt(Box<Exp>),
+    IsString(Box<Exp>),
+    IsList(Box<Exp>),
+    IsFun(Box<Exp>),
+    Coerce(Typ, Typ, Box<Exp>),
+    /// The Coerce variant is unfortunately named, since it is really an
+    /// occurrence of the coerce metafunction. This PrimCoerce is actually a
+    /// coercion application.
+    PrimCoerce(Coerce, Box<Exp>),
+}
+
+/// Holds the type for a unary operator. Not guaranteed to hold the actual
+/// operation from the program
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum UnOp {
+    Not,
+    BinaryNot,
+    FloatAbs,
+    TimerStart,
+    Print,
+    Exit,
+    ReadInt,
+    PrintInt,
+    ReadBool,
+    PrintBool,
+    ReadFloat,
+    ReadChar,
+    PrintChar,
+    FloatToInt,
+    IntToFloat,
+    CharToInt,
+    IntToChar,
+    And,
+}
+/// Holds the type for a binary operator. Only IntAdd is guaranteed to hold the
+/// actual operation from the program
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BinOp {
+    IntEq,
+    /// Most other binops also stand in for a number of different operators of
+    /// a different type, which is obviously wrong. Our interpreter mostly doesn't
+    /// support them so it's not a problem, but it supports this one. (int -> int)
+    /// -> int operators that are not supported by the interpreter go in IntMul
+    IntAdd,
+    /// May not actually be IntMul. Don't parse an (int -> int) -> int operation
+    /// besides + as IntAdd, parse it as IntMul
+    IntMul,
+    FloatAdd,
+    FloatEq,
+    /// grift's `and`. i'm not sure what this is mostly because i'm not sure why
+    /// it's any -> any -> any in the original env. Same type as `or` (omitted)
+    And,
+    Printf,
+    PrintFloat,
+}
+
+impl UnOp {
+    pub fn typ(&self) -> (Typ, Typ) {
+        #[allow(unused_imports)]
+        use std::boxed::Box;
+        use Typ::*;
+        match self {
+            UnOp::Not => (Bool, Bool),
+            UnOp::BinaryNot => (Int, Int),
+            UnOp::FloatAbs => (Float, Float),
+            UnOp::TimerStart => (Unit, Unit),
+            UnOp::Print => (Str, Unit),
+            UnOp::Exit => (Int, Any),
+            UnOp::ReadInt => (Unit, Int),
+            UnOp::PrintInt => (Int, Unit),
+            UnOp::ReadBool => (Unit, Bool),
+            UnOp::PrintBool => (Bool, Unit),
+            UnOp::ReadFloat => (Unit, Float),
+            // PrintFloat is weird
+            UnOp::ReadChar => (Unit, Char),
+            UnOp::PrintChar => (Char, Unit),
+            UnOp::FloatToInt => (Float, Int),
+            UnOp::IntToFloat => (Int, Float),
+            UnOp::CharToInt => (Char, Int),
+            UnOp::IntToChar => (Int, Char),
+            UnOp::And => (Any, Typ::Arr(Box::new(Any), Box::new(Any))),
+        }
+    }
+}
+impl BinOp {
+    pub fn typ(&self) -> (Typ, Typ, Typ) {
+        #[allow(unused_imports)]
+        use std::boxed::Box;
+        use Typ::*;
+        match self {
+            BinOp::IntEq => (Int, Int, Bool),
+            BinOp::IntAdd | BinOp::IntMul => (Int, Int, Int),
+            BinOp::FloatAdd => (Float, Float, Float),
+            BinOp::FloatEq => (Float, Float, Bool),
+            // see doc
+            BinOp::And => (Any, Any, Any),
+            BinOp::Printf => (Str, List(Box::new(Any)), Unit),
+            BinOp::PrintFloat => (Float, Int, Unit),
+        }
+    }
+}
+
+impl Exp {
+    pub fn take(&mut self) -> Self {
+        std::mem::replace(self, Exp::Lit(Lit::Int(0)))
+    }
+
+    pub fn coerce(self, k: Coerce) -> Self {
+        match k {
+            Coerce::Id => self,
+            _ => Exp::PrimCoerce(k, Box::new(self)),
+        }
+    }
+
+    pub fn begin(exps: Vec<Exp>) -> Self {
+        let num_exps = exps.len();
+
+        if num_exps == 0 {
+            Exp::Lit(Lit::Unit)
+        } else if num_exps == 1 {
+            exps.into_iter().next().unwrap()
+        } else {
+            let mut exps = exps.into_iter().rev();
+            let mut res = exps.next().unwrap();
+            let mut ctr = num_exps - 1;
+            for exp in exps {
+                res = Exp::Let(format!("__begin{}", ctr), Box::new(exp), Box::new(res));
+                ctr = ctr - 1;
+            }
+            res
+        }
+    }
+
+    pub fn lets(bindings: Vec<(String, Option<Typ>, Exp)>, body: Exp) -> Self {
+        let mut res = body;
+        for (x, t, e) in bindings.into_iter().rev() {
+            let e = match t {
+                Some(t) => Exp::Ann(Box::new(e), t),
+                None => e,
+            };
+
+            res = Exp::Let(x, Box::new(e), Box::new(res));
+        }
+        res
+    }
+
+    pub fn apps(exps: Vec<Exp>) -> Self {
+        assert!(!exps.is_empty());
+
+        if exps.len() == 1 {
+            Exp::App(
+                Box::new(exps.into_iter().next().unwrap()),
+                Box::new(Exp::Lit(Lit::Unit)),
+            )
+        } else {
+            let mut exps = exps.into_iter();
+            let mut app = exps.next().unwrap();
+            for arg in exps {
+                app = Exp::App(Box::new(app), Box::new(arg));
+            }
+            app
+        }
+    }
+
+    /// Generates a right-associated, unit-terminated pair (cf. `Typ::tuples`)
+    ///
+    /// Returns unit or the sole type itself when given 0 or 1 `typs`
+    pub fn pairs(exps: Vec<Exp>) -> Self {
+        if exps.len() == 0 {
+            Exp::Lit(Lit::Unit)
+        } else if exps.len() == 1 {
+            Exp::Pair(
+                Box::new(exps.into_iter().next().unwrap()),
+                Box::new(Exp::Lit(Lit::Unit)),
+            )
+        } else {
+            let mut tup = Exp::Lit(Lit::Unit);
+            for fst in exps.into_iter().rev() {
+                tup = Exp::Pair(Box::new(fst), Box::new(tup));
+            }
+            tup
+        }
+    }
+
+    /// Generates a function that gets the `n`th element out of a right-associated, unit-terminated tuple
+    pub fn proj(self, n: u32) -> Self {
+        let mut n = n;
+        let mut proj = self;
+        while n > 0 {
+            proj = Exp::Snd(Box::new(proj));
+            n = n - 1;
+        }
+        Exp::Fst(Box::new(proj))
+    }
+
+    pub fn funs(args: Vec<(String, Typ)>, body: Self) -> Self {
+        let mut fun = body;
+        for (x, t) in args.into_iter().rev() {
+            fun = Exp::Fun(x, t, Box::new(fun));
+        }
+        fun
+    }
+
+    pub fn switch(scrutinee: Exp, cases: Vec<(Vec<i32>, Exp)>, default: Exp) -> Self {
+        let name = "__scrutinee".to_string(); // TODO(mmg): ensure freshness
+        let x = Exp::Var(name.clone());
+
+        let mut e = default;
+
+        for (vals, then) in cases.into_iter().rev() {
+            e = Exp::If(
+                Box::new(Exp::one_of_ints(&x, vals)),
+                Box::new(then),
+                Box::new(e),
+            );
+        }
+
+        Exp::Let(name, Box::new(scrutinee), Box::new(e))
+    }
+
+    fn one_of_ints(val: &Exp, ints: Vec<i32>) -> Self {
+        assert!(ints.len() >= 1);
+
+        let mut ints = ints.into_iter();
+        let mut e = Exp::BinaryOp(
+            BinOp::IntEq,
+            Box::new(val.clone()),
+            Box::new(Exp::Lit(Lit::Int(ints.next().unwrap()))),
+        );
+        for i in ints {
+            e = Exp::or(
+                e,
+                Exp::BinaryOp(
+                    BinOp::IntEq,
+                    Box::new(val.clone()),
+                    Box::new(Exp::Lit(Lit::Int(i))),
+                ),
+            );
+        }
+
+        e
+    }
+
+    fn or(l: Exp, r: Exp) -> Self {
+        Exp::If(
+            Box::new(l),
+            Box::new(Exp::Lit(Lit::Bool(true))),
+            Box::new(r),
+        )
+    }
+
+    pub fn cond(cases: Vec<(Exp, Exp)>, default: Exp) -> Exp {
+        let mut e = default;
+
+        for (condition, branch) in cases.into_iter().rev() {
+            e = Exp::If(Box::new(condition), Box::new(branch), Box::new(e));
+        }
+
+        e
+    }
+
+    pub fn repeat(
+        var: Id,
+        lo: Exp,
+        hi: Exp,
+        acc: Id,
+        acc_typ: Typ,
+        acc_init: Exp,
+        body: Exp,
+    ) -> Exp {
+        let loop_fun = format!("__loop_{}_{}", var, acc); // TODO(mmg): ensure freshness
+        let loop_hi = format!("__loop_{}_{}_hi", var, acc);
+        let index = Box::new(Exp::Var(var.clone()));
+
+        let loop_body = Exp::If(
+            Box::new(Exp::BinaryOp(
+                BinOp::IntEq,
+                index.clone(),
+                Box::new(Exp::Var(loop_hi.clone())),
+            )),
+            // last loop
+            Box::new(body.clone()),
+            // body
+            Box::new(Exp::apps(vec![
+                Exp::Var(loop_fun.clone()),
+                Exp::BinaryOp(
+                    BinOp::IntAdd,
+                    index.clone(),
+                    Box::new(Exp::Lit(Lit::Int(1))),
+                ),
+                body.clone(),
+            ])),
+        );
+
+        Exp::LetRec(
+            vec![
+                (loop_hi, next_metavar(), hi),
+                (
+                    loop_fun.clone(),
+                    next_metavar(),
+                    Exp::funs(vec![(var, next_metavar()), (acc, acc_typ)], loop_body),
+                ),
+            ],
+            Box::new(Exp::apps(vec![Exp::Var(loop_fun), lo, acc_init])),
+        )
+    }
+
+    /// Replaces all type annotations with metavariables
+    ///
+    /// Removes `Exp::Ann` and `Exp::Coerce` nodes (but leaves in `Exp::Ann(e, Typ::Any))`)
+    pub fn fresh_types(&mut self) {
+        match self {
+            Exp::Ann(e, _) | Exp::Coerce(_, _, e) => {
+                e.fresh_types();
+                *self = e.take();
+            }
+            Exp::Lit(_) | Exp::Var(_) => (),
+            Exp::Empty(t) => *t = next_metavar(),
+            Exp::Fun(_, t, e) | Exp::Fix(_, t, e) => {
+                *t = next_metavar();
+                e.fresh_types();
+            }
+            Exp::LetRec(bindings, e) => {
+                for (_, ti, ei) in bindings.iter_mut() {
+                    *ti = next_metavar();
+                    ei.fresh_types();
+                }
+                e.fresh_types();
+            }
+            Exp::UnaryOp(_, e)
+            | Exp::Fst(e)
+            | Exp::Snd(e)
+            | Exp::IsEmpty(e)
+            | Exp::Head(e)
+            | Exp::Tail(e)
+            | Exp::Box(e)
+            | Exp::Unbox(e)
+            | Exp::IsBool(e)
+            | Exp::IsInt(e)
+            | Exp::IsString(e)
+            | Exp::IsList(e)
+            | Exp::IsFun(e)
+            | Exp::VectorLen(e) => e.fresh_types(),
+            Exp::App(e1, e2)
+            | Exp::Let(_, e1, e2)
+            | Exp::AddOverload(e1, e2)
+            | Exp::BinaryOp(_, e1, e2)
+            | Exp::Pair(e1, e2)
+            | Exp::Cons(e1, e2)
+            | Exp::BoxSet(e1, e2)
+            | Exp::Vector(e1, e2)
+            | Exp::VectorRef(e1, e2) => {
+                e1.fresh_types();
+                e2.fresh_types();
+            }
+            Exp::If(e1, e2, e3) | Exp::VectorSet(e1, e2, e3) => {
+                e1.fresh_types();
+                e2.fresh_types();
+                e3.fresh_types();
+            }
+            Exp::PrimCoerce(..) => panic!("PrimCoerce should not appear in source"),
+        };
+    }
+
+    /// Returns true when for every annotation in other, self matches
+    ///
+    /// Should be used like
+    /// inferred_program.matches_when_both_annotated(parsed_program), otherwise
+    /// the Ann/Coerce stuff won't match
+    ///
+    /// Resolves a problem where the grift static benchmarks aren't actually
+    /// fully annotated. This is kind of like whether they can be unified. When
+    /// other has a type variable, the comparison is skipped.
+    ///
+    /// Also, the resolution for a separate issue is folded into this: When
+    /// other has an annotation, the comparison is skipped, and when self has
+    /// a coercion, the comparison is skipped
+    pub fn matches_roughly(&self, other: &Exp) -> Result<(), String> {
+        match (self, other) {
+            (_, Exp::Ann(e, _)) => self.matches_roughly(e),
+            (Exp::Ann(..), _) => panic!("why ann on left-hand side?"),
+            (Exp::Coerce(.., e), _) => e.matches_roughly(other),
+            (Exp::Lit(_), Exp::Lit(_)) | (Exp::Var(_), Exp::Var(_)) => Ok(()),
+            (Exp::Empty(t1), Exp::Empty(t2)) => {
+                if t2.is_metavar() || t1 == t2 {
+                    Ok(())
+                } else {
+                    Err(format!("empty mismatch {} vs {}", t1, t2))
+                }
+            }
+            (Exp::Fun(id1, t1, e1), Exp::Fun(id2, t2, e2))
+            | (Exp::Fix(id1, t1, e1), Exp::Fix(id2, t2, e2)) => {
+                e1.matches_roughly(e2)?;
+                if t2.is_metavar() || t1 == t2 {
+                    Ok(())
+                } else {
+                    Err(format!("fun mismatch {}: {} vs {}: {}", id1, t1, id2, t2))
+                }
+            }
+            (Exp::LetRec(bindings1, e1), Exp::LetRec(bindings2, e2)) => {
+                bindings1.iter().zip(bindings2.iter()).fold(
+                    Ok(()),
+                    |acc, ((id1i, t1i, e1i), (id2i, t2i, e2i))| {
+                        acc?;
+                        e1i.matches_roughly(e2i)?;
+                        if t2i.is_metavar() || t1i == t2i {
+                            Ok(())
+                        } else {
+                            Err(format!(
+                                "letrec mismatch {}: {} vs {}: {}",
+                                id1i, t1i, id2i, t2i
+                            ))
+                        }
+                    },
+                )?;
+                e1.matches_roughly(e2)
+            }
+            (Exp::UnaryOp(op1, e1), Exp::UnaryOp(op2, e2)) if op1 == op2 => e1.matches_roughly(e2),
+            (Exp::BinaryOp(op1, e11, e12), Exp::BinaryOp(op2, e21, e22)) if op1 == op2 => e11
+                .matches_roughly(e21)
+                .and_then(|_| e12.matches_roughly(e22)),
+            (Exp::Fst(e1), Exp::Fst(e2))
+            | (Exp::Snd(e1), Exp::Snd(e2))
+            | (Exp::IsEmpty(e1), Exp::IsEmpty(e2))
+            | (Exp::Head(e1), Exp::Head(e2))
+            | (Exp::Tail(e1), Exp::Tail(e2))
+            | (Exp::Box(e1), Exp::Box(e2))
+            | (Exp::Unbox(e1), Exp::Unbox(e2))
+            | (Exp::IsBool(e1), Exp::IsBool(e2))
+            | (Exp::IsInt(e1), Exp::IsInt(e2))
+            | (Exp::IsString(e1), Exp::IsString(e2))
+            | (Exp::IsList(e1), Exp::IsList(e2))
+            | (Exp::IsFun(e1), Exp::IsFun(e2))
+            | (Exp::VectorLen(e1), Exp::VectorLen(e2)) => e1.matches_roughly(e2),
+            (Exp::App(e11, e12), Exp::App(e21, e22))
+            | (Exp::Let(_, e11, e12), Exp::Let(_, e21, e22))
+            | (Exp::AddOverload(e11, e12), Exp::AddOverload(e21, e22))
+            | (Exp::Pair(e11, e12), Exp::Pair(e21, e22))
+            | (Exp::Cons(e11, e12), Exp::Cons(e21, e22))
+            | (Exp::BoxSet(e11, e12), Exp::BoxSet(e21, e22))
+            | (Exp::Vector(e11, e12), Exp::Vector(e21, e22))
+            | (Exp::VectorRef(e11, e12), Exp::VectorRef(e21, e22)) => e11
+                .matches_roughly(e21)
+                .and_then(|_| e12.matches_roughly(e22)),
+            (Exp::If(e11, e12, e13), Exp::If(e21, e22, e23))
+            | (Exp::VectorSet(e11, e12, e13), Exp::VectorSet(e21, e22, e23)) => e11
+                .matches_roughly(e21)
+                .and_then(|_| e12.matches_roughly(e22))
+                .and_then(|_| e13.matches_roughly(e23)),
+            _ => Err(format!(
+                "strange. PROGRAM mismatch:\nINFERRED:\n{}\nGIVEN:\n{}",
+                self, other
+            )),
+        }
+    }
+
+    // Print the types of each bound identifier in program order
+    pub fn print_id_types(&self) {
+        match self {
+            Exp::Ann(e, _) | Exp::Coerce(_, _, e) => {
+                e.print_id_types();
+            }
+            Exp::Lit(_) | Exp::Var(_) | Exp::Empty(_) => (),
+            Exp::Fun(id, t, e) | Exp::Fix(id, t, e) => {
+                if !id.starts_with("__") {
+                    println!("{}: {}", id, t);
+                }
+                e.print_id_types();
+            }
+            Exp::LetRec(bindings, e) => {
+                for (idi, ti, ei) in bindings {
+                    if !idi.starts_with("__") {
+                        println!("{}: {}", idi, ti);
+                    }
+                    ei.print_id_types();
+                }
+                e.print_id_types();
+            }
+            Exp::UnaryOp(_, e)
+            | Exp::Fst(e)
+            | Exp::Snd(e)
+            | Exp::IsEmpty(e)
+            | Exp::Head(e)
+            | Exp::Tail(e)
+            | Exp::Box(e)
+            | Exp::Unbox(e)
+            | Exp::IsBool(e)
+            | Exp::IsInt(e)
+            | Exp::IsString(e)
+            | Exp::IsList(e)
+            | Exp::IsFun(e)
+            | Exp::VectorLen(e)
+            | Exp::PrimCoerce(_, e) => e.print_id_types(),
+            Exp::App(e1, e2)
+            | Exp::AddOverload(e1, e2)
+            | Exp::BinaryOp(_, e1, e2)
+            | Exp::Pair(e1, e2)
+            | Exp::Cons(e1, e2)
+            | Exp::BoxSet(e1, e2)
+            | Exp::Vector(e1, e2)
+            | Exp::VectorRef(e1, e2) => {
+                e1.print_id_types();
+                e2.print_id_types();
+            }
+            Exp::Let(_id, e1, e2) => {
+                e1.print_id_types();
+                e2.print_id_types();
+            }
+            Exp::If(e1, e2, e3) | Exp::VectorSet(e1, e2, e3) => {
+                e1.print_id_types();
+                e2.print_id_types();
+                e3.print_id_types();
+            }
+        };
+    }
+
+    pub fn is_app_like(&self) -> bool {
+        matches!(
+            self,
+            Exp::App(..)
+                | Exp::Cons(..)
+                | Exp::Head(..)
+                | Exp::Tail(..)
+                | Exp::IsBool(..)
+                | Exp::IsInt(..)
+                | Exp::IsString(..)
+                | Exp::IsFun(..)
+        )
+    }
+    pub fn is_fun_exp(&self) -> bool {
+        matches!(
+            self,
+            Exp::Fun(..) | Exp::Fix(..) | Exp::If(..) | Exp::Let(..) | Exp::Cons(..)
+        )
+    }
+    pub fn is_add_or_looser(&self) -> bool {
+        match self {
+            // could match on op and parethesize less
+            Exp::BinaryOp(..) => true,
+            _ => self.is_fun_exp(),
+        }
+    }
+    pub fn is_mul_or_looser(&self) -> bool {
+        match self {
+            // could match on op and parethesize less
+            Exp::BinaryOp(..) => true,
+            _ => self.is_add_or_looser(),
+        }
+    }
+
+    pub fn is_coercion(&self) -> bool {
+        match self {
+            Exp::Coerce(_, _, e) => e.is_atom(),
+            _ => false,
+        }
+    }
+
+    pub fn is_atom(&self) -> bool {
+        matches!(self, Exp::Lit(..) | Exp::Var(..) | Exp::Empty(..))
+    }
+}
+//! An evaluator for GTLC + extensions needed for the comparative evaluation.
+use super::syntax::*;
+use derive_more::Display;
+use im_rc::HashMap;
+
+type Env<'a> = HashMap<&'a Id, Val<'a>>;
+
+#[derive(Clone, Debug)]
+enum Val<'a> {
+    Lit(Lit),
+    Closure(Env<'a>, &'a Id, &'a Exp, Coerce, Coerce),
+    Tagged(GroundTyp, Box<Val<'a>>),
+}
+
+pub enum Answer {
+    Lit(Lit),
+    Closure,
+}
+
+#[derive(Display)]
+pub enum Error {
+    #[display(fmt = "coercion failed: {}", _0)]
+    Coercion(String),
+}
+
+struct Eval {
+    // Eventually, we will probably need an arena here for mutable references.
+}
+
+impl<'a> Val<'a> {
+    fn ground_typ(&self) -> GroundTyp {
+        match self {
+            Val::Closure(..) => GroundTyp::Fun,
+            Val::Lit(Lit::Bool(..)) => GroundTyp::Bool,
+            Val::Lit(Lit::Int(..)) => GroundTyp::Int,
+            // Coercion insertion should ensure this does not occur
+            _ => panic!("unsupported type"),
+        }
+    }
+
+    fn to_answer(self) -> Answer {
+        match self {
+            Val::Lit(l) => Answer::Lit(l),
+            Val::Tagged(_, v) => v.to_answer(),
+            Val::Closure(..) => Answer::Closure,
+        }
+    }
+}
+
+type EvalResult<'a> = Result<Val<'a>, Error>;
+
+impl Eval {
+    fn eval_k<'a>(&'a self, k: &Coerce, v: Val<'a>) -> EvalResult<'a> {
+        match k {
+            Coerce::Doomed => Err(Error::Coercion("doomed".to_string())),
+            Coerce::Id => Ok(v),
+            Coerce::Seq(k1, k2) => self.eval_k(k2, self.eval_k(k1, v)?),
+            Coerce::Tag(g) => {
+                let g2 = v.ground_typ();
+                if &g2 == g {
+                    Ok(Val::Tagged(g2, Box::new(v)))
+                } else {
+                    Err(Error::Coercion(format!("tag({:?}) on {:?}", g, v)))
+                }
+            }
+            Coerce::Untag(g) => match v {
+                Val::Tagged(g2, v) => {
+                    if g == &g2 {
+                        Ok(*v)
+                    } else {
+                        Err(Error::Coercion(format!("untag({:?})", g)))
+                    }
+                }
+                _ => Err(Error::Coercion(format!("untagged a not-tagged value"))),
+            },
+            Coerce::Wrap(dom, rng) => {
+                match v {
+                    Val::Closure(env, x, body, dom1, rng1) => {
+                        // TODO(arjun): Ordering matters
+                        Ok(Val::Closure(env, x, body, dom.seq(&dom1), rng1.seq(&rng)))
+                    }
+                    _ => Err(Error::Coercion(format!("wrap on a non-function"))),
+                }
+            }
+        }
+    }
+
+    fn eval<'a>(&'a self, env: Env<'a>, exp: &'a Exp) -> EvalResult<'a> {
+        match exp {
+            Exp::Lit(l) => Ok(Val::Lit(l.clone())),
+            Exp::Var(x) => {
+                // Coercion insertion should ensure this does not occur
+                Ok(env.get(x).cloned().expect("unbound identifier"))
+            }
+            Exp::Fun(x, _, e) => Ok(Val::Closure(env.clone(), x, e, Coerce::Id, Coerce::Id)),
+            Exp::App(e1, e2) => {
+                let v1 = self.eval(env.clone(), e1)?;
+                let v2 = self.eval(env.clone(), e2)?;
+                match v1 {
+                    Val::Closure(mut cl_env, x, body, dom, rng) => {
+                        let v2 = self.eval_k(&dom, v2)?;
+                        cl_env.insert(x, v2);
+                        let r = self.eval(cl_env, body)?;
+                        self.eval_k(&rng, r)
+                    }
+                    // Coercion insertion should ensure this does not occur
+                    _ => panic!("expected closure value in function position (got {:?})", v1),
+                }
+            }
+            Exp::Coerce(t1, t2, e) => {
+                let k = super::insert_coercions::coerce(&t1, &t2);
+                let v = self.eval(env, e)?;
+                self.eval_k(&k, v)
+            }
+            Exp::PrimCoerce(k, e) => self.eval_k(k, self.eval(env, e)?),
+            Exp::BinaryOp(BinOp::IntAdd, e1, e2) => {
+                let v1 = self.eval(env.clone(), e1)?;
+                let v2 = self.eval(env.clone(), e2)?;
+                match (v1, v2) {
+                    (Val::Lit(Lit::Int(m)), Val::Lit(Lit::Int(n))) => Ok(Val::Lit(Lit::Int(m + n))),
+                    // Panic because coercion insertion produced an unsafe program!
+                    _ => panic!("+ received a non-int argument"),
+                }
+            }
+            Exp::If(e1, e2, e3) => match self.eval(env.clone(), e1)? {
+                Val::Lit(Lit::Bool(true)) => self.eval(env, e2),
+                Val::Lit(Lit::Bool(false)) => self.eval(env, e3),
+                _ => panic!("condition is not a boolean"),
+            },
+            _ => unimplemented!(),
+        }
+    }
+}
+
+/// Assumes that the expression has coercions inserted.
+pub fn eval(exp: Exp) -> Result<Answer, Error> {
+    let eval = Eval {};
+    let v = eval.eval(Env::new(), &exp)?;
+    return Ok(v.to_answer());
+}
+use super::syntax::*;
+use im_rc::HashMap;
+
+type Env = HashMap<String, Typ>;
+
+// this serves as a replacement for line numbers haha. Make this true to
+// panic instead of Err (doesn't work for bespoke checks) and you can check the
+// backtrace
+const PANIC_ON_MISMATCH: bool = true;
+
+#[cfg(test)]
+pub fn type_check(exp: &Exp) -> Result<Typ, String> {
+    tcheck(&Default::default(), exp)
+}
+
+pub fn tcheck(env: &Env, exp: &Exp) -> Result<Typ, String> {
+    match exp {
+        // ---------------------------
+        // Γ ⊢ lit : lit.typ()
+        Exp::Lit(lit) => Ok(lit.typ()),
+        // ---------------------------
+        // Γ ⊢ x : Γ(x)
+        Exp::Var(x) => env
+            .get(x)
+            .ok_or(format!("unbound identifier {}", x))
+            .map(Clone::clone),
+        // Γ,x:T_1 ⊢ e : T_2
+        // ---------------------------------------
+        // Γ ⊢ fun (x : T_1) . e : T_1 -> T_2
+        Exp::Fun(x, t, body) => {
+            let mut env = env.clone();
+            env.insert(x.clone(), t.clone());
+            let t_body = tcheck(&env, body)?;
+            Ok(Typ::Arr(Box::new(t.clone()), Box::new(t_body)))
+        }
+        // Γ,x:T ⊢ e : T
+        // ---------------------------------------
+        // Γ ⊢ fix (x : T) . e : T
+        Exp::Fix(x, t1, body) => {
+            let mut env = env.clone();
+            env.insert(x.clone(), t1.clone());
+            let t2 = tcheck(&env, body)?;
+            should_match(t1, t2)
+        }
+        // Γ ⊢ e_1 : T_1 -> T_2
+        // Γ ⊢ e_2 : T_1
+        // ----------------------------------------------
+        // Γ ⊢ e_1 e_2 : T_2
+        Exp::App(e1, e2) => {
+            let t1_to_t2 = tcheck(&env, e1)?;
+            let t1 = tcheck(&env, e2)?;
+            match t1_to_t2 {
+                Typ::Arr(arr_t1, arr_t2) => {
+                    should_match(&*arr_t1, t1)?;
+                    Ok(*arr_t2)
+                }
+                _ => Err("expected arrow in application".to_string()),
+            }
+        }
+        // Γ ⊢ e : unop.typ().0
+        // ----------------------------------------------
+        // Γ ⊢ unop e : unop.typ().1
+        Exp::UnaryOp(op, e) => {
+            let (arg, ret) = op.typ();
+            should_match(&arg, tcheck(&env, e)?)?;
+            Ok(ret)
+        }
+        // Γ ⊢ e_1 : op.typ().0
+        // Γ ⊢ e_2 : op.typ().1
+        // ----------------------------------------------
+        // Γ ⊢ binop e_1 e_2 : op.typ().2
+        Exp::BinaryOp(op, e1, e2) => {
+            let (t1, t2, res) = op.typ();
+            should_match(&t1, tcheck(&env, e1)?)?;
+            should_match(&t2, tcheck(&env, e2)?)?;
+            Ok(res)
+        }
+        // Γ ⊢ e1 : T_1
+        // Γ,x:T_1 ⊢ e2 : T_2
+        // ---------------------------------------
+        // Γ ⊢ let x = e1 in e2 : T_2
+        Exp::Let(x, e1, e2) => {
+            let t1 = tcheck(&env, e1)?;
+            let mut env = env.clone();
+            env.insert(x.clone(), t1);
+            let t2 = tcheck(&env, e2)?;
+            Ok(t2)
+        }
+        // Γ,x1:T_1,...,xn:T_n ⊢ ei : T_i
+        // Γ,x1:T_1,...,xn:T_n ⊢ e : T
+        // ---------------------------------------
+        // Γ ⊢ letrec x1 : T_1 = e1 ... xn : T_n = en in e : T
+        Exp::LetRec(es, e) => {
+            let mut env = env.clone();
+            for (id, typ, _) in es {
+                env.insert(id.clone(), typ.clone());
+            }
+            for (_, typ, ei) in es {
+                should_match(typ, tcheck(&env, ei)?)?;
+            }
+            tcheck(&env, e)
+        }
+        // Γ ⊢ e : T
+        // ---------
+        // Γ ⊢ (e : T) : T
+        Exp::Ann(e, typ) => should_match(typ, tcheck(env, e)?),
+        // Γ ⊢ e_1 : T_1 where T_1 ∈ {int, str, any}
+        // Γ ⊢ e_2 : T_1
+        // ----------------------------------------------
+        // Γ ⊢ e_1 +? e_2 : T_1
+        Exp::AddOverload(e1, e2) => {
+            let t1 = tcheck(&env, e1)?;
+            should_match(&t1, tcheck(&env, e2)?)?;
+            match t1 {
+                Typ::Int | Typ::Str | Typ::Any => Ok(t1),
+                _ => Err("add overload not int, str, or any".to_string()),
+            }
+        }
+        // Γ ⊢ e_1 : bool
+        // Γ ⊢ e_2 : T_1
+        // Γ ⊢ e_3 : T_1
+        // ----------------------------------------------
+        // Γ ⊢ if e_1 then e_2 else e_3 : T_1
+        Exp::If(e1, e2, e3) => {
+            should_match(&Typ::Bool, tcheck(&env, e1)?)?;
+            let t1 = tcheck(&env, e2)?;
+            should_match(&t1, tcheck(&env, e3)?)?;
+            Ok(t1)
+        }
+        // Γ ⊢ e_1 : T_1
+        // Γ ⊢ e_2 : T_2
+        // ----------------------------------------------
+        // Γ ⊢ e_1, e_2 : (T_1, T_2)
+        Exp::Pair(e1, e2) => {
+            let t1 = tcheck(&env, e1)?;
+            let t2 = tcheck(&env, e2)?;
+            Ok(Typ::Pair(Box::new(t1), Box::new(t2)))
+        }
+        // Γ ⊢ e : Pair(T_1, T_2)
+        // ----------------------------------------------
+        // Γ ⊢ fst e : T_1
+        Exp::Fst(e) => {
+            let t = tcheck(env, e)?;
+            match t {
+                Typ::Pair(t1, _) => Ok(*t1),
+                _ => Err("fst non-pair".to_string()),
+            }
+        }
+        // Γ ⊢ e : Pair(T_1, T_2)
+        // ----------------------------------------------
+        // Γ ⊢ snd e : T_1
+        Exp::Snd(e) => {
+            let t = tcheck(env, e)?;
+            match t {
+                Typ::Pair(_, t2) => Ok(*t2),
+                _ => Err("snd non-pair".to_string()),
+            }
+        }
+
+        // Γ ⊢ e_1 : T_1
+        // Γ ⊢ e_2 : List(T_1)
+        // ----------------------------------------------
+        // Γ ⊢ e_1 :: e_2 : List(T_1)
+        Exp::Cons(e1, e2) => {
+            let t1 = tcheck(&env, e1)?;
+            should_match(&Typ::List(Box::new(t1)), tcheck(&env, e2)?)
+        }
+        // ----------------------------------------------
+        // Γ ⊢ empty: T : List(T)
+        Exp::Empty(t) => Ok(Typ::List(Box::new(t.clone()))),
+        // Γ ⊢ e : List(T)
+        // ----------------------------------------------
+        // Γ ⊢ head e : T
+        Exp::Head(e) => {
+            let t = tcheck(env, e)?;
+            match t {
+                Typ::List(res) => Ok(*res),
+                _ => Err("head non-list".to_string()),
+            }
+        }
+        // Γ ⊢ e : List(T)
+        // ----------------------------------------------
+        // Γ ⊢ tail e : List(T)
+        Exp::Tail(e) => {
+            let t = tcheck(env, e)?;
+            match t {
+                Typ::List(_) => Ok(t),
+                _ => Err("tail non-list".to_string()),
+            }
+        }
+        // Γ ⊢ e : List(T)
+        // ----------------------------------------------
+        // Γ ⊢ is_empty e : bool
+        Exp::IsEmpty(e) => {
+            let t = tcheck(env, e)?;
+            match t {
+                Typ::List(_) => Ok(Typ::Bool),
+                _ => Err("is_empty non-list".to_string()),
+            }
+        }
+        // Γ ⊢ e : T
+        // ----------------------------------------------
+        // Γ ⊢ box e : Box(T)
+        Exp::Box(e) => {
+            let t = tcheck(env, e)?;
+            Ok(Typ::Box(Box::new(t)))
+        }
+        // Γ ⊢ e : Box(T)
+        // ----------------------------------------------
+        // Γ ⊢ unbox e : T
+        Exp::Unbox(e) => {
+            let t = tcheck(env, e)?;
+            match t {
+                Typ::Box(t) => Ok(*t),
+                _ => Err("unbox non-box".to_string()),
+            }
+        }
+        // Γ ⊢ e_1 : Box(T)
+        // Γ ⊢ e_2 : T
+        // ----------------------------------------------
+        // Γ ⊢ boxset! e1 e2 : Unit
+        Exp::BoxSet(e1, e2) => {
+            let t1 = tcheck(env, e1)?;
+            let t2 = tcheck(env, e2)?;
+            should_match(&Typ::Box(Box::new(t2)), t1)?;
+            Ok(Typ::Unit)
+        }
+        // Γ ⊢ e1 : int
+        // Γ ⊢ e2 : T
+        // ----------------------------------------------
+        // Γ ⊢ vector e1 e2 : Vect(T)
+        Exp::Vector(e1, e2) => {
+            should_match(&Typ::Int, tcheck(env, e1)?)?;
+            let t = tcheck(env, e2)?;
+            Ok(Typ::Vect(Box::new(t)))
+        }
+        // Γ ⊢ e1 : Vect(T)
+        // Γ ⊢ e2 : Int
+        // ----------------------------------------------
+        // Γ ⊢ vector-ref e1 e2 : T
+        Exp::VectorRef(e1, e2) => {
+            should_match(&Typ::Int, tcheck(env, e2)?)?;
+            let t = tcheck(env, e1)?;
+            match t {
+                Typ::Vect(t) => Ok(*t),
+                _ => Err("vector-ref non-vector".to_string()),
+            }
+        }
+        // Γ ⊢ e1 : Vect(T)
+        // Γ ⊢ e2 : int
+        // Γ ⊢ e3 : T
+        // ----------------------------------------------
+        // Γ ⊢ vector-set! e1 e2 e3 : unit
+        Exp::VectorSet(e1, e2, e3) => {
+            let t1 = tcheck(env, e1)?;
+            should_match(&Typ::Int, tcheck(env, e2)?)?;
+            let t3 = tcheck(env, e3)?;
+            should_match(&Typ::Vect(Box::new(t3)), t1)?;
+            Ok(Typ::Unit)
+        }
+        // Γ ⊢ e : Vect(T)
+        // ----------------------------------------------
+        // Γ ⊢ vector-length e : int
+        Exp::VectorLen(e) => {
+            let t = tcheck(env, e)?;
+            match t {
+                Typ::Vect(_) => Ok(Typ::Int),
+                _ => Err("vector-length non-vector".to_string()),
+            }
+        }
+        // Γ ⊢ e : any
+        // ----------------------------------------------
+        // Γ ⊢ is_GROUND e : bool
+        Exp::IsBool(e) | Exp::IsInt(e) | Exp::IsString(e) | Exp::IsList(e) | Exp::IsFun(e) => {
+            should_match(&Typ::Any, tcheck(env, e)?)?;
+            Ok(Typ::Bool)
+        }
+        // Γ ⊢ e : T_1
+        // ----------------------------------------------
+        // Γ ⊢ coerce(T_1, T_2) e : T_2
+        Exp::Coerce(t1, t2, e) => {
+            should_match(t1, tcheck(env, e)?)?;
+            Ok(t2.clone())
+        }
+        Exp::PrimCoerce(..) => unimplemented!("PrimCoerce should not appear in source"),
+    }
+}
+
+fn should_match(t1: &Typ, t2: Typ) -> Result<Typ, String> {
+    if t1 == &t2 {
+        Ok(t2)
+    } else {
+        let e = mismatched(t1, &t2);
+        // this serves as a replacement for line numbers haha
+        if PANIC_ON_MISMATCH {
+            panic!("PANIC_ON_MISMATCH = true: {:?}", e);
+        }
+        e
+    }
+}
+
+fn mismatched<T>(t1: &Typ, t2: &Typ) -> Result<T, String> {
+    Err(format!("expected {} got {}", t1, t2))
+}
+use super::parser::next_metavar;
+use super::syntax::*;
+use super::z3_state::Z3State;
+use super::Options;
+use im_rc::HashMap;
+use std::cell::RefCell;
+use z3::ast::{Ast, Bool, Dynamic};
+use z3::{Optimize, SatResult};
+
+type Env = HashMap<String, Typ>;
+
+struct State<'a> {
+    vars: RefCell<HashMap<u32, Dynamic<'a>>>,
+    z3: Z3State<'a>,
+    solver: Optimize<'a>,
+    options: Options,
+}
+
+impl<'a> State<'a> {
+    fn t2z3(&self, typ: &Typ) -> Dynamic<'a> {
+        match typ {
+            Typ::Unit => self.z3.unit_z3.clone(),
+            Typ::Int => self.z3.int_z3.clone(),
+            Typ::Float => self.z3.float_z3.clone(),
+            Typ::Bool => self.z3.bool_z3.clone(),
+            Typ::Str => self.z3.str_z3.clone(),
+            Typ::Char => self.z3.char_z3.clone(),
+            Typ::Arr(t1, t2) => self.z3.arr_ctor.apply(&[&self.t2z3(t1), &self.t2z3(t2)]),
+            Typ::List(t) => self.z3.list_ctor.apply(&[&self.t2z3(t)]),
+            Typ::Pair(t1, t2) => self.z3.pair_ctor.apply(&[&self.t2z3(t1), &self.t2z3(t2)]),
+            Typ::Box(t) => self.z3.box_ctor.apply(&[&self.t2z3(t)]),
+            Typ::Vect(t) => self.z3.vect_ctor.apply(&[&self.t2z3(t)]),
+            Typ::Any => self.z3.any_z3.clone(),
+            Typ::Metavar(n) => {
+                let mut vars = self.vars.borrow_mut();
+                match vars.get(n) {
+                    Some(ast) => ast.clone(),
+                    None => {
+                        let t = z3::ast::Datatype::fresh_const(
+                            self.z3.cxt,
+                            &typ.to_string(),
+                            self.z3.typ_sort,
+                        );
+                        let x = Dynamic::from_ast(&t);
+                        vars.insert(*n, x.clone());
+                        x
+                    }
+                }
+            }
+        }
+    }
+
+    fn cgen(&self, env: &Env, exp: &mut Exp) -> (Typ, Bool<'a>) {
+        match exp {
+            Exp::PrimCoerce(..) => panic!("PrimCoerce should not appear in source"),
+            // ---------------------------
+            // Γ ⊢ lit => coerce(lit.typ(), α, lit), α, weaken(lit.typ(), α)
+            Exp::Lit(lit) => self.weaken(lit.typ(), exp, self.z3.true_z3()),
+            // ---------------------------
+            // Γ ⊢ x => x, Γ(x), true
+            Exp::Var(x) => {
+                let typ = env
+                    .get(x)
+                    .unwrap_or_else(|| panic!("unbound identifier {}", x))
+                    .clone();
+
+                if self.options.rigid_vars {
+                    (typ, self.z3.true_z3())
+                } else {
+                    self.weaken(typ, exp, self.z3.true_z3())
+                }
+            }
+            // Γ,x:T_1 ⊢ e => T_2, φ
+            // ---------------------------------------
+            // Γ ⊢ fun x : T_1 . e => coerce(T1 -> T2, α) fun x : T_1 . e, α,
+            //                        φ && weaken(T1 -> T2, α)
+            Exp::Fun(x, t1, body) => {
+                let mut env = env.clone();
+                env.insert(x.clone(), t1.clone());
+                let (t2, phi) = self.cgen(&env, body);
+                let arrow = Typ::Arr(Box::new(t1.clone()), Box::new(t2));
+                self.weaken(arrow, exp, phi)
+            }
+            // Γ,x:T_1 ⊢ e => T_2, φ
+            // ---------------------------------------
+            // Γ ⊢ fix x : T_1 . e => coerce(T_1, α) fix x : T_1 . e, α,
+            //                        φ && T_1 = T_2 && weaken(T_1, α)
+            Exp::Fix(x, t1, body) => {
+                let mut env = env.clone();
+                env.insert(x.clone(), t1.clone());
+                let (t2, phi1) = self.cgen(&env, body);
+                let phi2 = self.t2z3(t1)._eq(&self.t2z3(&t2));
+                self.weaken(t1.clone(), exp, phi1 & phi2)
+            }
+            // Γ ⊢ e_1 => T_1, φ_1
+            // Γ ⊢ e_2 => T_2, φ_2
+            // ----------------------------------------------
+            // Γ ⊢ e_1 e_2 => coerce(β, γ) (coerce(T_1, α -> β) e_1 e_2), γ,
+            //                φ_1 && φ_2 && strengthen(T_1, α -> β) && weaken(β, γ)
+            //                && T_2 = α
+            Exp::App(e1, e2) => {
+                let (t1, phi1) = self.cgen(&env, e1);
+                let (t2, phi2) = self.cgen(&env, e2);
+                let alpha = next_metavar();
+                let beta = next_metavar();
+                let arr = Typ::Arr(Box::new(alpha.clone()), Box::new(beta.clone()));
+                let phi3 = self.strengthen(t1.clone(), arr, e1);
+                let phi4 = self.t2z3(&t2)._eq(&self.t2z3(&alpha));
+                self.weaken(beta, exp, phi1 & phi2 & phi3 & phi4)
+            }
+            // Γ ⊢ e => T, φ
+            // ----------------------------------------------
+            // Γ ⊢ uop e => coerce(uop.res, α) coerce(T, uop.t, e), α, φ
+            //              && strengthen(T, uop.t) && weaken(uop.res, α)
+            Exp::UnaryOp(op, e) => {
+                let (op_t, res) = op.typ();
+                let (t, phi1) = self.cgen(&env, e);
+                let phi2 = self.strengthen(t, op_t, e);
+                self.weaken(res, exp, phi1 & phi2)
+            }
+            // Γ ⊢ e_1 => T_1, φ_1
+            // Γ ⊢ e_2 => T_2, φ_2
+            // ----------------------------------------------
+            // Γ ⊢ e_1 bop e_2 => coerce(bop.res, α) coerce(T_1, bop.t1) e_1 [+*] coerce(T_2, bop.t2) e_2, α,
+            //                     φ_1 && φ_2 && strengthen(T_1, bop.t1) && strengthen(T_2, bop.t2)
+            //                     && weaken(bop.res, α)
+            Exp::BinaryOp(op, e1, e2) => {
+                let (op1, op2, res) = op.typ();
+                let (t1, phi1) = self.cgen(&env, e1);
+                let (t2, phi2) = self.cgen(&env, e2);
+                let phi3 = self.strengthen(t1, op1, &mut *e1) & self.strengthen(t2, op2, &mut *e2);
+                self.weaken(res, exp, phi1 & phi2 & phi3)
+            }
+            // Γ ⊢ e1 => T_1, φ_1
+            // Γ,x:T_1 ⊢ e2 => T_2, φ_2
+            // ---------------------------------------
+            // Γ ⊢ let x = e1 in e2 => let x = e1 in e2, T_2, φ_1 && φ_2
+            Exp::Let(x, e1, e2) => {
+                let (t1, phi1) = self.cgen(&env, e1);
+                let mut env = env.clone();
+                env.insert(x.clone(), t1);
+                let (t2, phi2) = self.cgen(&env, e2);
+                (t2, phi1 & phi2)
+            }
+            // Γ,x1:T_1,...,xn:T_n ⊢ ei => T_i, φ_i
+            // Γ,x1:T_1,...,xn:T_n ⊢ e => T, φ
+            // ---------------------------------------
+            // Γ ⊢ letrec x1 : T_1 = e1 ... xn : T_n = en in e => letrec x1 : T_1 = e1 ... xn : T_n = en in e , T, φ_1 && ... & φ_n && φ
+            Exp::LetRec(es, e) => {
+                let mut env = env.clone();
+                for (xi, ti, _) in es.iter() {
+                    env.insert(xi.clone(), ti.clone());
+                }
+                let phis = es.iter_mut().fold(self.z3.true_z3(), |acc, (_, ti, ei)| {
+                    let (si, phii) = self.cgen(&env, ei);
+                    acc & self.t2z3(ti)._eq(&self.t2z3(&si)) & phii
+                });
+                let (t, phi) = self.cgen(&env, e);
+                (t, phi & phis)
+            }
+            // Γ ⊢ e1 => T_1, φ_1
+            // -------------------
+            // Γ ⊢ e1 : T => coerce(T_1, T) e, T, φ_1 && ground(T_1) && ground(T)
+            Exp::Ann(e, typ) => {
+                let (t1, phi1) = self.cgen(env, e);
+                let phi2 = self.ground(&t1) & self.ground(&typ);
+                (typ.clone(), phi1 & phi2)
+            }
+            // Γ ⊢ e_1 => T_1, φ_1
+            // Γ ⊢ e_2 => T_2, φ_2
+            // ----------------------------------------------
+            // Γ ⊢ e_1 +? e_2 => coerce(α, β) e_1 +? e_2, β,
+            //                   φ_1 && φ_2 && T_1 = T_2 && (T_1 = int ||
+            //                                               T_1 = str ||
+            //                                               T_1 = any)
+            //                   && weaken(α, β)
+            Exp::AddOverload(e1, e2) => {
+                let (t1, phi1) = self.cgen(&env, e1);
+                let (t2, phi2) = self.cgen(&env, e2);
+                let t1_z3 = self.t2z3(&t1);
+                let eq = t1_z3._eq(&self.t2z3(&t2));
+                let valid_type = t1_z3._eq(&self.z3.int_z3)
+                    | t1_z3._eq(&self.z3.str_z3)
+                    | t1_z3._eq(&self.z3.any_z3);
+                self.weaken(t1, exp, phi1 & phi2 & eq & valid_type)
+            }
+            // Γ ⊢ e_1 => T_1, φ_1
+            // Γ ⊢ e_2 => T_2, φ_2
+            // Γ ⊢ e_3 => T_3, φ_3
+            // ----------------------------------------------
+            // Γ ⊢ if e_1 then e_2 else e_3 => if coerce(T_1, bool, e_1) then e_2 else e_3, T_2,
+            //                                 φ_1 && φ_2 && φ_3 &&
+            //                                 strengthen(T_1, bool) && T_2 = T_3
+            Exp::If(e1, e2, e3) => {
+                let (t1, phi1) = self.cgen(&env, e1);
+                let (t2, phi2) = self.cgen(&env, e2);
+                let (t3, phi3) = self.cgen(&env, e3);
+                let phi4 = self.strengthen(t1, Typ::Bool, e1) & self.t2z3(&t2)._eq(&self.t2z3(&t3));
+                (t2, phi1 & phi2 & phi3 & phi4)
+            }
+            // Γ ⊢ e_1 => T_1, φ_1
+            // Γ ⊢ e_2 => T_2, φ_2
+            // ----------------------------------------------
+            // Γ ⊢ e_1, e_2 => coerce((T_1, T_2), α, (e_1, e_2)), α,
+            //                 φ_1 && φ_2 && weaken((T_1, T_2), α)
+            Exp::Pair(e1, e2) => {
+                let (t1, phi1) = self.cgen(&env, e1);
+                let (t2, phi2) = self.cgen(&env, e2);
+                self.weaken(Typ::Pair(Box::new(t1), Box::new(t2)), exp, phi1 & phi2)
+            }
+            // Γ ⊢ e => e, T_1, φ_1
+            // ----------------------------------------------
+            // Γ ⊢ fst e => coerce(α, γ) fst coerce(T_1, Pair(α,β), e), γ,
+            //              φ_1 && strengthen(T_1, Pair(α,β)) && weaken(α, γ)
+            Exp::Fst(e) => {
+                let (t1, phi1) = self.cgen(&env, e);
+                let alpha = next_metavar();
+                let beta = next_metavar();
+                let phi2 =
+                    self.strengthen(t1, Typ::Pair(Box::new(alpha.clone()), Box::new(beta)), e);
+                self.weaken(alpha, exp, phi1 & phi2)
+            }
+            // Γ ⊢ e => e, T_1, φ_1
+            // ----------------------------------------------
+            // Γ ⊢ snd e => coerce(β, γ) snd coerce(T_1, Pair(α,β), e), γ,
+            //              φ_1 && strengthen(T_1, Pair(α,β)) && weaken(β, γ)
+            Exp::Snd(e) => {
+                let (t1, phi1) = self.cgen(&env, e);
+                let alpha = next_metavar();
+                let beta = next_metavar();
+                let phi2 =
+                    self.strengthen(t1, Typ::Pair(Box::new(alpha), Box::new(beta.clone())), e);
+                self.weaken(beta, exp, phi1 & phi2)
+            }
+            // Γ ⊢ e_1 => T_1, φ_1
+            // Γ ⊢ e_2 => T_2, φ_2
+            // ----------------------------------------------
+            // Γ ⊢ e_1 :: e_2 => coerce(List(T_1), α, e_1 :: coerce(T_2, List(T_1), e_2)), α,
+            //                   φ_1 && φ_2 && strengthen(T_2, List(T_1)) && weaken(List(T_1), α)
+            Exp::Cons(e1, e2) => {
+                let (t1, phi1) = self.cgen(&env, e1);
+                let (t2, phi2) = self.cgen(&env, e2);
+                let list_typ = Typ::List(Box::new(t1.clone()));
+                let phi3 = self.strengthen(t2.clone(), list_typ.clone(), e2);
+                self.weaken(list_typ, exp, phi1 & phi2 & phi3)
+            }
+            // ----------------------------------------------
+            // Γ ⊢ empty α => coerce(List(α), β, empty α), β, weaken(List(α), β)
+            Exp::Empty(alpha) => {
+                self.weaken(Typ::List(Box::new(alpha.clone())), exp, self.z3.true_z3())
+            }
+            // Γ ⊢ e => T, φ
+            // ----------------------------------------------
+            // Γ ⊢ head e => coerce(α, β) head coerce(T, List(α), e), β,
+            //               φ && strengthen(T, List(α)) && weaken(α, β)
+            Exp::Head(e) => {
+                let (t, phi1) = self.cgen(env, e);
+                let alpha = next_metavar();
+                let phi2 = self.strengthen(t, Typ::List(Box::new(alpha.clone())), e);
+                self.weaken(alpha, exp, phi1 & phi2)
+            }
+            // Γ ⊢ e => T, φ
+            // ----------------------------------------------
+            // Γ ⊢ tail e => coerce(List(α), β, tail coerce(T, List(α), e)), β,
+            //               φ && strengthen(T, List(α)) && weaken(List(α), β)
+            Exp::Tail(e) => {
+                let (t, phi1) = self.cgen(env, e);
+                let alpha = next_metavar();
+                let list_alpha = Typ::List(Box::new(alpha));
+                let phi2 = self.strengthen(t, list_alpha.clone(), e);
+                self.weaken(list_alpha, exp, phi1 & phi2)
+            }
+            // Γ ⊢ e => T, φ
+            // ----------------------------------------------
+            // Γ ⊢ is_empty e => coerce(bool, β) is_empty coerce(T, List(α), e), β,
+            //                   φ && strengthen(T, List(α)) && weaken(bool, β)
+            Exp::IsEmpty(e) => {
+                let (t, phi1) = self.cgen(env, e);
+                let alpha = next_metavar();
+                let list_alpha = Typ::List(Box::new(alpha));
+                let phi2 = self.strengthen(t, list_alpha, e);
+                self.weaken(Typ::Bool, exp, phi1 & phi2)
+            }
+            // Γ ⊢ e => T, φ
+            // ----------------------------------------------
+            // Γ ⊢ box e => coerce(Box(α), β) box e, β, φ && weaken(Box(α), β)
+            Exp::Box(e) => {
+                let (t, phi1) = self.cgen(env, e);
+                self.weaken(Typ::Box(Box::new(t)), exp, phi1)
+            }
+            // Γ ⊢ e => T, φ
+            // ----------------------------------------------
+            // Γ ⊢ unbox e => coerce(α, β, coerce(T, Box(α))) e, β, φ
+            //                && strengthen(T, Box(α)) && weaken(α, β)
+            Exp::Unbox(e) => {
+                let (t, phi1) = self.cgen(env, e);
+                let alpha = next_metavar();
+                let phi2 = self.strengthen(t, Typ::Box(Box::new(alpha.clone())), e);
+                self.weaken(alpha, exp, phi1 & phi2)
+            }
+            // Γ ⊢ e_1 => T_1, φ_1
+            // Γ ⊢ e_2 => T_2, φ_2
+            // ----------------------------------------------
+            // Γ ⊢ boxset! e_1 e_2 => coerce(Unit, α) boxset! coerce(T_1, Box(T_2)) e_1 e_2, α,
+            //                        strengthen(T_1, Box(T_2)) && weaken(Unit, α)
+            Exp::BoxSet(e1, e2) => {
+                let (t1, phi1) = self.cgen(env, e1);
+                let (t2, phi2) = self.cgen(env, e2);
+                let phi3 = self.strengthen(t1, Typ::Box(Box::new(t2)), e1);
+                self.weaken(Typ::Unit, exp, phi1 & phi2 & phi3)
+            }
+            // Γ ⊢ e1 => T_1, φ_1
+            // Γ ⊢ e2 => T_2, φ_2
+            // ----------------------------------------------
+            // Γ ⊢ vector e1 e2 => coerce(Vect(T_2), α) vector (coerce(T_1, int) e1) e, α,
+            //                          φ_1 && φ_2 && && strengthen(T_1, int) && weaken(vect(T_2), α)
+            Exp::Vector(e1, e2) => {
+                let (t1, phi1) = self.cgen(env, e1);
+                let (t2, phi2) = self.cgen(env, e2);
+                let phi3 = self.strengthen(t1, Typ::Int, e1);
+                self.weaken(Typ::Vect(Box::new(t2)), exp, phi1 & phi2 & phi3)
+            }
+            // Γ ⊢ e1 => T_1, φ_1
+            // Γ ⊢ e2 => T_2, φ_2
+            // ----------------------------------------------
+            // Γ ⊢ vector-ref e1 e2 =>
+            //     coerce(α, β) vector-ref (coerce(T_1, Vect(α)) e1) (coerce(T_2, Int) e2), β,
+            //                         φ && strengthen(T_1, Vect(α)) && strengthen(T_2, Int)
+            //                         && weaken(α, β)
+            Exp::VectorRef(e1, e2) => {
+                let (t1, phi1) = self.cgen(env, e1);
+                let (t2, phi2) = self.cgen(env, e2);
+                let alpha = next_metavar();
+                let phi3 = self.strengthen(t1, Typ::Vect(Box::new(alpha.clone())), e1);
+                let phi4 = self.strengthen(t2, Typ::Int, e2);
+                self.weaken(alpha, exp, phi1 & phi2 & phi3 & phi4)
+            }
+            // Γ ⊢ e1 => T_1, φ_1
+            // Γ ⊢ e2 => T_2, φ_2
+            // Γ ⊢ e3 => T_3, φ_3
+            // ----------------------------------------------
+            // Γ ⊢ vector-set! e1 e2 e3 =>
+            //     coerce(Unit, α) vector-set! coerce(T_1, Vect(T_3)) e_1 coerce(T_2, Int) e_2 e_3, α,
+            //                             strengthen(T_1, Vect(T_3)) && weaken(Unit, α)
+            Exp::VectorSet(e1, e2, e3) => {
+                let (t1, phi1) = self.cgen(env, e1);
+                let (t2, phi2) = self.cgen(env, e2);
+                let (t3, phi3) = self.cgen(env, e3);
+                let phi4 = self.strengthen(t1, Typ::Vect(Box::new(t3)), e1);
+                let phi5 = self.strengthen(t2, Typ::Int, e2);
+                self.weaken(Typ::Unit, exp, phi1 & phi2 & phi3 & phi4 & phi5)
+            }
+            // Γ ⊢ e => T, φ
+            // ----------------------------------------------
+            // Γ ⊢ vector-length e => coerce(int, β) vector-length coerce(e, Vect(α)), β,
+            //                        φ && strengthen(T, Vect(α)) && weaken(int, β)
+            Exp::VectorLen(e) => {
+                let (t, phi1) = self.cgen(env, e);
+                let alpha = next_metavar();
+                let phi2 = self.strengthen(t, Typ::Vect(Box::new(alpha)), e);
+                self.weaken(Typ::Int, exp, phi1 & phi2)
+            }
+            // Γ ⊢ e => T, φ
+            // ----------------------------------------------
+            // Γ ⊢ is_GROUND e => coerce(bool, α) is_GROUND e, α, φ && T = any && weaken(bool, α)
+            Exp::IsBool(e) | Exp::IsInt(e) | Exp::IsString(e) | Exp::IsList(e) | Exp::IsFun(e) => {
+                let (t, phi1) = self.cgen(env, e);
+                let phi2 = self.t2z3(&t)._eq(&self.z3.any_z3);
+                self.weaken(Typ::Bool, exp, phi1 & phi2)
+            }
+            // Γ ⊢ e => T_3, φ
+            // ----------------------------------------------
+            // Γ ⊢ coerce(T_1, T_2) e => coerce(T_1, T_2) e, T_2, φ && T_1 = T_3
+            Exp::Coerce(t1, t2, e) => {
+                let (t3, phi) = self.cgen(env, e);
+                if self.options.optimizer {
+                    self.solver
+                        .assert_soft(&self.t2z3(&t1)._eq(&self.t2z3(&t2)), 1, None);
+                }
+                (t2.clone(), phi & self.t2z3(&t1)._eq(&self.t2z3(&t3)))
+            }
+        }
+    }
+
+    fn solve_model(&self, model: z3::Model) -> HashMap<u32, Typ> {
+        let mut result = HashMap::new();
+        for (x, x_ast) in self.vars.borrow().iter() {
+            let x_val_ast = model.eval(x_ast).expect("evaluating metavar");
+            result.insert(*x, self.z3.z3_to_typ(&model, x_val_ast));
+        }
+        result
+    }
+
+    /// Provide a typ for the entire program. Returns a constraint
+    /// that ensures that every type in a negative position is any
+    ///
+    /// DO NOT evaluate (model.eval) t before passing in. model.eval
+    /// recursively evaluates. we only want to get the kind and its
+    /// metavariables
+    fn negative_any(&self, model: &z3::Model<'a>, t: &Dynamic<'a>) -> Bool<'a> {
+        if self.z3.is_int(model, &t)
+            || self.z3.is_unit(model, &t)
+            || self.z3.is_float(model, &t)
+            || self.z3.is_bool(model, &t)
+            || self.z3.is_str(model, &t)
+            || self.z3.is_char(model, &t)
+            || self.z3.is_any(model, &t)
+        {
+            self.z3.true_z3()
+        } else if self.z3.is_arr(model, &t) {
+            let arg = self.z3.arr_arg(&t);
+            let ret = self.z3.arr_ret(&t);
+            arg._eq(&self.z3.any_z3) & self.negative_any(model, &ret)
+        } else if self.z3.is_list(model, &t) {
+            let t = self.z3.list_typ(&t);
+            self.negative_any(model, &t)
+        } else if self.z3.is_pair(model, &t) {
+            let t1 = self.z3.pair1(&t);
+            let t2 = self.z3.pair2(&t);
+            self.negative_any(model, &t1) & self.negative_any(model, &t2)
+        } else if self.z3.is_box(model, &t) {
+            // A box is a negative position, no matter what is_neg says. For
+            // example, p = box 5 may be put in a context that says `boxset! p
+            // true`. so p must have type box any
+            let t = self.z3.box_typ(&t);
+            t._eq(&self.z3.any_z3)
+        } else if self.z3.is_vect(model, &t) {
+            let t = self.z3.vect_typ(&t);
+            t._eq(&self.z3.any_z3)
+        } else {
+            panic!("missing case in negative_any {:?}", t);
+        }
+    }
+
+    fn coerce(&self, t1: Typ, t2: Typ, exp: &mut Exp) {
+        if self.options.optimizer {
+            self.solver
+                .assert_soft(&self.t2z3(&t1)._eq(&self.t2z3(&t2)), 1, None);
+        }
+        *exp = Exp::Coerce(t1, t2, Box::new(exp.take()));
+    }
+
+    /// Modifies `exp` in place to coerce from t1 to t2. Generates a
+    /// constraint that T_1 must be any and T_2 must be negative-any, or they are
+    /// already equal. Caller's responsibility to ensure typ(exp) = t1
+    ///
+    /// In other words, the constraint is that t1 and t2 are dynamically
+    /// consistent, the type doesn't weaken, and the coercion is reasonable.
+    ///
+    /// Because this can cause dynamic errors, **this should only be used
+    /// at elimination forms** in order to be safe!
+    ///
+    /// T_1 = T_2 || (T_1 = any && ground(t2))
+    #[must_use]
+    fn strengthen(&self, t1: Typ, t2: Typ, exp: &mut Exp) -> Bool<'a> {
+        let coerce_case = self.t2z3(&t1)._eq(&self.z3.any_z3) & self.ground(&t2);
+        // we don't care about putting an ID coercion, that's fine
+        let dont_coerce_case = self.t2z3(&t1)._eq(&self.t2z3(&t2));
+        self.coerce(t1, t2, exp);
+        coerce_case | dont_coerce_case
+    }
+
+    /// (α, weaken'(t1, α, exp) & phi1) where weaken'(t1, t2, exp) =
+    ///
+    /// Modifies `exp` in place to corce from t1 to t2. Generates a constraint
+    /// that they are already equal, or t2 is any and t1 is
+    /// negative-any. Caller's responsibility to ensure typ(exp) = t1
+    ///
+    /// In other words, the constraint is that t1 and t2 are dynamically
+    /// consistent, the type doesn't strengthen, and the coercion does not lose
+    /// track of important type information.
+    ///
+    /// This is always safe, so it happens on all expressions.
+    ///
+    /// The peculiarities of this signature are because weaken should occur
+    /// on every expression that may have a different type than any of its
+    /// sub-expressions and NEVER otherwise. Therefore it is easy to call
+    /// self.weaken(true_typ, whole_exp, other_constraints) at the end of a match
+    /// arm in cgen
+    ///
+    /// ----------------------------------------------
+    /// Γ ⊢ e: T => coerce(T, α, e), α, φ
+    ///             && T = α || (α = any && ground(T))      |> weaken'
+    fn weaken(&self, t1: Typ, exp: &mut Exp, phi1: Bool<'a>) -> (Typ, Bool<'a>) {
+        let alpha = next_metavar();
+        let coerce_case = self.t2z3(&alpha)._eq(&self.z3.any_z3) & self.ground(&t1);
+        let dont_coerce_case = self.t2z3(&t1)._eq(&self.t2z3(&alpha));
+        self.coerce(t1, alpha.clone(), exp);
+        (alpha, phi1 & (coerce_case | dont_coerce_case))
+    }
+
+    /// Provided a type, generate constraints that the type has any in all of
+    /// its negative forms. The function is more weak / general than it could be
+    /// due to the difficulties with z3.
+    ///
+    /// For example, if t has type * -> int, that type is safe to
+    /// coerce to any (with wrapping). However, because z3 cannot produce
+    /// recursive constraints, and the type * -> (int -> int) is forbidden,
+    /// ground is forced to produce the constraint that t has type *
+    /// -> *.
+    ///
+    /// Note that anything that can be mutated is negative.
+    ///
+    /// One might think that lists are a special case: because lists are
+    /// immutable they have no negative positions. However, imagine a function that
+    /// is stored in a list. It is inferred to be int -> int, however after being
+    /// pulled out of the list it is called with a bool. This is incorrect. We
+    /// might say, lists must hold ground types, rather than
+    /// any! And you would be right, but notice that we have now produced a
+    /// recursive constraint which z3 does not support.
+    ///
+    /// ground t = is_arr(t) => t = any -> any
+    ///                    && is_list(t) => t = list any
+    ///                    && is_box(t) => t = box any
+    ///                    && is_vect(t) => t = vect any
+    fn ground(&self, t: &Typ) -> Bool<'a> {
+        let any_to_any = Typ::Arr(Box::new(Typ::Any), Box::new(Typ::Any));
+        self.z3
+            .z3_is_arr(self.t2z3(t))
+            .implies(&self.t2z3(t)._eq(&self.t2z3(&any_to_any)))
+            & self
+                .z3
+                .z3_is_list(self.t2z3(t))
+                .implies(&self.t2z3(t)._eq(&self.t2z3(&Typ::List(Box::new(Typ::Any)))))
+            & self.z3.z3_is_pair(self.t2z3(t)).implies(
+                &self
+                    .t2z3(t)
+                    ._eq(&self.t2z3(&Typ::Pair(Box::new(Typ::Any), Box::new(Typ::Any)))),
+            )
+            & self
+                .z3
+                .z3_is_box(self.t2z3(t))
+                .implies(&self.t2z3(t)._eq(&self.t2z3(&Typ::Box(Box::new(Typ::Any)))))
+            & self
+                .z3
+                .z3_is_vect(self.t2z3(t))
+                .implies(&self.t2z3(t)._eq(&self.t2z3(&Typ::Vect(Box::new(Typ::Any)))))
+    }
+}
+
+fn annotate_typ(env: &HashMap<u32, Typ>, t: &mut Typ) {
+    // if type already exists, nothing to do
+    match t {
+        Typ::Metavar(i) => {
+            match env.get(i) {
+                Some(s) => *t = s.clone(),
+                // there is no constraint whatsoever on what this type
+                // can be. Migeed and Parsberg seem to choose Int in this
+                // case, though i haven't read enough to know if they
+                // explicitly mention that
+                None => (),
+            }
+        }
+        Typ::Arr(t1, t2) | Typ::Pair(t1, t2) => {
+            annotate_typ(env, t1);
+            annotate_typ(env, t2);
+        }
+        Typ::List(t) | Typ::Box(t) | Typ::Vect(t) => {
+            annotate_typ(env, t);
+        }
+        Typ::Unit | Typ::Int | Typ::Float | Typ::Bool | Typ::Str | Typ::Char | Typ::Any => (),
+    }
+}
+
+fn annotate(env: &HashMap<u32, Typ>, exp: &mut Exp) {
+    match &mut *exp {
+        Exp::PrimCoerce(..) => panic!("PrimCoerce should not appear in source"),
+        Exp::Lit(..) | Exp::Var(..) => {}
+        Exp::Empty(t) => annotate_typ(env, t),
+        Exp::Fun(_, t, e) | Exp::Fix(_, t, e) | Exp::Ann(e, t) => {
+            annotate_typ(env, t);
+            annotate(env, e);
+        }
+        Exp::Coerce(t1, t2, e) => {
+            annotate(env, e);
+            annotate_typ(env, t1);
+            annotate_typ(env, t2);
+            if t1 == t2 {
+                *exp = e.take();
+            }
+        }
+        Exp::Head(e)
+        | Exp::Tail(e)
+        | Exp::UnaryOp(_, e)
+        | Exp::Box(e)
+        | Exp::Unbox(e)
+        | Exp::Fst(e)
+        | Exp::Snd(e)
+        | Exp::IsEmpty(e)
+        | Exp::IsBool(e)
+        | Exp::IsInt(e)
+        | Exp::IsString(e)
+        | Exp::IsList(e)
+        | Exp::IsFun(e)
+        | Exp::VectorLen(e) => {
+            annotate(env, e);
+        }
+        Exp::App(e1, e2)
+        | Exp::BinaryOp(_, e1, e2)
+        | Exp::AddOverload(e1, e2)
+        | Exp::Cons(e1, e2)
+        | Exp::Pair(e1, e2)
+        | Exp::BoxSet(e1, e2)
+        | Exp::Let(_, e1, e2)
+        | Exp::Vector(e1, e2)
+        | Exp::VectorRef(e1, e2) => {
+            annotate(env, e1);
+            annotate(env, e2);
+        }
+        Exp::If(e1, e2, e3) | Exp::VectorSet(e1, e2, e3) => {
+            annotate(env, e1);
+            annotate(env, e2);
+            annotate(env, e3);
+        }
+        Exp::LetRec(bindings, e) => {
+            for (_, typ, ei) in bindings {
+                annotate_typ(env, typ);
+                annotate(env, ei);
+            }
+            annotate(env, e);
+        }
+    }
+}
+
+#[cfg(test)]
+pub fn typeinf(exp: Exp) -> Result<Exp, String> {
+    typeinf_options(exp, &Default::default(), Options::default())
+}
+pub fn typeinf_options(mut exp: Exp, env: &Env, options: Options) -> Result<Exp, String> {
+    let cfg = z3::Config::new();
+    let cxt = z3::Context::new(&cfg);
+    let typ = Z3State::typ(&cxt);
+    let s = State {
+        z3: Z3State::new(&cxt, &typ),
+        vars: Default::default(),
+        solver: Optimize::new(&cxt),
+        options,
+    };
+    let (t, phi) = s.cgen(env, &mut exp);
+    s.solver.assert(&phi);
+    if options.debug {
+        eprintln!("Simplified constraints:");
+        eprintln!("{}", phi.simplify());
+    }
+    if s.options.context {
+        s.solver.push();
+        if options.debug {
+            eprintln!("Solver state for precise type:");
+            eprintln!("{}", s.solver);
+        }
+        match s.solver.check(&[]) {
+            SatResult::Unsat => return Err("unsat (precise type)".to_string()),
+            SatResult::Unknown => return Err("unknown from Z3 -- very bad".to_string()),
+            SatResult::Sat => (),
+        }
+        let model = s.solver.get_model().expect("model not available");
+        s.solver.pop();
+        let negative_any = s.negative_any(&model, &s.t2z3(&t));
+        s.solver.assert(&negative_any);
+        if options.debug {
+            let mut exp_precise = exp.clone();
+            let result = s.solve_model(model);
+            annotate(&result, &mut exp_precise);
+            println!("precise annotation: {}", exp_precise);
+        }
+    }
+    if options.debug {
+        eprintln!("Solver state for final type:");
+        eprintln!("{}", s.solver);
+    }
+    match s.solver.check(&[]) {
+        SatResult::Unsat => return Err("unsat (context)".to_string()),
+        SatResult::Unknown => panic!("unknown from Z3 -- very bad"),
+        SatResult::Sat => (),
+    }
+    let model = s.solver.get_model().expect("model not available");
+    let result = s.solve_model(model);
+    annotate(&result, &mut exp);
+    Ok(exp)
+}
+
+#[cfg(test)]
+mod test {
+    use super::super::parser::parse;
+    use super::typeinf;
+    use crate::syntax::Typ;
+    use crate::tests_631::*;
+
+    #[test]
+    fn test_typeinf() {
+        typeinf(parse("(fun x . x) 10 ").unwrap()).unwrap();
+    }
+
+    #[test]
+    fn identity_alone() {
+        println!("{:?}", typeinf(parse("fun x . x").unwrap()).unwrap())
+    }
+
+    #[test]
+    fn occurs_check_fun_any() {
+        // In HM, this would be an occurs-check failure
+        println!("{:?}", typeinf(parse("fun f . f f").unwrap()).unwrap())
+    }
+
+    #[test]
+    fn test_typeinf_add() {
+        typeinf(parse("(fun x . x +? 20) 10 ").unwrap()).unwrap();
+    }
+
+    #[test]
+    fn str_add() {
+        println!(
+            "{:?}",
+            typeinf(parse(r#"(fun x . x +? x) "everything is ""#).unwrap()).unwrap()
+        );
+    }
+
+    #[test]
+    fn add_str_int_any() {
+        println!(
+            "{:?}",
+            typeinf(parse(r#"(fun x . fun y . x +? y) "everything is " 10"#).unwrap()).unwrap()
+        );
+    }
+
+    #[test]
+    fn infer_arr() {
+        println!("{:?}", typeinf(parse("fun f . f 200").unwrap()));
+    }
+
+    #[test]
+    fn ambiguous_add() {
+        println!("{:?}", typeinf(parse("fun x . x +? x").unwrap()).unwrap());
+    }
+
+    #[test]
+    fn heterogenous_list() {
+        println!("{:?}", typeinf(parse("true :: 10 :: empty").unwrap()));
+    }
+
+    #[test]
+    fn make_pair() {
+        succeeds("(fun x . fun y . x, y) 5 true");
+    }
+
+    #[test]
+    fn over_optimized() {
+        no_from_any(
+            "// this should be (any -> int)
+             // but it gets mislabeled as (int -> int)
+             let accepts_any = fun x . 5 in
+             // this is used to get the optimizer to mislabel accepts_any
+             accepts_any 5 + accepts_any 5 + accepts_any 5 +
+             // now this was correct before our inference, but now is incorrect
+             // a runtime error will be thrown as false is from_any_to_any'd, when it could
+             // have stayed any just fine
+             // the conditional is here to allow the to_any
+             accepts_any (if true then true else false)",
+        );
+    }
+
+    #[test]
+    fn cond_int_bool() {
+        coerces(
+            "let f = fun b.fun x. if b then x + 1 else not x in
+             let y = f true 5 in
+             f false false",
+        );
+    }
+
+    #[test]
+    fn strengthen_not() {
+        coerces(
+            "let accepts_any = fun x . not x in
+            let _ = accepts_any true in
+            accepts_any 5",
+        );
+    }
+
+    #[test]
+    fn force_any_then_cons() {
+        coerces(
+            "let force_any = fun x . 5 :: x in
+            let _ = force_any true in
+            force_any (10 :: empty)",
+        );
+    }
+
+    // let's have some context fun
+    #[test]
+    fn app() {
+        coerces("fun f. fun x. f x");
+    }
+
+    #[test]
+    fn map_public() {
+        coerces(
+            "fix map . fun f . fun lst .
+               if is_empty(lst) then
+                 empty
+               else
+                 f(head(lst)) :: (map f (tail(lst)))",
+        );
+    }
+
+    #[test]
+    fn gives_list_fs() {
+        succeeds("(fun x.x) :: empty");
+    }
+
+    #[test]
+    fn annotate_exact() {
+        succeeds("5 : int");
+        // coerces("5 : bool"); // actually fails :|
+    }
+
+    #[test]
+    fn arr_in_lists() {
+        assert_eq!(
+            coerces(
+                "let id = fun x.x in // any -> any, but if not careful, int -> int
+                let call_head_bool = fun x. (head x) true in
+                let my_arr = id :: empty in
+                let tmp1 = call_head_bool my_arr in
+                id 5
+                "
+            ),
+            Typ::Any
+        )
+    }
+
+    #[test]
+    fn arjun_arr_in_any() {
+        assert_eq!(
+            coerces(
+                "let id = fun x . x in
+                let tmp0 = id 5 in
+                let id2 = id id in
+                let id3 = fun n.n in // if this is int -> int things are bad
+                let tmp1 = id3 5 in
+                let id4 = id2 id3 in
+                let tmp2 = id4 true in
+                id3 5"
+            ),
+            Typ::Any
+        )
+    }
+
+    #[test]
+    fn introduction_arr_in_any() {
+        assert_eq!(
+            coerces(
+                "let to_int = fun x.x*5 in
+                let id = fun x.x in
+                let tmp0 = id true in
+                let tmp1 = id to_int in
+                to_int 10"
+            ),
+            Typ::Any
+        )
+    }
+}
+use super::syntax::{Exp, Typ};
+use std::cell::RefCell;
+use std::collections::hash_set::HashSet;
+
+lrlex::lrlex_mod!("lexer.l"); // effectively mod `lexer_l`
+lrpar::lrpar_mod!("parser.y"); // effectively mod `parser_y`
+
+thread_local!(static NEXT_METAVAR: RefCell<u32> = RefCell::new(0));
+thread_local!(static PARSER_WARNINGS: RefCell<HashSet<String>> = RefCell::new(HashSet::new()));
+
+pub fn next_metavar() -> Typ {
+    Typ::Metavar(inc_metavar())
+}
+
+pub fn inc_metavar() -> u32 {
+    NEXT_METAVAR.with(|mv| {
+        let mut mv = mv.borrow_mut();
+        let i = *mv;
+        *mv = i + 1;
+        i
+    })
+}
+
+pub fn parser_warning(msg: impl AsRef<str>) {
+    let msg = msg.as_ref().to_string();
+    PARSER_WARNINGS.with(|s| {
+        let mut s = s.borrow_mut();
+        s.insert(msg);
+    });
+}
+
+pub fn show_warnings() {
+    PARSER_WARNINGS.with(|ws| {
+        for w in ws.replace(HashSet::new()).into_iter() {
+            eprintln!("Warning: {}", w);
+        }
+    });
+}
+
+/// Parses the input string, producing an `Exp` where very type annotation
+/// is set to `Typ::Metavar`. Each `Typ::Metavar` is numbered sequentially,
+/// starting with `0`.
+pub fn parse(input: impl AsRef<str>) -> Result<Exp, String> {
+    let input = input.as_ref();
+    let lexerdef = lexer_l::lexerdef();
+    let lexer = lexerdef.lexer(input);
+    let (res, errs) = parser_y::parse(&lexer);
+    let mut errors = String::new();
+    let did_err = errs.is_empty() == false;
+    for err in errs.into_iter() {
+        errors.push_str(&format!("{}", err.pp(&lexer, &|t| parser_y::token_epp(t))));
+    }
+
+    match res {
+        Some(Ok(exp)) => {
+            if did_err == false {
+                Ok(exp)
+            } else {
+                Err(errors)
+            }
+        }
+        Some(Err(_)) | None => Err(errors),
+    }
+}
+use crate::syntax::*;
+use im_rc::HashMap;
+
+lrlex::lrlex_mod!("grift.l"); // effectively mod `grift_l`
+lrpar::lrpar_mod!("grift.y"); // effectively mod `grift_y`
+
+pub fn toplevel_exp(tls: Vec<Toplevel>) -> Exp {
+    let mut bindings = Vec::new();
+    let mut exprs = Vec::new();
+
+    let mut saw_expr = false;
+    let mut warnings = Vec::new();
+    for tl in tls.into_iter() {
+        match tl {
+            Toplevel::Define(x, t, e) => {
+                if saw_expr {
+                    warnings.push(x.clone());
+                }
+
+                bindings.push((x, t, e));
+            }
+            Toplevel::Exp(e) => {
+                saw_expr = true;
+                exprs.push(e);
+            }
+        }
+    }
+
+    if !warnings.is_empty() {
+        eprintln!(
+            "The following top-level definitions have been unsoundly reordered: {}.",
+            warnings.join(", ")
+        );
+    }
+
+    let e = Exp::begin(exprs);
+    if bindings.is_empty() {
+        e
+    } else {
+        Exp::LetRec(bindings, Box::new(e))
+    }
+}
+
+pub fn parse_toplevel(input: impl AsRef<str>) -> Vec<Toplevel> {
+    let input = input.as_ref();
+    let lexerdef = grift_l::lexerdef();
+    let lexer = lexerdef.lexer(input);
+    let (res, errs) = grift_y::parse(&lexer);
+    if errs.is_empty() {
+        crate::parser::show_warnings();
+        return res.unwrap();
+    }
+    for err in errs.into_iter() {
+        eprintln!("{}", err.pp(&lexer, &|t| grift_y::token_epp(t)));
+    }
+    panic!("Error parsing expressions");
+}
+
+pub fn parse(input: impl AsRef<str>) -> Exp {
+    toplevel_exp(parse_toplevel(input))
+}
+
+type Env = HashMap<String, Typ>;
+pub fn env() -> Env {
+    Env::default()
+}
+
+#[cfg(test)]
+mod test {
+    use super::parse;
+    use crate::cgen::typeinf_options;
+    use crate::syntax::*;
+    use crate::tests_631::contains_coercions;
+    use crate::type_check::tcheck;
+    use crate::Options;
+
+    fn compile_verbose(orig: Exp) -> (Typ, Exp) {
+        let env = super::env();
+        println!("\nOriginal program:\n{}", &orig);
+        let mut options = Options::default();
+        options.debug = true;
+        let e = typeinf_options(orig, &env, options).unwrap();
+        println!("\nAfter type inference:\n{}", e);
+        let t = tcheck(&env, &e).expect("failed to typecheck");
+        println!("\nProgram type:\n{}", t);
+        (t, e)
+    }
+    pub fn exp_succeeds(orig: Exp) -> Typ {
+        let (t, e) = compile_verbose(orig);
+        let coercions = contains_coercions(e);
+        assert!(!coercions.0 && !coercions.1);
+        t
+    }
+    pub fn exp_coerces(orig: Exp) -> Typ {
+        let (t, e) = compile_verbose(orig);
+        let coercions = contains_coercions(e);
+        assert!(coercions.0 || coercions.1);
+        t
+    }
+
+    #[test]
+    #[should_panic]
+    fn bad_things() {
+        parse("(if 5 6 7 8)");
+    }
+    #[test]
+    fn parse_int() {
+        assert_eq!(parse("5"), Exp::Lit(Lit::Int(5)))
+    }
+    #[test]
+    fn let_once() {
+        assert_eq!(
+            parse("(let ((x 5)) x)"),
+            Exp::Let(
+                "x".to_string(),
+                Box::new(Exp::Lit(Lit::Int(5))),
+                Box::new(Exp::Var("x".to_string()))
+            )
+        )
+    }
+    #[test]
+    fn lambda() {
+        parse("(lambda (x) x)");
+    }
+    #[test]
+    fn app() {
+        parse("((lambda (x) x) 5)");
+    }
+    #[test]
+    fn cond() {
+        parse("(if 5 6 7)");
+    }
+    #[test]
+    fn fact_grift_concrete() {
+        exp_coerces(parse(
+            "(let ((f (lambda (f n)
+                (if (= n 0)
+                    1
+                    ; - was replaced with + because meh
+                    (* n (f f (+ n 1)))))))
+              ; this was : but again, meh
+              (f f 6))",
+        ));
+    }
+    #[test]
+    fn ack_no_rec() {
+        // this is supposed to be letrec but meh
+        exp_succeeds(parse(
+            "(letrec ([ack (lambda ([m : Int] [n : Int]) : Int
+                    (if (= m 0)
+                        (+ n 1)
+                        (if (= n 0)
+                            (ack (+ m -1) 1)
+                            (ack (+ m -1) (ack m (+ n -1))))))])
+                  (ack 1 2))",
+        ));
+    }
+    #[test]
+    fn ack() {
+        exp_succeeds(parse(
+            "(letrec ([ack (lambda (m n) ; this should have : Dyn but we don't annotate returns yet
+                             (if (= m 0)
+                                 (+ n 1)
+                                 (if (= n 0)
+                                     (ack (+ m -1) 1)
+                                     (ack (+ m -1) (ack m (+ n -1))))))])
+               (ack 3 10)) ; should be : / ann",
+        ));
+    }
+    #[test]
+    fn box_int() {
+        exp_succeeds(parse(
+            "(let ((my_box (box 5)))
+                (let ((i_set (box-set! my_box 10)))
+                  (unbox my_box)))",
+        ));
+    }
+    #[test]
+    fn box_any() {
+        exp_coerces(parse(
+            "(let ((my_box (box 5)))
+                (let ((i_set (box-set! my_box #t)))
+                  (unbox my_box)))",
+        ));
+    }
+    #[test]
+    fn box_context() {
+        exp_coerces(parse("(box 5)"));
+    }
+    #[test]
+    fn box_identities() {
+        assert_eq!(
+            exp_coerces(parse(
+                "(let ((id (lambda (x) x)))
+                (let ((h (id (box 5))))
+                (id (unbox h))))"
+            )),
+            Typ::Any
+        );
+    }
+    #[test]
+    fn box_weakens_box_any() {
+        assert_eq!(
+            exp_coerces(parse(
+                "(let ((my_box (box #t)))
+                (let ((h ((lambda (x) x) my_box)))
+                ((lambda (x) (+ 1 (unbox x))) my_box)))"
+            )),
+            Typ::Int
+        );
+    }
+    #[test]
+    fn box_stay_strong() {
+        assert_eq!(
+            exp_succeeds(parse(
+                "(let ((id (lambda (x) x))) (let ((h (id (box 5)))) 5))"
+            )),
+            Typ::Int
+        );
+    }
+    #[test]
+    fn multi_arg_lam() {
+        parse("(lambda (f n) (if (= n 0) 1 (f n)))");
+    }
+    #[test]
+    fn basic_toplevel() {
+        assert_eq!(
+            exp_succeeds(parse("(define x 5) (define y 10) (+ x y)")),
+            Typ::Int
+        );
+        assert_eq!(
+            exp_succeeds(parse(
+                "(define (f) 10) (define x 5) (define y 10) (* (f) (+ x y))"
+            )),
+            Typ::Int
+        );
+    }
+    #[test]
+    fn float_constants() {
+        assert_eq!(
+            exp_succeeds(parse(
+                "(define x #i8.34336671824457987) (define y #i2.30417297573763929e-5) (define z 0.1) y"
+            )),
+            Typ::Float
+        )
+    }
+    #[test]
+    fn scheme_varnames() {
+        assert_eq!(
+            exp_succeeds(parse("(define days-per-year : Float #i365.24) (define *saturn* #i-4.03523417114321381e-1) *saturn*")),
+            Typ::Float
+        );
+    }
+    #[test]
+    fn tuples() {
+        assert_eq!(
+            exp_succeeds(parse("(tuple 1 #f \"hi\")")),
+            Typ::tuples(vec![Typ::Int, Typ::Bool, Typ::Str])
+        );
+        assert_eq!(
+            exp_succeeds(parse("(tuple-proj (tuple 1 #f \"hi\") 2)")),
+            Typ::Str
+        );
+    }
+    #[test]
+    fn int_ops() {
+        assert_eq!(exp_succeeds(parse("(< (* 1 2) (+ 3 4))")), Typ::Bool);
+    }
+    #[test]
+    fn scheme_cond() {
+        assert_eq!(
+            exp_coerces(parse(
+                "(lambda (n) (cond [(> n 0) 1] [(< n 0) -1] [else 0]))"
+            )),
+            Typ::arrs(vec![Typ::Any, Typ::Int])
+        );
+    }
+}
+//! Type-directed coercion insertion.
+//!
+//! This is vanilla, type-directed coercion insertion for the GTLC. There should
+//! be nothing innovative in this file, and it has nothing to do with type
+//! migration.
+//!
+//! At the moment, it only supports the fragment of the language we need for
+//! the comparative evaluation.
+use super::syntax::{Coerce, Exp, GroundTyp, Id, Lit, Typ};
+use im_rc::HashMap;
+
+type Env = HashMap<Id, Typ>;
+
+type R = Result<Typ, String>;
+
+fn lit_typ(lit: &Lit) -> Typ {
+    match lit {
+        Lit::Int(_) => Typ::Int,
+        Lit::Bool(_) => Typ::Bool,
+        _ => panic!("unsupported literal {:?}", lit),
+    }
+}
+
+fn fun_typ(t: Typ) -> Result<(Typ, Typ), String> {
+    match t {
+        Typ::Arr(dom, rng) => Ok((*dom, *rng)),
+        Typ::Any => Ok((Typ::Any, Typ::Any)),
+        _ => Ok((Typ::Any, Typ::Any)), // will be doomed
+    }
+}
+
+pub fn coerce(src: &Typ, dst: &Typ) -> Coerce {
+    match (src, dst) {
+        (Typ::Int, Typ::Any) => Coerce::Tag(GroundTyp::Int),
+        (Typ::Bool, Typ::Any) => Coerce::Tag(GroundTyp::Bool),
+        (Typ::Arr(dom, rng), Typ::Any) => Coerce::Wrap(
+            Box::new(coerce(&Typ::Any, dom)),
+            Box::new(coerce(rng, &Typ::Any)),
+        )
+        .seq(&Coerce::Tag(GroundTyp::Fun)),
+        (Typ::Arr(dom1, rng1), Typ::Arr(dom2, rng2)) => {
+            Coerce::Wrap(Box::new(coerce(dom2, dom1)), Box::new(coerce(rng1, rng2)))
+        }
+        (Typ::Any, Typ::Int) => Coerce::Untag(GroundTyp::Int),
+        (Typ::Any, Typ::Bool) => Coerce::Untag(GroundTyp::Bool),
+        (Typ::Any, Typ::Arr(dom, rng)) => Coerce::Untag(GroundTyp::Fun).seq(&Coerce::Wrap(
+            Box::new(coerce(dom, &Typ::Any)),
+            Box::new(coerce(&Typ::Any, rng)),
+        )),
+        _ => {
+            if src == dst {
+                Coerce::Id
+            } else {
+                Coerce::Doomed
+            }
+        }
+    }
+}
+
+fn ins(mut env: Env, exp: &mut Exp) -> R {
+    match exp {
+        Exp::Var(x) => {
+            let t = env.get(x).ok_or("unbound identifier".to_string())?.clone();
+            Ok(t)
+        }
+        Exp::Lit(l) => Ok(lit_typ(&l)),
+        Exp::Fun(x, t1, e) => {
+            env.insert(x.clone(), t1.clone());
+            let t2 = ins(env, e)?;
+            Ok(Typ::Arr(Box::new(t1.clone()), Box::new(t2)))
+        }
+        Exp::BinaryOp(op, e1, e2) => {
+            let (op1, op2, op_res) = op.typ();
+            let t1 = ins(env.clone(), e1)?;
+            let t2 = ins(env.clone(), e2)?;
+            let k2 = coerce(&t2, &op1);
+            let k1 = coerce(&t1, &op2);
+            let e1_inner = std::mem::replace(&mut **e1, Exp::Lit(Lit::Unit));
+            **e1 = Exp::PrimCoerce(k1, Box::new(e1_inner));
+            let e2_inner = std::mem::replace(&mut **e2, Exp::Lit(Lit::Unit));
+            **e2 = Exp::PrimCoerce(k2, Box::new(e2_inner));
+            Ok(op_res)
+        }
+        Exp::App(e1, e2) => {
+            let t1 = ins(env.clone(), e1)?;
+            let t2 = ins(env.clone(), e2)?;
+            let (t11, t12) = fun_typ(t1.clone())?;
+            let k2 = coerce(&t2, &t11);
+            let k1 = coerce(&t1, &Typ::Arr(Box::new(t11), Box::new(t12.clone())));
+            let e1_inner = std::mem::replace(&mut **e1, Exp::Lit(Lit::Unit));
+            **e1 = Exp::PrimCoerce(k1, Box::new(e1_inner));
+            let e2_inner = std::mem::replace(&mut **e2, Exp::Lit(Lit::Unit));
+            **e2 = Exp::PrimCoerce(k2, Box::new(e2_inner));
+            Ok(t12)
+        }
+        Exp::Coerce(_, t2, e) => {
+            ins(env.clone(), e)?;
+            Ok(t2.clone())
+        }
+        Exp::If(e1, e2, e3) => {
+            let t1 = ins(env.clone(), e1)?;
+            let k1 = coerce(&t1, &Typ::Bool);
+            **e1 = Exp::PrimCoerce(k1, Box::new(e1.take()));
+            let t2 = ins(env.clone(), e2)?;
+            let t3 = ins(env.clone(), e3)?;
+            let t_joined = t2.join(&t3);
+            **e2 = e2.take().coerce(coerce(&t2, &t_joined));
+            **e3 = e3.take().coerce(coerce(&t3, &t_joined));
+            Ok(t_joined)
+        }
+        Exp::Ann(e1, t1) => {
+            let t2 = ins(env.clone(), e1)?;
+            let k = coerce(&t2, &t1);
+            let t_result = t1.take();
+            *exp = Exp::PrimCoerce(k, Box::new(e1.take()));
+            Ok(t_result)
+        }
+        _ => unimplemented!("{:?}", exp),
+    }
+}
+
+/// Inserts coercions into the program, which makes it suitable for evaluation.
+///
+/// This function modifies the expression in-place, because we are in Rust, and
+/// can happily do such things! The function will produce an error message on
+/// expected failures, e.g., if the program has a free variable.
+pub fn insert_coercions(exp: &mut Exp) -> Result<(), String> {
+    ins(Env::new(), exp)?;
+    return Ok(());
+}

