@@ -1,3 +1,44 @@
+use cfgrammar::yacc::YaccKind;
+use lrlex::LexerBuilder;
+use lrpar::CTParserBuilder;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    println!(r"cargo:rustc-link-search=/usr/local/lib/");
+
+    // '.error_on_conflicts(true)' does not print the conflicts that occur, which makes the error
+    // hard to debug. Instead, we print the conflicts ourselves below.
+    let mut parser_builder = CTParserBuilder::new()
+        .yacckind(YaccKind::Grmtools)
+        .error_on_conflicts(false);
+
+    let lex_rule_ids_map = parser_builder.process_file_in_src("parser.y")?;
+
+    if let Some(conflicts) = parser_builder.conflicts() {
+        println!("{}", conflicts.3.pp(conflicts.0));
+        panic!("Found shift-reduce or reduce-reduce conflicts (described above).");
+    }
+
+    LexerBuilder::new()
+        .rule_ids_map(lex_rule_ids_map)
+        .process_file_in_src("lexer.l")?;
+
+    let mut parser_builder = CTParserBuilder::new()
+        .yacckind(YaccKind::Grmtools)
+        .error_on_conflicts(false);
+
+    let lex_rule_ids_map = parser_builder.process_file_in_src("grift.y")?;
+
+    if let Some(conflicts) = parser_builder.conflicts() {
+        println!("{}", conflicts.3.pp(conflicts.0));
+        panic!("Found shift-reduce or reduce-reduce conflicts (described above).");
+    }
+
+    LexerBuilder::new()
+        .rule_ids_map(lex_rule_ids_map)
+        .process_file_in_src("grift.l")?;
+
+    Ok(())
+}
 mod benchmark;
 mod cgen;
 mod eval;
@@ -4406,4 +4447,1510 @@ fn ins(mut env: Env, exp: &mut Exp) -> R {
 pub fn insert_coercions(exp: &mut Exp) -> Result<(), String> {
     ins(Env::new(), exp)?;
     return Ok(());
+}
+use super::syntax::*;
+use im_rc::{HashMap, HashSet};
+
+/// This also performs Base and Comp of the closure computation
+pub fn compile_coercions(x: Exp) -> (Exp, Typ, HashSet<(Typ, Typ)>) {
+    // Base
+    let (e, t, mut c) = compile(x, &HashMap::new());
+    c = c.union(comp(t.clone(), true));
+    (e, t, c)
+}
+
+fn comp(t: Typ, pos: bool) -> HashSet<(Typ, Typ)> {
+    match t {
+        Typ::Metavar(_) | Typ::MetavarArg(_) | Typ::MetavarRet(_) => {
+            if pos {
+                HashSet::unit((t, Typ::Any))
+            } else {
+                HashSet::unit((Typ::Any, t))
+            }
+        }
+        Typ::Null | Typ::Int | Typ::Bool if !pos => panic!("How did this happen?"),
+        Typ::Any | Typ::Null | Typ::Int | Typ::Bool => empty(),
+        Typ::Arr(t1, t2) => comp(*t1, !pos).union(comp(*t2, pos)),
+    }
+}
+
+/// this matches Figure 3: Compilation judgment, except that we collect
+/// coercions into a HashSet so as to not have to collect them for closure
+/// computation later
+fn compile(exp: Exp, env: &HashMap<Id, Typ>) -> (Exp, Typ, HashSet<(Typ, Typ)>) {
+    match exp {
+        // -------------------------
+        // Γ ⊢ Lit(l) ↪ Lit(l) :: l.typ()
+        Exp::Lit(ref l) => {
+            let t = l.typ();
+            (exp, t, empty())
+        }
+        // ------------------
+        // Γ ⊢ x : (Γ(x), ∅)
+        Exp::Var(ref x) => {
+            let t = env.get(x).expect("unknown identifier").clone();
+            (exp, t, empty())
+        }
+        // Γ(x) = t1
+        // Γ ⊢ e ↪ e' :: t2
+        // ------------------
+        // Γ ⊢ x = e ↪ ⟨t2 ▷ t1⟩ e' :: t1
+        Exp::Assign(id, e) => {
+            let t1 = env.get(&id).expect("unknown identifier").clone();
+            let (ep, t2, c1) = compile(*e, env);
+            let (coerced, c2) = coerce(t2, t1.clone(), ep);
+            (Exp::Assign(id, Box::new(coerced)), t1, c1.union(c2))
+        }
+        // Γ[x↦t1] ⊢ e2 ↪ e2' :: t2'
+        // e2'' = ⟨t2' ▷ t2⟩ e2'
+        // -----------------------------
+        // Γ ⊢ fun (x:t1) e2:t2 ↪ fun (x:t1) (e2'':t2) :: t1 -> t2
+        Exp::Fun(x, t1, e2, t2) => {
+            let mut env = env.clone();
+            env.insert(x.clone(), t1.clone());
+            let (e2p, t2p, c1) = compile(*e2, &env);
+            let (e2pp, c2) = coerce(t2p, t2.clone(), e2p);
+            let e = Exp::Fun(x, t1.clone(), Box::new(e2pp), t2.clone());
+            let t = Typ::Arr(Box::new(t1), Box::new(t2));
+            (e, t, c1.union(c2))
+        }
+        // Γ ⊢ e ↪ e' :: t
+        // t -o t1 -> t2
+        // Γ ⊢ e1 ↪ e1' :: t1'
+        // e1'' = ⟨t1' ▷ t1⟩ e1'
+        // ----------------------
+        // Γ ⊢ e e1 ↪ (⟨t ▷ t1 -> t2⟩ e') e1'' :: t2
+        Exp::App(e, e1) => {
+            let (ep, t, c1) = compile(*e, env);
+            let (e1p, t1p, c2) = compile(*e1, env);
+            let t1 = t.get_arg();
+            let (e1pp, c3) = coerce(t1p, t1.clone(), e1p);
+            let t2 = t.get_ret();
+            let arr_typ = Typ::Arr(Box::new(t1), Box::new(t2.clone()));
+            let (f, c4) = coerce(t, arr_typ, ep);
+            let res_e = Exp::App(Box::new(f), Box::new(e1pp));
+            (res_e, t2, c1.union(c2).union(c3).union(c4))
+        }
+        // Γ ⊢ e ↪ e' :: t
+        // Γ ⊢ e1 ↪ e1' :: t1
+        // Γ ⊢ e2 ↪ e2' :: t2
+        // Γ ⊢ e1'' = ⟨t1 ▷ α⟩ e1'
+        // Γ ⊢ e2'' = ⟨t2 ▷ α⟩ e2'
+        // ----------------------------
+        // Γ ⊢ if e then e1 else e2 ↪ if e' then e1'' else e2'' :: α
+        Exp::If(e, e1, e2) => {
+            // t is null-check, which i guess, every type is actually T | null. i
+            // guess this is called ⊥? although evaluating ⊥ doesn't seem
+            // to be a problem, since `if` would have to evaluate it to reach its
+            // alternate arm. this is weird, and i don't like it, but i think
+            // this is the ActionScript talking, although eliminating
+            // null/undefined is one part of why we're doing type inference for
+            // Jankscripten, so i'm sticking with "i don't like it"
+            let (ep, _t, c1) = compile(*e, env);
+            let (e1p, t1, c2) = compile(*e1, env);
+            let (e2p, t2, c3) = compile(*e2, env);
+            let alpha = Typ::Metavar(crate::parser::inc_metavar());
+            let (e1pp, c4) = coerce(t1, alpha.clone(), e1p);
+            let (e2pp, c5) = coerce(t2, alpha.clone(), e2p);
+            let res_e = Exp::If(Box::new(ep), Box::new(e1pp), Box::new(e2pp));
+            (res_e, alpha, c1.union(c2).union(c3).union(c4).union(c5))
+        }
+        // Γ ⊢ e1 ↪ e1' :: t1
+        // Γ ⊢ e2 ↪ e2' :: t2
+        // Γ ⊢ e1'' = ⟨t1 ▷ int⟩ e1'
+        // Γ ⊢ e2'' = ⟨t2 ▷ int⟩ e2'
+        // ----------------------------
+        // Γ ⊢ e1 + e2 ↪ e1'' + e2'' :: int
+        Exp::Add(e1, e2) => {
+            let (e1p, t1, c1) = compile(*e1, env);
+            let (e2p, t2, c2) = compile(*e2, env);
+            let (e1pp, c3) = coerce(t1, Typ::Int, e1p);
+            let (e2pp, c4) = coerce(t2, Typ::Int, e2p);
+            let res_e = Exp::Add(Box::new(e1pp), Box::new(e2pp));
+            (res_e, Typ::Int, c1.union(c2).union(c3).union(c4))
+        }
+        // Γ ⊢ e1 ↪ e1' :: t1
+        // Γ ⊢ e2 ↪ e2' :: t2
+        // ----------------------------
+        // Γ ⊢ e1; e2 ↪ e1'; e2' :: t2
+        Exp::Seq(e1, e2) => {
+            let (e1p, _, c1) = compile(*e1, env);
+            let (e2p, t2, c2) = compile(*e2, env);
+            let res_e = Exp::Seq(Box::new(e1p), Box::new(e2p));
+            (res_e, t2, c1.union(c2))
+        }
+        Exp::Coerce(..) => panic!("coercions don't exist during compilation"),
+    }
+}
+
+fn empty() -> HashSet<(Typ, Typ)> {
+    HashSet::new()
+}
+
+fn coerce(t1: Typ, t2: Typ, e: Exp) -> (Exp, HashSet<(Typ, Typ)>) {
+    if t1 == t2 {
+        (e, empty())
+    } else {
+        (
+            Exp::Coerce(t1.clone(), t2.clone(), Box::new(e)),
+            HashSet::unit((t1, t2)),
+        )
+    }
+}
+use super::syntax::*;
+use im_rc::HashMap;
+
+pub fn decorate(exp: &mut Exp, solution: &HashMap<Typ, Typ>) {
+    match exp {
+        Exp::Lit(_) | Exp::Var(_) => (),
+        Exp::Assign(_, e) => {
+            decorate(e, &solution);
+        }
+        Exp::Fun(_, t1, e, t2) => {
+            decorate_typ(t1, &solution);
+            decorate_typ(t2, &solution);
+            decorate(e, &solution);
+        }
+        Exp::App(e1, e2) | Exp::Seq(e1, e2) | Exp::Add(e1, e2) => {
+            decorate(e1, &solution);
+            decorate(e2, &solution);
+        }
+        Exp::Coerce(t1, t2, e) => {
+            decorate_typ(t1, &solution);
+            decorate_typ(t2, &solution);
+            decorate(e, &solution);
+            if t1 == t2 {
+                *exp = e.take();
+            }
+        }
+        Exp::If(e1, e2, e3) => {
+            decorate(e1, &solution);
+            decorate(e2, &solution);
+            decorate(e3, &solution);
+        }
+    }
+}
+
+pub fn decorate_typ(t: &mut Typ, solution: &HashMap<Typ, Typ>) {
+    match t {
+        // this isn't exactly said in the paper but i think it's necessary to
+        // fully decorate. well after all none of decoration is really written
+        // down
+        //
+        // to what extent does this duplicate with Î? i don't know
+        Typ::Arr(t1, t2) => {
+            decorate_typ(t1, solution);
+            decorate_typ(t2, solution);
+        }
+        _ if t.is_metavar() => match solution.get(t) {
+            Some(found) => {
+                assert!(!found.is_metavar());
+                *t = found.clone();
+                decorate_typ(t, solution);
+            }
+            None => {
+                eprintln!(
+                    "WARNING: no solution for {}. this probably means
+                there are no constraints on the type. Writing int",
+                    t
+                );
+                *t = Typ::Metavar(4444);
+            }
+        },
+        _ => (),
+    }
+}
+use super::syntax::Typ;
+use super::Closure;
+use im_rc::HashMap;
+
+pub fn solve_closure(cs: Closure) -> HashMap<Typ, Typ> {
+    // This is called T+ in the paper
+    // (X => set of types that flow IN to X)
+    let mut inflows = HashMap::new();
+    for (from, to) in cs.into_iter() {
+        if to.is_metavar() && !from.is_metavar() {
+            inflows.entry(to).or_insert(vec![]).push(from);
+        }
+    }
+    // this is the big summation that goes into Î
+    // it is the least upper bound of the given
+    let mut lubs = HashMap::new();
+    for (x, t) in inflows.into_iter() {
+        // all entries will either not exist or have at least a 0th entry
+        let (first, t) = t.split_first().unwrap();
+        let lub = t.iter().fold(first.kind_of_typ_var(&x), |lub, k| {
+            lub.least_upper_bound(&k.kind_of_typ_var(&x))
+        });
+        lubs.insert(x, lub);
+    }
+    let mut solution = HashMap::new();
+    for (x, i) in lubs.clone() {
+        solution.insert(x, solve_recursively(i, &lubs));
+    }
+    solution
+}
+
+/// this is called Î in the paper - it substitutes the solved kinds
+/// recursively into higher kinded types (arrows, since we've ignored objects
+/// so far)
+///
+/// the paper claims that this solution being not fully solved at the time of
+/// resolving this is not a problem "since kinds do not have cyclic dependencies"
+fn solve_recursively(t: Typ, i: &HashMap<Typ, Typ>) -> Typ {
+    match t {
+        Typ::Arr(t1, t2) => Typ::Arr(
+            Box::new(solve_recursively(*t1, i)),
+            Box::new(solve_recursively(*t2, i)),
+        ),
+        _ if t.is_metavar() => match i.get(&t) {
+            Some(t) => t.clone(),
+            None => {
+                eprintln!(
+                    "while resolving a higher kinded type, the lower-kinded type {} was not solved",
+                    t
+                );
+                // this is probly definitely wrong, and this oddness in *never* specified
+                Typ::Metavar(4444)
+            }
+        },
+        _ => t,
+    }
+}
+use super::syntax::*;
+use crate::syntax::{BinOp, Exp as SrcExp, Lit as SrcLit, Typ as SrcTyp};
+
+type Result<T> = std::result::Result<T, ()>;
+
+fn next_metavar_typ() -> Typ {
+    Typ::Metavar(crate::parser::inc_metavar())
+}
+
+pub fn from_typ(t: &SrcTyp) -> Result<Typ> {
+    match t {
+        SrcTyp::Int => Ok(Typ::Int),
+        SrcTyp::Bool => Ok(Typ::Bool),
+        SrcTyp::Any => Ok(Typ::Any),
+        SrcTyp::Unit => Ok(Typ::Null),
+        SrcTyp::Arr(t1, t2) => Ok(Typ::Arr(Box::new(from_typ(t1)?), Box::new(from_typ(t2)?))),
+        SrcTyp::Metavar(n) => Ok(Typ::Metavar(*n)),
+        _ => Err(()),
+    }
+}
+
+pub fn from_lit(l: &SrcLit) -> Result<Lit> {
+    match l {
+        // skips null
+        SrcLit::Int(n) => Ok(Lit::Int(*n)),
+        SrcLit::Bool(b) => Ok(Lit::Bool(*b)),
+        SrcLit::Unit => Ok(Lit::Null),
+        _ => Err(()),
+    }
+}
+
+pub fn from_exp(e: &SrcExp) -> Result<Exp> {
+    match e {
+        // skips assign and seq
+        SrcExp::Lit(l) => Ok(Exp::Lit(from_lit(l)?)),
+        SrcExp::Var(x) => Ok(Exp::Var(x.clone())),
+        SrcExp::Fun(x, t, e) => Ok(Exp::Fun(
+            x.clone(),
+            from_typ(t)?,
+            Box::new(from_exp(e)?),
+            next_metavar_typ(),
+        )),
+        SrcExp::App(e1, e2) => Ok(Exp::App(Box::new(from_exp(e1)?), Box::new(from_exp(e2)?))),
+        SrcExp::If(e1, e2, e3) => Ok(Exp::If(
+            Box::new(from_exp(e1)?),
+            Box::new(from_exp(e2)?),
+            Box::new(from_exp(e3)?),
+        )),
+        SrcExp::BinaryOp(BinOp::IntAdd, e1, e2) => {
+            Ok(Exp::Add(Box::new(from_exp(e1)?), Box::new(from_exp(e2)?)))
+        }
+        SrcExp::Let(x, e1, e2) => Ok(Exp::App(
+            Box::new(Exp::Fun(
+                x.to_string(),
+                next_metavar_typ(),
+                Box::new(from_exp(e2)?),
+                next_metavar_typ(),
+            )),
+            Box::new(from_exp(e1)?),
+        )),
+        _ => Err(()),
+    }
+}
+
+fn to_typ(t: Typ) -> Result<SrcTyp> {
+    match t {
+        Typ::Null => Ok(SrcTyp::Unit),
+        Typ::Int => Ok(SrcTyp::Int),
+        Typ::Bool => Ok(SrcTyp::Bool),
+        Typ::Arr(t1, t2) => Ok(SrcTyp::Arr(Box::new(to_typ(*t1)?), Box::new(to_typ(*t2)?))),
+        Typ::Any => Ok(SrcTyp::Any),
+        Typ::Metavar(n) => Ok(SrcTyp::Metavar(n)),
+        Typ::MetavarArg(_) => Err(()),
+        Typ::MetavarRet(_) => Err(()),
+    }
+}
+
+fn to_lit(l: Lit) -> SrcLit {
+    match l {
+        Lit::Null => SrcLit::Unit,
+        Lit::Int(n) => SrcLit::Int(n),
+        Lit::Bool(b) => SrcLit::Bool(b),
+    }
+}
+
+pub fn to_exp(e: Exp) -> Result<SrcExp> {
+    match e {
+        Exp::Lit(l) => Ok(SrcExp::Lit(to_lit(l))),
+        Exp::Var(x) => Ok(SrcExp::Var(x)),
+        Exp::Assign(_, _) => Err(()),
+        Exp::Fun(x, t, e, _) => Ok(SrcExp::Fun(x, to_typ(t)?, Box::new(to_exp(*e)?))),
+        Exp::App(e1, e2) => Ok(SrcExp::App(Box::new(to_exp(*e1)?), Box::new(to_exp(*e2)?))),
+        Exp::Coerce(t1, t2, e) => Ok(SrcExp::Coerce(
+            to_typ(t1)?,
+            to_typ(t2)?,
+            Box::new(to_exp(*e)?),
+        )),
+        Exp::If(e1, e2, e3) => Ok(SrcExp::If(
+            Box::new(to_exp(*e1)?),
+            Box::new(to_exp(*e2)?),
+            Box::new(to_exp(*e3)?),
+        )),
+        Exp::Add(e1, e2) => Ok(SrcExp::BinaryOp(
+            BinOp::IntAdd,
+            Box::new(to_exp(*e1)?),
+            Box::new(to_exp(*e2)?),
+        )),
+        Exp::Seq(_, _) => Err(()),
+    }
+}
+use super::syntax::*;
+use super::Closure;
+
+/// provide Base and Comp (from Figure 4) (aka Def 3.9: 1)
+pub fn compute_closure(cs: Closure) -> Closure {
+    compute_closure_check_complete(split_fun(tran_and_exp_fun(pull_and_factor(cs))))
+}
+
+fn compute_closure_check_complete(cs: Closure) -> Closure {
+    let init = cs.clone();
+    let step2 = pull_and_factor(cs);
+    // Def 3.9: 5
+    if step2 != init {
+        compute_closure(split_fun(tran_and_exp_fun(step2)))
+    } else {
+        init
+    }
+}
+
+/// this isn't in the spec, but makes it easier to read closures, and i don't
+/// think it should make a difference
+fn e(c: &mut Closure, t1: Typ, t2: Typ) {
+    if t1 != t2 {
+        assert!(
+            !t1.is_base() || !t2.is_base(),
+            "flow should not produce base |> base coercions: {} |> {}",
+            t1,
+            t2
+        );
+        c.insert((t1, t2));
+    }
+}
+
+/// for debugging, this prints the coercion (or two) that combine to produce
+/// the coercion that is added to the closure, along with that coercion
+fn p(c: &mut Closure, description: &'static str, reasons: Vec<(&Typ, &Typ)>, t1: Typ, t2: Typ) {
+    if t1 != t2 {
+        if super::DEBUG {
+            let mut reasoning = String::from(description);
+            reasoning.push_str(": ");
+            for reason in reasons {
+                reasoning.push_str(&format!("{} |> {}, ", reason.0, reason.1));
+            }
+            reasoning.push_str(&format!("==> {} |> {}", t1, t2));
+            eprintln!("{}", reasoning);
+        }
+        let as_tup = (t1, t2);
+        if !c.contains(&as_tup) {
+            e(c, as_tup.0, as_tup.1);
+        }
+    }
+}
+
+/// Definition 3.9: 2
+fn pull_and_factor(cs: Closure) -> Closure {
+    // Base
+    let mut expanded = cs.clone();
+    for c in cs.clone().into_iter() {
+        match c {
+            (from, to) if to.is_metavar() => {
+                if from.is_kind(&to) {
+                    // K |> X
+                    // Pull
+                    // surely this doesn't have to be O(n^2)? check complexity analysis
+                    for c in cs.clone().into_iter() {
+                        match c {
+                            (from2, to2) if from2 == to && to2.is_metavar() => {
+                                p(
+                                    &mut expanded,
+                                    "Pull",
+                                    vec![(&from, &to), (&from2, &to2.clone())],
+                                    from.clone(),
+                                    to2,
+                                );
+                            }
+                            _ => (),
+                        }
+                    }
+                }
+                // Factor
+                // T |> X
+                if !from.is_metavar() {
+                    let kind = from.kind_of_typ_var(&to);
+                    p(
+                        &mut expanded,
+                        "Factor",
+                        vec![(&from, &to)],
+                        from.clone(),
+                        kind.clone(),
+                    );
+                    p(
+                        &mut expanded,
+                        "Factor",
+                        vec![(&from, &to.clone())],
+                        kind,
+                        to,
+                    );
+                }
+            }
+            _ => (),
+        }
+    }
+    if cs != expanded {
+        pull_and_factor(expanded)
+    } else {
+        expanded
+    }
+}
+
+/// Def 3.9: 3
+fn tran_and_exp_fun(cs: Closure) -> Closure {
+    let any_to_any = Typ::Arr(Box::new(Typ::Any), Box::new(Typ::Any));
+    let mut expanded = cs.clone();
+    for c in cs.clone().into_iter() {
+        match c {
+            // ExpFunL
+            (Typ::Any, to @ Typ::Arr(..)) => {
+                p(
+                    &mut expanded,
+                    "ExpFunL",
+                    vec![(&Typ::Any, &to)],
+                    any_to_any.clone(),
+                    to.clone(),
+                );
+            }
+            // ExpFunR
+            (from @ Typ::Arr(..), Typ::Any) => {
+                p(
+                    &mut expanded,
+                    "ExpFunR",
+                    vec![(&from, &Typ::Any)],
+                    from.clone(),
+                    any_to_any.clone(),
+                );
+            }
+            // Tran
+            (k, x) if x.is_metavar() && k.is_kind(&x) => {
+                // surely this doesn't have x be O(n^2)? check complexity analysis
+                for c in cs.clone().into_iter() {
+                    match c {
+                        (x2, t) if x2 == x && k.dyn_consistent(&t) => {
+                            // it isn't seen in the paper formulation because
+                            // they only have one base type, but a base |> base
+                            // makes no sense. it doesn't cause any problems
+                            // based on the rules, but it makes closures bigger
+                            // than they have to be
+                            if !(k.is_base() && t.is_base()) {
+                                p(
+                                    &mut expanded,
+                                    "Tran",
+                                    vec![(&k, &x), (&x2, &t.clone())],
+                                    k.clone(),
+                                    t,
+                                );
+                            }
+                        }
+                        _ => (),
+                    }
+                }
+            }
+            _ => (),
+        }
+    }
+    if cs != expanded {
+        tran_and_exp_fun(expanded)
+    } else {
+        expanded
+    }
+}
+
+/// Def 3.9: 4
+fn split_fun(cs: Closure) -> Closure {
+    let mut expanded = cs.clone();
+    for c in cs.clone().into_iter() {
+        match c {
+            // SplitFun
+            // TODO(luna): potential optimization: if any t[12]p? is_arr, then
+            // repeat, but if it never happens, don't bother checking equality
+            // and exit
+            (Typ::Arr(t1, t2), Typ::Arr(t1p, t2p)) => {
+                p(
+                    &mut expanded,
+                    "SplitFun",
+                    vec![(
+                        &Typ::Arr(t1.clone(), t2.clone()),
+                        &Typ::Arr(t1p.clone(), t2p.clone()),
+                    )],
+                    *t1p.clone(),
+                    *t1.clone(),
+                );
+                p(
+                    &mut expanded,
+                    "SplitFun",
+                    vec![(
+                        &Typ::Arr(t1.clone(), t2.clone()),
+                        &Typ::Arr(t1p.clone(), t2p.clone()),
+                    )],
+                    *t2.clone(),
+                    *t2p.clone(),
+                );
+            }
+            _ => (),
+        }
+    }
+    if cs != expanded {
+        split_fun(expanded)
+    } else {
+        expanded
+    }
+}
+use super::syntax::*;
+use super::Closure;
+use crate::pretty::Pretty;
+
+// Copied from jankscripten
+#[macro_export]
+macro_rules! impl_Display_Pretty2 {
+    ($T:ty) => {
+        impl std::fmt::Display for $T {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                let pp = pretty::BoxAllocator;
+                let doc = self.pretty::<_, ()>(&pp);
+                doc.1.render_fmt($crate::pretty::DEFAULT_WIDTH, f)
+            }
+        }
+    };
+}
+
+////////////////////////////////////////////////////////////////////////////////
+
+const PRINT_COERCIONS: bool = false;
+
+fn parens_if<'b, D, A, T>(pp: &'b D, d: &'b T, b: bool) -> pretty::DocBuilder<'b, D, A>
+where
+    T: Pretty,
+    D: pretty::DocAllocator<'b, A>,
+    A: std::clone::Clone,
+    <D as pretty::DocAllocator<'b, A>>::Doc: std::clone::Clone,
+{
+    if b {
+        pp.concat(vec![pp.text("("), d.pretty(pp), pp.text(")")])
+    } else {
+        d.pretty(pp)
+    }
+}
+
+impl Pretty for Typ {
+    fn pretty<'b, D, A>(&'b self, pp: &'b D) -> pretty::DocBuilder<'b, D, A>
+    where
+        D: pretty::DocAllocator<'b, A>,
+        A: std::clone::Clone,
+        <D as pretty::DocAllocator<'b, A>>::Doc: std::clone::Clone,
+    {
+        match self {
+            Typ::Null => pp.text("null"),
+            Typ::Int => pp.text("int"),
+            Typ::Bool => pp.text("bool"),
+            Typ::Arr(t1, t2) => pretty_arr(t1, t2, pp),
+            Typ::Any => pp.text("any"),
+            Typ::Metavar(i) => pp.text(greek(*i)),
+            Typ::MetavarArg(t) => t.pretty(pp).append(pp.text("?")),
+            Typ::MetavarRet(t) => t.pretty(pp).append(pp.text("!")),
+        }
+    }
+}
+
+fn pretty_arr<'b, D, A>(t1: &'b Typ, t2: &'b Typ, pp: &'b D) -> pretty::DocBuilder<'b, D, A>
+where
+    D: pretty::DocAllocator<'b, A>,
+    A: std::clone::Clone,
+    <D as pretty::DocAllocator<'b, A>>::Doc: std::clone::Clone,
+{
+    pp.concat(vec![
+        parens_if(pp, &*t1, t1.is_arr()),
+        pp.space(),
+        pp.text("->"),
+        pp.space(),
+        t2.pretty(pp),
+    ])
+}
+
+/// produces lowercase greek letters in alphabetic order, then produced <i>
+/// where i begins at 1 after the greek characters
+fn greek(i: u32) -> String {
+    let num_greek_chars = 78;
+    if i <= num_greek_chars {
+        // SAFETY:
+        // - a char is a u32 if the u32 is a valid Unicode codepoint
+        // - all characters between 0x03b1 and 0x03ff are greek characters
+        // - if i is 78, total is 0x03ff, if i is 0, it is 0x03b1
+        // - so all integers produced by this path are Unicode code points
+        // 0x03b1 is α
+        std::char::from_u32(0x03b1 + i).unwrap().to_string()
+    } else {
+        format!("⦉{}⦊", i - num_greek_chars)
+    }
+}
+
+impl Pretty for Exp {
+    fn pretty<'b, D, A>(&'b self, pp: &'b D) -> pretty::DocBuilder<'b, D, A>
+    where
+        D: pretty::DocAllocator<'b, A>,
+        A: std::clone::Clone,
+        <D as pretty::DocAllocator<'b, A>>::Doc: std::clone::Clone,
+    {
+        match self {
+            Exp::Lit(x) => x.pretty(pp),
+            Exp::Var(x) => pp.text(x),
+            Exp::Assign(x, v) => pp.concat(vec![pp.text(x), pp.text(": "), v.pretty(pp)]),
+            Exp::Fun(x, t1, e, t2) if super::DEBUG => pp.concat(vec![
+                t2.pretty(pp).parens(),
+                pp.space(),
+                pp.text("fun "),
+                pp.text(x),
+                pp.text(":"),
+                t1.pretty(pp),
+                pp.text("."),
+                pp.softline(),
+                e.pretty(pp).nest(2),
+            ]),
+            Exp::Fun(x, t1, e, _) => pp.concat(vec![
+                pp.text("fun "),
+                pp.text(x),
+                pp.text(":"),
+                t1.pretty(pp),
+                pp.text("."),
+                pp.softline(),
+                e.pretty(pp).nest(2),
+            ]),
+            Exp::App(e1, e2) => pp.concat(vec![
+                parens_if(pp, &**e1, e1.is_fun_exp()),
+                pp.space(),
+                parens_if(pp, &**e2, !e2.is_atom()),
+            ]),
+            Exp::If(e1, e2, e3) => pp.concat(vec![
+                pp.text("if"),
+                pp.space(),
+                e1.pretty(pp).nest(2),
+                pp.softline(),
+                pp.concat(vec![pp.text("then"), pp.softline(), e2.pretty(pp)])
+                    .nest(2),
+                pp.softline(),
+                pp.concat(vec![pp.text("else"), pp.softline(), e3.pretty(pp)])
+                    .nest(2),
+            ]),
+            Exp::Add(e1, e2) => pp.concat(vec![
+                parens_if(pp, &**e1, !e1.is_atom()),
+                pp.text(" + "),
+                parens_if(pp, &**e2, !e2.is_atom()),
+            ]),
+            Exp::Coerce(t1, t2, e) if PRINT_COERCIONS => pp.concat(vec![
+                pp.text("⟨"),
+                pretty_coercion(t1, t2, pp),
+                pp.text("⟩"),
+                pp.space(),
+                parens_if(pp, &**e, e.is_app_like()),
+            ]),
+            Exp::Coerce(_, _, e) => e.pretty(pp),
+            Exp::Seq(e1, e2) => pp.concat(vec![
+                e1.pretty(pp),
+                pp.text(";"),
+                pp.softline(),
+                e2.pretty(pp),
+            ]),
+        }
+    }
+}
+
+pub fn pretty_coercion<'b, D, A>(
+    t1: &'b Typ,
+    t2: &'b Typ,
+    pp: &'b D,
+) -> pretty::DocBuilder<'b, D, A>
+where
+    D: pretty::DocAllocator<'b, A>,
+    A: std::clone::Clone,
+    <D as pretty::DocAllocator<'b, A>>::Doc: std::clone::Clone,
+{
+    pp.concat(vec![
+        t1.pretty(pp),
+        pp.space(),
+        pp.text("▷"),
+        pp.space(),
+        t2.pretty(pp),
+    ])
+}
+
+impl Pretty for Lit {
+    fn pretty<'b, D, A>(&'b self, pp: &'b D) -> pretty::DocBuilder<'b, D, A>
+    where
+        D: pretty::DocAllocator<'b, A>,
+        A: std::clone::Clone,
+        <D as pretty::DocAllocator<'b, A>>::Doc: std::clone::Clone,
+    {
+        match self {
+            Lit::Null => pp.text("null"),
+            Lit::Int(n) => pp.as_string(n),
+            Lit::Bool(true) => pp.text("true"),
+            Lit::Bool(false) => pp.text("false"),
+        }
+    }
+}
+
+impl Pretty for (Typ, Typ) {
+    fn pretty<'b, D, A>(&'b self, pp: &'b D) -> pretty::DocBuilder<'b, D, A>
+    where
+        D: pretty::DocAllocator<'b, A>,
+        A: std::clone::Clone,
+        <D as pretty::DocAllocator<'b, A>>::Doc: std::clone::Clone,
+    {
+        pp.concat(vec![
+            self.0.pretty(pp),
+            pp.space(),
+            pp.text("▷"),
+            pp.space(),
+            self.1.pretty(pp),
+        ])
+    }
+}
+
+impl Pretty for Closure {
+    fn pretty<'b, D, A>(&'b self, pp: &'b D) -> pretty::DocBuilder<'b, D, A>
+    where
+        D: pretty::DocAllocator<'b, A>,
+        A: std::clone::Clone,
+        <D as pretty::DocAllocator<'b, A>>::Doc: std::clone::Clone,
+    {
+        pp.intersperse(
+            self.iter().map(|(t1, t2)| pretty_coercion(t1, t2, pp)),
+            pp.text(",").append(pp.softline()),
+        )
+    }
+}
+
+pub struct DisplayClosure<'a>(pub &'a Closure);
+impl Pretty for DisplayClosure<'_> {
+    fn pretty<'b, D, A>(&'b self, pp: &'b D) -> pretty::DocBuilder<'b, D, A>
+    where
+        D: pretty::DocAllocator<'b, A>,
+        A: std::clone::Clone,
+        <D as pretty::DocAllocator<'b, A>>::Doc: std::clone::Clone,
+    {
+        self.0.pretty(pp)
+    }
+}
+
+impl_Display_Pretty2!(Typ);
+impl_Display_Pretty2!(Exp);
+impl_Display_Pretty2!(DisplayClosure<'_>);
+#[derive(PartialEq, Eq, Hash, Clone)]
+pub enum Typ {
+    Null,
+    Int,
+    Bool,
+    Arr(Box<Typ>, Box<Typ>),
+    Any,
+    Metavar(u32),
+    /// if X is Metavar(n) then X? is MetavarArg(Metavar(n))
+    /// if X is Metavar(n) then X?? is MetavarArg(MetavarArg(Metavar(n)))
+    MetavarArg(Box<Typ>),
+    /// if X is Metavar(n) then X! is MetavarRet(Metavar(n))
+    MetavarRet(Box<Typ>),
+}
+
+impl Typ {
+    pub fn is_arr(&self) -> bool {
+        matches!(self, Typ::Arr(..))
+    }
+    #[allow(dead_code)]
+    pub fn is_atom(&self) -> bool {
+        !self.is_arr()
+    }
+    pub fn is_metavar(&self) -> bool {
+        matches!(
+            self,
+            Typ::Metavar(..) | Typ::MetavarArg(..) | Typ::MetavarRet(..)
+        )
+    }
+    /// Rastogi et al define:
+    ///
+    /// > Kinds for a type variable X, ranged over by K^X, are types of the
+    /// > form null, X?->X!, [object stuff], or any
+    ///
+    /// Let's focus on X?->X!, which I consider a bit ambiguous. The definition
+    /// says kinds *for a type variable X*, which should mean that X in this
+    /// notation isn't an arbitrary notation, but rather refers specifically to a
+    /// type variable described by X. So that would mean when we see K^X in the
+    /// figures, it doesn't mean any non-metavar, it means non-metavars with a
+    /// very particular property on arrows. Earlier versions of my
+    /// implementation used the former. The introduction of the below function,
+    /// which represents the stricter "with respect to X" sense, works to the same
+    /// extent. Since it's stricter and we're dealing with infinite loop issues,
+    /// I'll stick with this until it breaks something
+    pub fn is_kind(&self, x: &Typ) -> bool {
+        assert!(x.is_metavar());
+        match self {
+            _ if self.is_metavar() => false,
+            Typ::Arr(t1, t2) if **t1 == x.get_arg() && **t2 == x.get_ret() => true,
+            Typ::Arr(..) => false,
+            _ => true,
+        }
+    }
+    pub fn is_base(&self) -> bool {
+        matches!(self, Typ::Any | Typ::Bool | Typ::Int | Typ::Null)
+    }
+    /// t1 -> t2 --> t1
+    /// X --> X?
+    /// (as defined in the paper)
+    pub fn get_arg(&self) -> Typ {
+        match self {
+            Typ::Arr(t1, _) => *t1.clone(),
+            _ if self.is_metavar() => Typ::MetavarArg(Box::new(self.clone())),
+            _ => panic!("cannot make arg type variable of non-arrow, non-metavar"),
+        }
+    }
+    /// t1 -> t2 --> t2
+    /// X --> X!
+    /// (as defined in the paper)
+    pub fn get_ret(&self) -> Typ {
+        match self {
+            Typ::Arr(_, t2) => *t2.clone(),
+            _ if self.is_metavar() => Typ::MetavarRet(Box::new(self.clone())),
+            _ => panic!("cannot make arg type variable of non-arrow, non-metavar"),
+        }
+    }
+    /// self ≼ t
+    pub fn dyn_consistent(&self, t: &Typ) -> bool {
+        matches!((self, t),
+            (Typ::Null, _) | (Typ::Any, _) | (_, Typ::Any) | (Typ::Arr(..), Typ::Arr(..)))
+    }
+    /// least upper bound of kinds. self and k must be kinds (which means not
+    /// metavars, i think(?))
+    pub fn least_upper_bound(&self, k: &Typ) -> Typ {
+        assert!(!self.is_metavar());
+        assert!(!k.is_metavar());
+        match (self, k) {
+            (Typ::Null, k) | (k, Typ::Null) => k.clone(),
+            (Typ::Any, _) | (_, Typ::Any) => Typ::Any,
+            (Typ::Arr(x_arg, x_ret), Typ::Arr(x_arg2, x_ret2))
+                if x_arg == x_arg2 && x_ret == x_ret2 =>
+            {
+                self.clone()
+            }
+            // the paper avoids having to do this by having only two
+            // incompatible types: objects and arrows. their specified behavior is
+            // arrow |_| obj = any. we generalize this to t1 |_| t2 where t1 !=
+            // t2 = any
+            _ if self == k => self.clone(),
+            _ => Typ::Any,
+        }
+    }
+    /// ||T||x where T = self
+    pub fn kind_of_typ_var(&self, x: &Typ) -> Typ {
+        assert!(x.is_metavar());
+        match self {
+            Typ::Null | Typ::Int | Typ::Bool => self.clone(),
+            Typ::Any => Typ::Any,
+            Typ::Arr(..) => Typ::Arr(Box::new(x.get_arg()), Box::new(x.get_ret())),
+            Typ::Metavar(..) | Typ::MetavarArg(..) | Typ::MetavarRet(..) => {
+                panic!("t must not be a metavar")
+            }
+        }
+    }
+}
+
+pub type Id = String;
+
+#[derive(PartialEq, Clone)]
+pub enum Lit {
+    Null,
+    Int(i32),
+    Bool(bool),
+}
+impl Lit {
+    pub fn typ(&self) -> Typ {
+        match self {
+            Lit::Null => Typ::Null,
+            Lit::Int(_) => Typ::Int,
+            Lit::Bool(_) => Typ::Bool,
+        }
+    }
+}
+
+#[derive(PartialEq, Clone)]
+pub enum Exp {
+    Lit(Lit),
+    Var(Id),
+    #[allow(dead_code)]
+    Assign(Id, Box<Exp>),
+    Fun(Id, Typ, Box<Exp>, Typ),
+    App(Box<Exp>, Box<Exp>),
+    Coerce(Typ, Typ, Box<Exp>),
+    If(Box<Exp>, Box<Exp>, Box<Exp>),
+    Add(Box<Exp>, Box<Exp>),
+    #[allow(dead_code)]
+    Seq(Box<Exp>, Box<Exp>),
+    // TODO(luna): objects
+}
+
+impl Exp {
+    pub fn take(&mut self) -> Self {
+        std::mem::replace(self, Exp::Lit(Lit::Null))
+    }
+
+    pub fn is_app_like(&self) -> bool {
+        matches!(self, Exp::App(..))
+    }
+    pub fn is_fun_exp(&self) -> bool {
+        matches!(self, Exp::Fun(..) | Exp::If(..))
+    }
+    pub fn is_atom(&self) -> bool {
+        matches!(self, Exp::Lit(..) | Exp::Var(..))
+    }
+}
+use super::syntax::*;
+use im_rc::HashMap;
+
+type Env = HashMap<String, Typ>;
+
+pub fn type_check(exp: &Exp) -> Result<Typ, String> {
+    tcheck(&Default::default(), exp)
+}
+
+fn tcheck(env: &Env, exp: &Exp) -> Result<Typ, String> {
+    match exp {
+        // ---------------------------
+        // Γ ⊢ lit : lit.typ()
+        Exp::Lit(lit) => Ok(lit.typ()),
+        // ---------------------------
+        // Γ ⊢ x : Γ(x)
+        Exp::Var(x) => env
+            .get(x)
+            .ok_or(format!("unbound identifier {}", x))
+            .map(Clone::clone),
+        // Γ,x:T_1 ⊢ e : T_2
+        // ---------------------------------------
+        // Γ ⊢ fun (x : T_1) . e : T_1 -> T_2
+        Exp::Fun(x, t, body) => {
+            let mut env = env.clone();
+            env.insert(x.clone(), t.clone());
+            let t_body = tcheck(&env, body)?;
+            Ok(Typ::Arr(Box::new(t.clone()), Box::new(t_body)))
+        }
+        // Γ,x:T ⊢ e : T
+        // ---------------------------------------
+        // Γ ⊢ fix (x : T) . e : T
+        Exp::Fix(x, t1, body) => {
+            let mut env = env.clone();
+            env.insert(x.clone(), t1.clone());
+            let t2 = tcheck(&env, body)?;
+            should_match(t1, t2)
+        }
+        // Γ ⊢ e_1 : T_1 -> T_2
+        // Γ ⊢ e_2 : T_1
+        // ----------------------------------------------
+        // Γ ⊢ e_1 e_2 : T_2
+        Exp::App(e1, e2) => {
+            let t1_to_t2 = tcheck(&env, e1)?;
+            let t1 = tcheck(&env, e2)?;
+            match t1_to_t2 {
+                Typ::Arr(arr_t1, arr_t2) => {
+                    should_match(&*arr_t1, t1)?;
+                    Ok(*arr_t2)
+                }
+                _ => Err("expected arrow in application".to_string()),
+            }
+        }
+        // Γ ⊢ e1 : T_1
+        // Γ,x:T_1 ⊢ e2 : T_2
+        // ---------------------------------------
+        // Γ ⊢ let x: T_1 = e1 in e2 : T_2
+        Exp::Let(x, t1_ann, e1, e2) => {
+            let t1 = should_match(t1_ann, tcheck(&env, e1)?)?;
+            let mut env = env.clone();
+            env.insert(x.clone(), t1);
+            let t2 = tcheck(&env, e2)?;
+            Ok(t2)
+        }
+        // Γ ⊢ e_1 : int
+        // Γ ⊢ e_2 : int
+        // ----------------------------------------------
+        // Γ ⊢ e_1 [+*] e_2 : int
+        Exp::Add(e1, e2) | Exp::Mul(e1, e2) => {
+            should_match(&Typ::Int, tcheck(&env, e1)?)?;
+            should_match(&Typ::Int, tcheck(&env, e2)?)?;
+            Ok(Typ::Int)
+        }
+        // Γ ⊢ e_1 : int
+        // Γ ⊢ e_2 : int
+        // ----------------------------------------------
+        // Γ ⊢ e_1 = e_2 : bool
+        Exp::IntEq(e1, e2) => {
+            should_match(&Typ::Int, tcheck(&env, e1)?)?;
+            should_match(&Typ::Int, tcheck(&env, e2)?)?;
+            Ok(Typ::Bool)
+        }
+        // Γ ⊢ e : bool
+        // ----------------------------------------------
+        // Γ ⊢ not e : bool
+        Exp::Not(e) => {
+            should_match(&Typ::Bool, tcheck(&env, e)?)?;
+            Ok(Typ::Bool)
+        }
+        // Γ ⊢ e_1 : T_1 where T_1 ∈ {int, str, any}
+        // Γ ⊢ e_2 : T_1
+        // ----------------------------------------------
+        // Γ ⊢ e_1 +? e_2 : T_1
+        Exp::AddOverload(e1, e2) => {
+            let t1 = tcheck(&env, e1)?;
+            should_match(&t1, tcheck(&env, e2)?)?;
+            match t1 {
+                Typ::Int | Typ::Str | Typ::Any => Ok(t1),
+                _ => Err("add overload not int, str, or any".to_string()),
+            }
+        }
+        // Γ ⊢ e_1 : bool
+        // Γ ⊢ e_2 : T_1
+        // Γ ⊢ e_3 : T_1
+        // ----------------------------------------------
+        // Γ ⊢ if e_1 then e_2 else e_3 : T_1
+        Exp::If(e1, e2, e3) => {
+            should_match(&Typ::Bool, tcheck(&env, e1)?)?;
+            let t1 = tcheck(&env, e2)?;
+            should_match(&t1, tcheck(&env, e3)?)?;
+            Ok(t1)
+        }
+        // Γ ⊢ e_1 : T_1
+        // Γ ⊢ e_2 : T_2
+        // ----------------------------------------------
+        // Γ ⊢ e_1, e_2 : (T_1, T_2)
+        Exp::Pair(e1, e2) => {
+            let t1 = tcheck(&env, e1)?;
+            let t2 = tcheck(&env, e2)?;
+            Ok(Typ::Pair(Box::new(t1), Box::new(t2)))
+        }
+        // Γ ⊢ e_1 : T_1
+        // Γ ⊢ e_2 : List(T_1)
+        // ----------------------------------------------
+        // Γ ⊢ e_1 :: e_2 : List(T_1)
+        Exp::Cons(e1, e2) => {
+            let t1 = tcheck(&env, e1)?;
+            should_match(&Typ::List(Box::new(t1)), tcheck(&env, e2)?)
+        }
+        // ----------------------------------------------
+        // Γ ⊢ empty: T : List(T)
+        Exp::Empty(t) => Ok(Typ::List(Box::new(t.clone()))),
+        // Γ ⊢ e : List(T)
+        // ----------------------------------------------
+        // Γ ⊢ head e : T
+        Exp::Head(e) => {
+            let t = tcheck(env, e)?;
+            match t {
+                Typ::List(res) => Ok(*res),
+                _ => Err("head non-list".to_string()),
+            }
+        }
+        // Γ ⊢ e : List(T)
+        // ----------------------------------------------
+        // Γ ⊢ tail e : List(T)
+        Exp::Tail(e) => {
+            let t = tcheck(env, e)?;
+            match t {
+                Typ::List(_) => Ok(t),
+                _ => Err("tail non-list".to_string()),
+            }
+        }
+        // Γ ⊢ e : List(T)
+        // ----------------------------------------------
+        // Γ ⊢ is_empty e : bool
+        Exp::IsEmpty(e) => {
+            let t = tcheck(env, e)?;
+            match t {
+                Typ::List(_) => Ok(Typ::Bool),
+                _ => Err("is_empty non-list".to_string()),
+            }
+        }
+        // Γ ⊢ e : any
+        // ----------------------------------------------
+        // Γ ⊢ is_GROUND e : bool
+        Exp::IsBool(e) | Exp::IsInt(e) | Exp::IsString(e) | Exp::IsList(e) | Exp::IsFun(e) => {
+            should_match(&Typ::Any, tcheck(env, e)?)?;
+            Ok(Typ::Bool)
+        }
+        // even though these should be removed by type inference, it's possible
+        // we never did type inference on this program. so consider these no-ops
+        Exp::MaybeToAny(_, e) => tcheck(env, e),
+        Exp::MaybeFromAny(_, t, e) => {
+            match t {
+                Typ::Metavar(..) => (),
+                _ => panic!(
+                    "a maybe_from_any appeared which indicates we didn't
+                    do type inference, but we got a type besides a
+                    metavariable..."
+                ),
+            }
+            tcheck(env, e)
+        }
+        // Γ ⊢ e : T where T != any
+        // ----------------------------------------------
+        // Γ ⊢ to_any e : any
+        Exp::ToAny(e) => {
+            let t1 = tcheck(env, e)?;
+            if t1 != Typ::Any {
+                Ok(Typ::Any)
+            } else {
+                Err("to_any any".to_string())
+            }
+        }
+        // Γ ⊢ e : any
+        // ----------------------------------------------
+        // Γ ⊢ from_any: T e : T
+        Exp::FromAny(t, e) => {
+            should_match(&Typ::Any, tcheck(env, e)?)?;
+            Ok(t.clone())
+        }
+    }
+}
+
+fn should_match(t1: &Typ, t2: Typ) -> Result<Typ, String> {
+    if t1 == &t2 {
+        Ok(t2)
+    } else {
+        mismatched(t1, &t2)
+    }
+}
+
+fn mismatched<T>(t1: &Typ, t2: &Typ) -> Result<T, String> {
+    Err(format!("expected {} got {}", t1, t2))
+}
+mod collect_coercions;
+mod decorate;
+mod flow;
+mod pretty;
+mod solve;
+mod syntax;
+mod to_from_portable_ast;
+
+#[cfg(not(test))]
+const DEBUG: bool = false;
+#[cfg(test)]
+const DEBUG: bool = true;
+
+type Closure = im_rc::HashSet<(syntax::Typ, syntax::Typ)>;
+
+pub fn typeinf_portable(exp: crate::syntax::Exp) -> crate::syntax::Exp {
+    let internal_e =
+        to_from_portable_ast::from_exp(&exp).expect("unsupported features in input program");
+    let (checked_e, _) = typeinf(internal_e);
+    return to_from_portable_ast::to_exp(checked_e)
+        .expect("migrated program has unsupported features");
+}
+
+pub fn typeinf(parsed: syntax::Exp) -> (syntax::Exp, syntax::Typ) {
+    let (mut coerced, mut typ, coercions) = collect_coercions::compile_coercions(parsed);
+    if DEBUG {
+        println!(
+            "{}\ncoercions:\n{}",
+            coerced,
+            pretty::DisplayClosure(&coercions)
+        );
+    }
+    let coercions_closure = flow::compute_closure(coercions);
+    if DEBUG {
+        println!("closure:\n{}", pretty::DisplayClosure(&coercions_closure));
+    }
+    let solution = solve::solve_closure(coercions_closure);
+    // if DEBUG {
+    //     println!("solution:\n{:?}", solution);
+    // }
+    decorate::decorate(&mut coerced, &solution);
+    decorate::decorate_typ(&mut typ, &solution);
+    if DEBUG {
+        println!("annotated:\n{}", coerced);
+    }
+    (coerced, typ)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::syntax::*;
+    use super::typeinf;
+
+    fn parse(s: &str) -> Exp {
+        let mut portable_input_e = crate::parser::parse(s).unwrap();
+        portable_input_e.fresh_types();
+        return super::to_from_portable_ast::from_exp(&portable_input_e)
+            .expect("unsupported features");
+    }
+
+    pub fn contains_coercions(e: Exp) -> bool {
+        match e {
+            Exp::Coerce(..) => true,
+            Exp::Lit(..) | Exp::Var(..) => false,
+            Exp::Fun(_, _, e, _) | Exp::Assign(_, e) => contains_coercions(*e),
+            Exp::App(e1, e2) | Exp::Seq(e1, e2) | Exp::Add(e1, e2) => {
+                contains_coercions(*e1) || contains_coercions(*e2)
+            }
+            Exp::If(e1, e2, e3) => {
+                contains_coercions(*e1) || contains_coercions(*e2) || contains_coercions(*e3)
+            }
+        }
+    }
+    pub fn succeeds(program: &str) {
+        let orig = parse(program);
+        println!("\nOriginal program:\n{}", &orig);
+        let e = typeinf(orig);
+        println!("\nAfter type inference:\n{}", e.1);
+        let coercions = contains_coercions(e.0);
+        assert!(!coercions);
+    }
+    pub fn coerces(program: &str) {
+        let orig = parse(program);
+        println!("\nOriginal program:\n{}", &orig);
+        let e = typeinf(orig);
+        println!("\nAfter type inference:\n{}", e.1);
+        let coercions = contains_coercions(e.0);
+        assert!(coercions);
+    }
+    #[test]
+    fn an_int() {
+        succeeds("5");
+    }
+    #[test]
+    fn fun_app_int() {
+        succeeds("(fun x.x) 5");
+    }
+    #[test]
+    fn fun_fun_app_int_int() {
+        succeeds("(fun x.fun y.y) 5 8");
+    }
+    #[test]
+    fn indir_int_equal_bool() {
+        coerces(
+            "fun p .
+                (fun foo . foo 10 p true)
+                    (fun x . fun y . fun z .
+                        if true then z
+                        else
+                            (fun w . w) (if true then y else (fun w0 . w0) x))",
+        );
+    }
+    #[test]
+    fn key_is_bool_and_int() {
+        // previously ended in else key > 10 which would yield bool and
+        // constrain key to int, so we make something similar type-wise without
+        // adding comparisons
+        coerces(
+            "let elim_int = fun i: int.i in
+            fun key . if true then if true then key else true else
+                (fun i . true) (elim_int key)",
+        );
+    }
+    #[test]
+    fn identity_polymorphic() {
+        coerces(
+            "let id = fun x . x in
+            let f = fun anid .
+                let n = anid 10 in
+                let b = anid true in
+                5 in
+            f id",
+        );
+    }
+    #[test]
+    fn bool_const() {
+        succeeds("true");
+    }
+    #[test]
+    fn local_variables_having_base_types() {
+        // we don't worry about elimination forms since ins and outs doesn't
+        // even use them!
+        succeeds(
+            "fun n:int.
+                let index = 0 in
+                let sum = index in
+                // while (index < sum) { <- index |> int, sum |> int aren't used (outflows)
+                       // index = index; // was index + 1 which produces index |> int (outflow)
+                       // sum = sum; // was sum + index which produces outflows, and int |> sum (already there)
+                // }
+                sum",
+        );
+    }
+    #[test]
+    fn conditional_int_arr_int() {
+        succeeds(
+            "let b = () in
+            let elim_int = fun x: int. x in // an elimanation form for int, for use rather than +
+            let foo = fun x.
+                if b then
+                    elim_int x
+                else
+                    0 in
+            foo 1",
+        )
+    }
+    #[test]
+    fn callable_by_existing_code() {
+        coerces(
+            "let b = () in
+            let foo = fun x.
+                if b then
+                    (fun i: int. i) x // an elimanation form for int, for use rather than +
+                else
+                    0 in
+            let app1 = foo 1 in
+            foo",
+        )
+    }
+    #[test]
+    fn identity_twice() {
+        succeeds("(fun i.i) ((fun i.i) ())");
+    }
+    #[test]
+    fn identity_public() {
+        let e = typeinf(parse("(fun i . i)")).0;
+        match e {
+            Exp::Fun(_, Typ::Any, _, Typ::Any) => (),
+            _ => panic!(),
+        }
+    }
+    #[test]
+    fn call_identity() {
+        succeeds("(fun i.i ()) (fun x.x)");
+    }
+    #[test]
+    fn i_on_f() {
+        // probly (fun i:(any->any)->any->any.(i (fun y:any.y:any))) (fun x:any->any.x:any->any)
+        succeeds("(fun i.(i (fun y.y))) (fun x.x)");
+    }
+    #[test]
+    fn i_on_f_twice() {
+        succeeds("(fun i.(fun a.a) (i (fun y.y))) (fun x.x)");
+    }
+    #[test]
+    fn broke_migeed() {
+        coerces("(fun i.(fun a.fun b.b) (i 5) (i true)) (fun x.x)");
+    }
+    #[test]
+    fn add_apply_self() {
+        coerces("fun f.fun g.f 1 + g f")
+    }
+    // =======================================
+    // ~~~~~~~~~ migeed and palsberg ~~~~~~~~~
+    #[test]
+    fn apply_add() {
+        coerces(
+            "let elim_add = fun x: int.x in
+            fun x . x (elim_add x)",
+        );
+    }
+    #[test]
+    fn add_applied() {
+        coerces(
+            "let elim_add = fun x: int.x in
+            fun x             . x (elim_add (x true))",
+        );
+    }
+    #[test]
+    fn add_two_applies() {
+        coerces(
+            "let elim_add = fun x: int. x in
+            fun x             . let _ = elim_add (x 4) in elim_add (x true)",
+        );
+    }
+    #[test]
+    fn identity_four() {
+        succeeds("(fun x . x) 4");
+    }
+    #[test]
+    #[ignore = "fresh_types removes the int annotation"]
+    fn succ_id_id() {
+        coerces(
+            "let elim_int = fun x: int. x in
+            elim_int ((fun y    .y) ((fun x    .x) true))",
+        );
+    }
+    #[test]
+    fn identity() {
+        succeeds("fun x.x");
+    }
+    #[test]
+    fn apply2() {
+        coerces("fun x    .fun y                    .y x x");
+    }
+    #[test]
+    fn indirect_apply_self() {
+        coerces("fun x    .(fun y    .x)           x  x");
+    }
+    #[test]
+    fn the_long_one() {
+        succeeds("fun x    .(fun f    .(fun x    .fun y    .x)          f (f x))(fun z    .1)");
+    }
+    /// this benchmark has no maximal migration, which means that x could be
+    /// given an infinity recursive arrow type (t -> t -> t -> ...). we will
+    /// give it... something
+    #[test]
+    fn apply_self() {
+        coerces("fun x.x x");
+    }
+    /// this benchmark has an unknown maximal migration. because Migeed's
+    /// algorithm is incomplete, it sometimes does not report whether a maximal
+    /// solution exists. in practice, this probably means that there is no maximal
+    /// migration. we still give it some migration
+    /// TODO(luna): this test hangs fsr
+    #[test]
+    #[ignore]
+    fn untypable_in_sys_f() {
+        coerces("(fun x.fun y.y(x(fun x.x))(x(fun b.fun c.b)))(fun d.d d)");
+    }
+    #[test]
+    #[ignore]
+    fn self_apply_applied() {
+        coerces("(fun x.x x) (fun i.i)");
+        coerces("(fun x: any.<any |> any -> any>x x) (fun i: any.i)");
+    }
+    /// unknown to Migeed and Parsberg. self interpreter for the lambda calculus
+    /// TODO(luna): this test hangs adding a bunch of ?!?!?!s fsr
+    #[test]
+    #[ignore]
+    fn self_interpreter() {
+        coerces(
+            "(fun h.(fun x.h(x x))(fun x.h x x))
+             (fun e.fun m.m(fun x.x)(fun m.fun n.(e m)(e n))(fun m.fun v.e (m v)))",
+        );
+    }
+    // =======================================
 }
